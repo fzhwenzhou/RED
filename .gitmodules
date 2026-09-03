@@ -1,0 +1,6 @@
+[submodule "target_cpu/picorv32"]
+	path = target_cpu/picorv32
+	url = https://github.com/yosyshq/picorv32
+[submodule "target_project/micro-ecc"]
+	path = target_project/micro-ecc
+	url = https://github.com/kmackay/micro-ecc

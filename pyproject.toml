@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "red-agent"
+version = "0.1.0"
+description = "RED — an agentic RISC-V ISA extension designer (A1 kernel mining + A2 ISA synthesis on the CHIA framework)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # CHIA (installed separately: `pip install -e /home/naonao/chia`)
+    "ray>=2.9",
+    "google-genai>=1.0",         # VertexGeminiLLM backend
+    "google-cloud-compute>=1.0", # GCP cluster provisioning
+    "mcp>=1.0",                  # ChiaTool MCP servers
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["red*"]

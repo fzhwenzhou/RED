@@ -1,0 +1,245 @@
+# RED cluster — head on your local machine, workers on GCP Compute Engine
+# (Google free-trial credit; Gemini-on-Vertex LLM backend).
+#
+# Fill every #FILL before `chia up`:
+#   1. provider.head_ip        — your head machine's IP/hostname (must be SSH-
+#                                reachable from the GCP workers for the default
+#                                reverse-tunnel path; see the tailnet note below).
+#   2. gcp_nodes.*.ssh_user / ssh_public_key / ssh_private_key  — your SSH keypair.
+#
+# One-time GCP setup (see the GCP guide PDF, p.10 — CHIA does the rest):
+#     pip install google-cloud-compute
+#     gcloud auth application-default login
+#     gcloud auth application-default set-quota-project <project>
+#     gcloud services enable compute.googleapis.com --project <project>
+#
+# The LLM node calls Gemini on Vertex AI with Application Default Credentials
+# from the GCE metadata server: it is created with the project's default
+# compute service account attached (see gcp_nodes.llm.extra_args below), so no
+# interactive `gcloud auth` on the node is ever needed.
+#
+# Resource tags (red/constants.py) map 1:1 onto the node types below:
+#   llm, head_local, database, profile, rtl, spike, llvm  (VLSI is off by default).
+cluster_name: red
+
+provider:
+    # The head is THIS machine. CHIA brings the head up over SSH too, so this
+    # must be an address the machine can SSH to ITSELF on — use the LAN/WSL
+    # address, NOT the public egress IP (that one is the router/NAT; inbound
+    # :22 is refused). fish:  set -x HEAD_IP (hostname -I | awk '{print $1}')
+    # The GCP workers never dial this address — they reach the head through
+    # CHIA's reverse SSH tunnels; the ssh firewall rule is derived separately
+    # from the head's public egress IP.
+    head_ip: ${HEAD_IP}          # FILL — e.g. set -x HEAD_IP (hostname -I | awk '{print $1}')
+
+auth:
+    ssh_user: ${USER}
+    # ssh_private_key: ~/.ssh/<key>   # uncomment if not in your ssh-agent
+
+available_node_types:
+
+    # ----- Agent nodes: Gemini 2.5 Pro on Vertex AI (ADC on the node) -----
+    llm:
+        resources: {"llm": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # The repo is rsynced to the same path (file_mounts below) before this
+        # runs, so `import red` works for the ChiaFunction nodes on this worker.
+        worker_setup_commands: ["pip install -e $HOME/RED"]
+        compatible_ips: ["@llm:0"]
+
+    # ----- Sealed MCP tools + driver-side gates (run on the head) -----
+    head_local:
+        resources: {"head_local": 8}
+        num_workers: 1
+        # The head has no conda — its Python env is the RED venv.
+        worker_env_commands: ["source $HOME/RED/.venv/bin/activate && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        compatible_ips: ["${HEAD_IP}"]   # the head machine itself (== provider.head_ip)
+
+    # ----- Durable artifact store (local disk on one node) -----
+    database:
+        resources: {"database": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # The repo is rsynced to the same path (file_mounts below) before this
+        # runs, so `import red` works for the ChiaFunction nodes on this worker.
+        worker_setup_commands: ["pip install -e $HOME/RED"]
+        compatible_ips: ["@database:0"]
+
+    # ----- A1 profiling: native harness build + perf/callgrind -----
+    profile:
+        resources: {"profile": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # A1 builds the target project's harness with cc and profiles it under
+        # callgrind — Debian cloud images ship NEITHER, so install them here
+        # (guarded: re-runs skip the apt work). Without this A1 silently
+        # degrades to profile_method="none" and Gate 1 can never pass.
+        worker_setup_commands:
+            - "command -v cc >/dev/null 2>&1 && command -v valgrind >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq build-essential valgrind)"
+            # The repo is rsynced to the same path (file_mounts below) before
+            # this runs, so `import red` works for the ChiaFunction nodes here.
+            - "pip install -e $HOME/RED"
+        compatible_ips: ["@profile:0"]
+
+    # ----- A3: core build + iverilog/verilator simulation -----
+    rtl:
+        resources: {"rtl": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # A3 simulates the core with the extension RTL — needs a Verilog
+        # simulator (absent from stock Debian images; guarded install).
+        worker_setup_commands:
+            - "command -v iverilog >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq iverilog verilator)"
+            - "pip install -e $HOME/RED"
+        compatible_ips: ["@rtl:0"]
+
+    # ----- Gate 2 / links 2-3: patched Spike ISS -----
+    spike:
+        resources: {"spike": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # Spike itself is a from-source build (not packaged on Debian) — Gate 2
+        # defers gracefully while it is absent. The RISC-V cross-compiler IS
+        # packaged and cheap, so install it here.
+        worker_setup_commands:
+            - "command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq gcc-riscv64-unknown-elf)"
+            - "pip install -e $HOME/RED"
+        compatible_ips: ["@spike:0"]
+
+    # ----- A4: LLVM optimization pass -----
+    llvm:
+        resources: {"llvm": 1}
+        num_workers: 1
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+        # A4 runs clang/llc/opt on the mined kernels (absent from stock Debian
+        # images; guarded install).
+        worker_setup_commands:
+            - "command -v clang >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm)"
+            - "pip install -e $HOME/RED"
+        compatible_ips: ["@llvm:0"]
+
+    # ----- A5 synthesis (PPA): off by default; fill to enable -----
+    vlsi:
+        resources: {"VLSI": 4}
+        num_workers: 0
+        compatible_ips: []
+
+# ---- GCP workers (provisioned by `chia up`) ----
+gcp_nodes:
+    project: project-160a0199-6b4a-464c-86a     # RED_GCP_PROJECT (env-overridable)
+    zone: us-central1-a
+
+    llm:
+        # The llm node only runs VertexGeminiLLM.prompt — a thin client that
+        # calls Gemini over HTTPS (the model runs on Google's side). E2 is
+        # cheaper and far more available than N2; no need for n2-standard-2.
+        machine_type: e2-medium
+        count: 1
+        spot: false                 # keep ADC across reboots; reclaims lose it
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub      # FILL if different
+        ssh_private_key: ${HOME}/.ssh/id_ed25519         # FILL if different
+        # Attach the project's default compute SA with cloud-platform scope so
+        # google.auth.default() on this node picks up credentials from the GCE
+        # metadata server — no interactive `gcloud auth` on the node needed.
+        # (Vertex AI API is already enabled; the default compute SA is Editor.)
+        # Unknown keys are deep-merged onto the Instance proto as extra_args;
+        # scripts/red_env.sh exports GCP_COMPUTE_SA. Settable only at instance
+        # creation — after changing this, run: red_env.sh down && red_env.sh up
+        service_accounts:
+            - email: ${GCP_COMPUTE_SA}
+              scopes:
+                - https://www.googleapis.com/auth/cloud-platform
+
+    database:
+        machine_type: e2-medium
+        count: 1
+        spot: false
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
+        ssh_private_key: ${HOME}/.ssh/id_ed25519
+
+    profile:
+        machine_type: n2-standard-4
+        count: 1
+        spot: true
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
+        ssh_private_key: ${HOME}/.ssh/id_ed25519
+
+    rtl:
+        machine_type: n2-standard-4
+        count: 1
+        spot: true
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
+        ssh_private_key: ${HOME}/.ssh/id_ed25519
+
+    spike:
+        machine_type: n2-standard-4
+        count: 1
+        spot: true
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
+        ssh_private_key: ${HOME}/.ssh/id_ed25519
+
+    llvm:
+        machine_type: n2-standard-4
+        count: 1
+        spot: true
+        disk_size_gb: 50
+        ssh_user: ${USER}
+        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
+        ssh_private_key: ${HOME}/.ssh/id_ed25519
+
+# RED runs 7 sealed MCP tool servers on the head. The default reverse-forwarded
+# head-tool range (8000-8010, 11 ports) fits them with almost no slack: a stale
+# server from a crashed loop run (or a test) occupies a port, the live tool
+# scans past it, and past 8010 it lands OUTSIDE the forwarded range — then the
+# llm node cannot reach it and every LLM tool session fails. Widen the range so
+# a handful of stale occupants are harmless (the loop stops its own tools in a
+# finally, but hard crashes happen).
+tunnel_defaults:
+    head_tool_port_max: 8030
+
+# Sync the repo to every node at the SAME absolute path, so the ChiaFunction
+# nodes find their project/core sources (e.g. target_project/..., target_cpu/...)
+# and `pip install -e` (worker_setup_commands) has something to install.
+# {remote_path: local_path}; .gitignore (rsync_filter) keeps .venv out.
+# NOTE the trailing slash on the local path: without it rsync nests the repo
+# at RED/RED on the receivers.
+file_mounts:
+    /home/naonao/RED: /home/naonao/RED/
+
+rsync_exclude:
+    - "**/.git"
+    - "**/.git/**"
+
+rsync_filter:
+    - ".gitignore"
+
+initialization_commands: []
+
+setup_commands: []
+
+# The head has no conda — activate the RED venv so `ray`/`python` resolve.
+head_env_commands: ["source $HOME/RED/.venv/bin/activate && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
+
+head_start_ray_commands:
+    - ray stop
+    - ulimit -c unlimited && ray start --head --port=6379 --include-dashboard=True --dashboard-agent-listen-port=0
+
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0
+
+# --- Alternative for cloud workers behind NAT (recommended if your head is not
+#     publicly reachable): add a `tailnet:` section (see docs/user_guides/
+#     cluster_config_reference.rst "Tailnet (tailscale) clusters") and CHIA will
+#     join every GCP worker over tailscale instead of reverse SSH tunnels.
