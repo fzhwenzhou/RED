@@ -19,7 +19,11 @@
 # interactive `gcloud auth` on the node is ever needed.
 #
 # Resource tags (red/constants.py) map 1:1 onto the node types below:
-#   llm, head_local, database, profile, rtl, spike, llvm  (VLSI is off by default).
+#   llm        A1 mining + A2 synthesis agents (Gemini on Vertex AI)
+#   head_local sealed MCP tools + the gates/links (runs on THIS machine)
+#   database   durable artifact store
+#   profile    A1's harness build + callgrind profiling
+# Three GCP VMs are provisioned (llm, database, profile); head_local is local.
 cluster_name: red
 
 provider:
@@ -38,19 +42,25 @@ auth:
 
 available_node_types:
 
-    # ----- Agent nodes: Gemini 2.5 Pro on Vertex AI (ADC on the node) -----
+    # ----- Agent nodes: Gemini on Vertex AI (ADC on the node) -----
+    # The model itself is red/constants.py LLM_MODEL (RED_LLM_MODEL overrides it);
+    # this node only runs the thin client, so it never needs pinning here.
     llm:
         resources: {"llm": 1}
         num_workers: 1
         worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
         # The repo is rsynced to the same path (file_mounts below) before this
         # runs, so `import red` works for the ChiaFunction nodes on this worker.
-        worker_setup_commands: ["pip install -e $HOME/RED"]
+        worker_setup_commands: ["pip install -e $HOME/chia && pip install -e $HOME/RED"]
         compatible_ips: ["@llm:0"]
 
     # ----- Sealed MCP tools + driver-side gates (run on the head) -----
+    # Also carries the `spike` tag: Gate 2 builds a Spike extension against the
+    # simulator's headers and cross-compiles an rv32 test, and scripts/
+    # setup_spike.sh installs that toolchain on the head. Give the dedicated
+    # spike node below workers instead if you would rather it ran on a VM.
     head_local:
-        resources: {"head_local": 8}
+        resources: {"head_local": 8, "spike": 2}
         num_workers: 1
         # The head has no conda — its Python env is the RED venv.
         worker_env_commands: ["source $HOME/RED/.venv/bin/activate && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
@@ -63,7 +73,7 @@ available_node_types:
         worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
         # The repo is rsynced to the same path (file_mounts below) before this
         # runs, so `import red` works for the ChiaFunction nodes on this worker.
-        worker_setup_commands: ["pip install -e $HOME/RED"]
+        worker_setup_commands: ["pip install -e $HOME/chia && pip install -e $HOME/RED"]
         compatible_ips: ["@database:0"]
 
     # ----- A1 profiling: native harness build + perf/callgrind -----
@@ -79,49 +89,18 @@ available_node_types:
             - "command -v cc >/dev/null 2>&1 && command -v valgrind >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq build-essential valgrind)"
             # The repo is rsynced to the same path (file_mounts below) before
             # this runs, so `import red` works for the ChiaFunction nodes here.
-            - "pip install -e $HOME/RED"
+            - "pip install -e $HOME/chia && pip install -e $HOME/RED"
         compatible_ips: ["@profile:0"]
 
-    # ----- A3: core build + iverilog/verilator simulation -----
-    rtl:
-        resources: {"rtl": 1}
-        num_workers: 1
-        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
-        # A3 simulates the core with the extension RTL — needs a Verilog
-        # simulator (absent from stock Debian images; guarded install).
-        worker_setup_commands:
-            - "command -v iverilog >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq iverilog verilator)"
-            - "pip install -e $HOME/RED"
-        compatible_ips: ["@rtl:0"]
-
-    # ----- Gate 2 / links 2-3: patched Spike ISS -----
+    # ----- Gate 2's patched Spike ISS: off by default -----
+    # Gate 2 runs on the head (head_local advertises `spike` above), because
+    # that is where scripts/setup_spike.sh installs the simulator and the rv32
+    # cross-compiler. To move it onto its own VM instead: set num_workers: 1,
+    # add a gcp_nodes.spike entry, drop `spike` from head_local's resources, and
+    # give this node a worker_setup_command that runs setup_spike.sh (a ~20 min
+    # first-time build per VM, which is why it is not the default).
     spike:
         resources: {"spike": 1}
-        num_workers: 1
-        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
-        # Spike itself is a from-source build (not packaged on Debian) — Gate 2
-        # defers gracefully while it is absent. The RISC-V cross-compiler IS
-        # packaged and cheap, so install it here.
-        worker_setup_commands:
-            - "command -v riscv64-unknown-elf-gcc >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq gcc-riscv64-unknown-elf)"
-            - "pip install -e $HOME/RED"
-        compatible_ips: ["@spike:0"]
-
-    # ----- A4: LLVM optimization pass -----
-    llvm:
-        resources: {"llvm": 1}
-        num_workers: 1
-        worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
-        # A4 runs clang/llc/opt on the mined kernels (absent from stock Debian
-        # images; guarded install).
-        worker_setup_commands:
-            - "command -v clang >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm)"
-            - "pip install -e $HOME/RED"
-        compatible_ips: ["@llvm:0"]
-
-    # ----- A5 synthesis (PPA): off by default; fill to enable -----
-    vlsi:
-        resources: {"VLSI": 4}
         num_workers: 0
         compatible_ips: []
 
@@ -141,6 +120,12 @@ gcp_nodes:
         ssh_user: ${USER}
         ssh_public_key: ${HOME}/.ssh/id_ed25519.pub      # FILL if different
         ssh_private_key: ${HOME}/.ssh/id_ed25519         # FILL if different
+        # Debian cloud images ship no rsync, and chia rsyncs file_mounts to this
+        # node in the worker phase — after these gcp_nodes setup_commands but
+        # BEFORE the top-level ones. Install it here or bring-up dies with
+        # "rsync: command not found".
+        setup_commands:
+            - "command -v rsync >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq rsync)"
         # Attach the project's default compute SA with cloud-platform scope so
         # google.auth.default() on this node picks up credentials from the GCE
         # metadata server — no interactive `gcloud auth` on the node needed.
@@ -161,42 +146,27 @@ gcp_nodes:
         ssh_user: ${USER}
         ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
         ssh_private_key: ${HOME}/.ssh/id_ed25519
+        # Debian cloud images ship no rsync, and chia rsyncs file_mounts to this
+        # node in the worker phase — after these gcp_nodes setup_commands but
+        # BEFORE the top-level ones. Install it here or bring-up dies with
+        # "rsync: command not found".
+        setup_commands:
+            - "command -v rsync >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq rsync)"
 
     profile:
-        machine_type: n2-standard-4
+        machine_type: e2-standard-4
         count: 1
-        spot: true
+        spot: false
         disk_size_gb: 50
         ssh_user: ${USER}
         ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
         ssh_private_key: ${HOME}/.ssh/id_ed25519
-
-    rtl:
-        machine_type: n2-standard-4
-        count: 1
-        spot: true
-        disk_size_gb: 50
-        ssh_user: ${USER}
-        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
-        ssh_private_key: ${HOME}/.ssh/id_ed25519
-
-    spike:
-        machine_type: n2-standard-4
-        count: 1
-        spot: true
-        disk_size_gb: 50
-        ssh_user: ${USER}
-        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
-        ssh_private_key: ${HOME}/.ssh/id_ed25519
-
-    llvm:
-        machine_type: n2-standard-4
-        count: 1
-        spot: true
-        disk_size_gb: 50
-        ssh_user: ${USER}
-        ssh_public_key: ${HOME}/.ssh/id_ed25519.pub
-        ssh_private_key: ${HOME}/.ssh/id_ed25519
+        # Debian cloud images ship no rsync, and chia rsyncs file_mounts to this
+        # node in the worker phase — after these gcp_nodes setup_commands but
+        # BEFORE the top-level ones. Install it here or bring-up dies with
+        # "rsync: command not found".
+        setup_commands:
+            - "command -v rsync >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq rsync)"
 
 # RED runs 7 sealed MCP tool servers on the head. The default reverse-forwarded
 # head-tool range (8000-8010, 11 ports) fits them with almost no slack: a stale
@@ -216,6 +186,13 @@ tunnel_defaults:
 # at RED/RED on the receivers.
 file_mounts:
     /home/naonao/RED: /home/naonao/RED/
+    # Ship the head's OWN chia checkout too. chia's default worker setup clones
+    # upstream chia, which can pin a DIFFERENT ray than the head's checkout — and
+    # a head/worker ray skew makes `ray start` on the worker die with
+    # "FileNotFoundError: [Errno 2] No such file or directory: ''" (the worker
+    # reads an empty temp_dir out of the head's session info). Mounting the head's
+    # copy and reinstalling it below keeps both sides on one chia and one ray.
+    /home/naonao/chia: /home/naonao/chia/
 
 rsync_exclude:
     - "**/.git"
@@ -226,7 +203,8 @@ rsync_filter:
 
 initialization_commands: []
 
-setup_commands: []
+setup_commands:
+    - "command -v conda >/dev/null 2>&1 && conda install -y -n chia_env python=3.12 || true"
 
 # The head has no conda — activate the RED venv so `ray`/`python` resolve.
 head_env_commands: ["source $HOME/RED/.venv/bin/activate && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]

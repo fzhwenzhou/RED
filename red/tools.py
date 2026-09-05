@@ -2,8 +2,7 @@
 
 These pin to ``head_local`` so their files land on the driver's disk and get
 archived. The destination paths are baked in at construction — the agents only
-see the payload. The *editor* (``chia.base.tools.BashTool``, work_dir = project
-root) is built in the loop itself.
+see the payload, never a path they could redirect.
 
 RED is general-purpose: ``SourceTool`` serves whatever project/core the loop was
 given (never a hard-coded file list). The agents work through typed JSON
@@ -16,8 +15,11 @@ Tool surface the agents see:
     read_profile()                       – the mechanical profile (A1, ground truth)
     read_report() / write_report(json)   – the HotLoopReport (A1 mining agent writes;
                                            A2 reads it as ground truth)
-    read_spec() / write_spec(json)       – the ISASpec draft (A2)
-    read_status()                        – per-instruction pass/fail (latest evals)
+    read_spec() / write_spec(json)       – the ISASpec draft (A2); the ISS
+                                           implementer gets its own pair that
+                                           hides the C models and accepts only
+                                           spike_model (IssSpecTool)
+    read_status()                        – the last verification verdict + counterexample
     append_knowledge(note)               – durable cross-iteration notes
     finish(summary)                      – declare the extension complete
 """
@@ -29,7 +31,7 @@ import os
 
 from chia.base.tools.ChiaTool import ChiaTool
 
-from red import state_def
+from red import iss, state_def
 from red.constants import REPO_ROOT, find_sources
 
 
@@ -109,6 +111,12 @@ class ReportTool(ChiaTool):
         fill in from the profile."""
         try:
             report = state_def.from_json(report_json, state_def.HotLoopReport)
+            for loop in report.loops:
+                # Agents write operand_stats either as prose or as a small
+                # object; normalize to text so the artifact is well-typed
+                # either way instead of rejecting a useful report on shape.
+                if not isinstance(loop.operand_stats, str):
+                    loop.operand_stats = json.dumps(loop.operand_stats)
             state_def.validate_hot_loop_report(report)
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             return f"Rejected: invalid HotLoopReport — {e}"
@@ -120,7 +128,7 @@ class ReportTool(ChiaTool):
 class SpecTool(ChiaTool):
     """The ISASpec draft — A2's working artifact. ``write_spec`` validates the
     JSON against the ISASpec schema before accepting, so a malformed draft is
-    rejected back to the agent instead of poisoning A3/A4."""
+    rejected back to the agent instead of reaching the verification edges."""
 
     def __init__(self, name, spec_path, task_options=None):
         super().__init__(name, task_options=task_options)
@@ -142,12 +150,114 @@ class SpecTool(ChiaTool):
         pseudocode); it is validated and rejected if not."""
         try:
             spec = state_def.from_json(spec_json, state_def.ISASpec)
+            for ins in spec.instructions:
+                # Agents commonly nest the encoding fields
+                # (``"encoding": {"opcode": ..., "funct3": ...}``) instead of
+                # filling the flat ones. That is a shape difference, not a design
+                # error, so lift it into the schema rather than bouncing the draft.
+                if isinstance(ins.encoding, dict):
+                    parts = ins.encoding
+                    ins.opcode = ins.opcode or str(parts.get("opcode", ""))
+                    ins.funct3 = ins.funct3 or str(parts.get("funct3", ""))
+                    ins.funct7 = ins.funct7 or str(parts.get("funct7", ""))
+                    ins.encoding = str(parts.get("encoding") or
+                                       " ".join(f"{k}={v}" for k, v in parts.items()))
+                ins.opcode = state_def.normalize_opcode(ins.opcode) or ins.opcode
             state_def.validate_isa_spec(spec)
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             return f"Rejected: invalid ISASpec — {e}"
+
+        # spike_model belongs to the ISS implementer alone. Gate 2 only means
+        # something if the two executable models were written independently, so
+        # a designer-side turn cannot supply or edit one here: whatever the ISS
+        # agent last wrote is carried over, and anything sent in is dropped.
+        existing = {}
+        if os.path.exists(self.spec_path):
+            try:
+                with open(self.spec_path) as f:
+                    prior = state_def.from_json(f.read(), state_def.ISASpec)
+                existing = {i.mnemonic: i.spike_model for i in prior.instructions}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                existing = {}
+        for ins in spec.instructions:
+            ins.spike_model = existing.get(ins.mnemonic, "")
+
         with open(self.spec_path, "w") as f:
             f.write(state_def.to_json(spec))
         return f"Accepted ISASpec '{spec.name}' ({len(spec.instructions)} instructions)."
+
+
+class IssSpecTool(ChiaTool):
+    """The ISASpec as the **ISS implementer** may see and change it.
+
+    Gate 2 is only worth running if the two executable models were written
+    independently, so that is enforced here rather than asked for in a prompt:
+
+    * ``read_spec`` serves the spec with every ``c_model`` stripped out, so the
+      ISS agent cannot copy the implementation it is supposed to cross-check.
+    * ``write_spec`` takes **only** the ``spike_model`` fields from what the
+      agent writes and merges them into the spec on disk, so an ISS turn cannot
+      quietly edit the semantics, encodings or C models it disagreed with.
+    """
+
+    def __init__(self, name, spec_path, task_options=None):
+        super().__init__(name, task_options=task_options)
+        self.spec_path = spec_path
+        self.mcp.add_tool(self.read_spec, name=f"{name}_read_spec")
+        self.mcp.add_tool(self.write_spec, name=f"{name}_write_spec")
+        super().__post_init__()
+
+    def _load(self):
+        with open(self.spec_path) as f:
+            return state_def.from_json(f.read(), state_def.ISASpec)
+
+    def read_spec(self) -> str:
+        """Return the ISASpec to implement: encodings, operand widths, prose
+        semantics and pseudo-code. The reference C models are withheld on
+        purpose — implement what the specification says."""
+        if not os.path.exists(self.spec_path):
+            return "No ISASpec yet."
+        spec = self._load()
+        for ins in spec.instructions:
+            ins.c_model = "(withheld — implement from the specification above)"
+        return state_def.to_json(spec)
+
+    def write_spec(self, spec_json: str) -> str:
+        """Record your Spike implementations. Send the spec back with a
+        `spike_model` on each instruction; only those fields are taken, every
+        other field keeps the designer's value."""
+        try:
+            incoming = state_def.from_json(spec_json, state_def.ISASpec)
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return f"Rejected: not a valid ISASpec — {e}"
+        if not os.path.exists(self.spec_path):
+            return "Rejected: there is no ISASpec on disk to add models to."
+
+        spec = self._load()
+        supplied = {i.mnemonic: (i.spike_model or "") for i in incoming.instructions}
+        missing, wrong = [], []
+        for ins in spec.instructions:
+            model = supplied.get(ins.mnemonic, "").strip()
+            if not model:
+                missing.append(ins.mnemonic)
+                continue
+            want = iss.iss_function(ins.mnemonic)
+            if want not in model:
+                wrong.append(f"{ins.mnemonic} (expected a function named {want})")
+                continue
+            ins.spike_model = model
+        if missing or wrong:
+            parts = []
+            if missing:
+                parts.append("no spike_model for: " + ", ".join(missing))
+            if wrong:
+                parts.append("wrong function name in: " + "; ".join(wrong))
+            return "Rejected: " + "; ".join(parts)
+
+        with open(self.spec_path, "w") as f:
+            f.write(state_def.to_json(spec))
+        return (f"Accepted {len(spec.instructions)} Spike model(s). Gate 2 will "
+                "run them against the reference C models.")
 
 
 class StatusTool(ChiaTool):
@@ -216,3 +326,39 @@ class FinishTool(ChiaTool):
     def reset(self) -> None:
         if os.path.exists(self.sentinel_path):
             os.remove(self.sentinel_path)
+
+
+class RelayTool:
+    """A relay-aware stand-in for a :class:`ChiaTool`, passed to the LLM backend.
+
+    The backends build each tool's MCP endpoint as
+    ``http://{tool.hostname}:{tool.port}/{tool.name}/mcp`` from the attributes of
+    the tool object they are handed. RED's tools are pinned to ``head_local``, so
+    that hostname is the head's own address — which a tunnelled cloud worker
+    cannot dial: CHIA reverse-forwards the head's tool ports onto the worker's
+    ``CHIA_TOOL_RELAY_HOST`` (same port numbers) instead. CHIA ships
+    :func:`chia.base.tools.ChiaTool.resolve_tool_url` for exactly this rewrite,
+    but no model backend calls it, so on a tunnelled cluster every agent turn
+    dies inside the MCP task group with an unreachable endpoint.
+
+    This proxy carries the tool's identity and resolves the host **lazily, on
+    whichever node reads it** — the relay environment variables only exist on the
+    worker. On a single machine (no relay vars) it returns the address unchanged,
+    so ``--local-llm`` behaves exactly as before.
+    """
+
+    __slots__ = ("name", "port", "node_id", "_hostname")
+
+    def __init__(self, tool: ChiaTool):
+        self.name = tool.name
+        self.port = getattr(tool, "port", 8000)
+        self.node_id = getattr(tool, "node_id", None)
+        self._hostname = tool.hostname
+
+    @property
+    def hostname(self) -> str:
+        advertise = os.environ.get("CHIA_TOOL_ADVERTISE_HOST")
+        relay = os.environ.get("CHIA_TOOL_RELAY_HOST")
+        if advertise and relay and self._hostname == advertise:
+            return relay
+        return self._hostname

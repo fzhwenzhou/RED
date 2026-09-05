@@ -8,11 +8,11 @@ SSH, no rsync (CHIA field-guide pattern).
 Layout produced under ``DB_ROOT``::
 
     <workload>/run_<run_id>/
+    ├── profile.json              # A1 mechanical profile
     ├── HotLoopReport.json        # A1 output (typed)
-    ├── ISASpec.json              # A2 output (typed)
-    ├── gates/                    # GateResult + link1..link4 verdicts
-    ├── evals/                    # A3/A4/A5 EvalResults
-    ├── llm_logs/                 # LLM session transcripts
+    ├── ISASpec.draft.json        # A2 output before the verification edges
+    ├── ISASpec.json              # A2 output, final — RED's deliverable
+    ├── gates/                    # gate1 / gate2 / link1 / link2 verdicts
     └── summary.md                # human-readable result table
 """
 
@@ -30,12 +30,17 @@ from red.constants import DB_ROOT
 
 
 @ChiaFunction(resources={"database": 0.9})
-def claim_run(workload: str) -> tuple[int, str]:
-    """Allocate the next free ``run_<N>`` under DB_ROOT/<workload>/; returns
-    (N, abs_path). Atomic via mkdir; racing callers retry the next integer."""
+def claim_run(workload: str, db_root: str = "") -> tuple[int, str]:
+    """Allocate the next free ``run_<N>`` under <db_root>/<workload>/; returns
+    (N, abs_path). Atomic via mkdir; racing callers retry the next integer.
+
+    The driver passes *db_root* so the store's location is decided in one place
+    and every later ``put`` targets the same absolute path. Falling back to this
+    node's own ``DB_ROOT`` would resolve against wherever Ray happened to stage
+    the ``red`` module on this worker, not the rsynced repo."""
     if workload:
         get_profiler().add_info({"workload": workload})
-    root = os.path.join(DB_ROOT, workload)
+    root = os.path.join(db_root or DB_ROOT, workload)
     os.makedirs(root, exist_ok=True)
     while True:
         used = [int(m.group(1)) for d in os.listdir(root)
@@ -70,6 +75,19 @@ def write_text(dest_dir: str, filename: str, content: str, workload: str = "") -
         get_profiler().add_info({"workload": workload})
     with open(os.path.join(dest_dir, filename), "w") as f:
         f.write(content)
+
+
+@ChiaFunction(resources={"database": 0.9})
+def fetch_run(sweep_path: str) -> bytes:
+    """Return the whole run directory as a tar blob.
+
+    The store lives on the database node's own disk, which on a cloud cluster
+    is a VM that teardown deletes. The driver calls this at the end of a run and
+    unpacks the blob on the head, so the artifacts outlive the cluster."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        tar.add(sweep_path, arcname=".")
+    return buf.getvalue()
 
 
 @ChiaFunction(resources={"database": 0.9})

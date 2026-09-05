@@ -11,6 +11,7 @@ Subcommands:
                     llm node calls Gemini on Vertex as this SA via metadata
                     ADC; without the role every prompt 403s with
                     aiplatform.endpoints.predict denied)
+    count           print the number of cluster instances (0 when none)
     list            show cluster instances, firewall rules, disks, addresses
     verify-clean    exit 0 when no cluster instances/disks/addresses remain
     force-clean     delete ALL cluster resources directly (instances, disks,
@@ -154,6 +155,15 @@ def cmd_llm_sa() -> int:
     return 0
 
 
+def cmd_count() -> int:
+    """Print how many instances this cluster currently has (0 when none).
+
+    red_env.sh uses it to pick between `chia up` (fresh provision) and
+    `chia up --add` (discover + join what already exists)."""
+    print(len(list(_cluster_instances())))
+    return 0
+
+
 def cmd_list() -> int:
     insts = list(_cluster_instances())
     print(f"instances ({len(insts)}):")
@@ -269,6 +279,7 @@ def main() -> int:
         "ensure-apis": cmd_ensure_apis,
         "llm-sa": cmd_llm_sa,
         "ensure-iam": cmd_ensure_iam,
+        "count": cmd_count,
         "list": cmd_list,
         "verify-clean": cmd_verify_clean,
         "force-clean": cmd_force_clean,

@@ -224,3 +224,6 @@ __marimo__/
 
 # Claude Code
 .claude
+
+# RED run artifacts: output/work (driver scratch) + output/db (durable store)
+output/

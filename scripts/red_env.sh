@@ -166,14 +166,26 @@ cmd_up() {
         warn "recreate it:  bash $0 down && bash $0 up"
     fi
 
-    say "chia up"
-    (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
+    # `chia up` provisions; against instances that already exist it fails with a
+    # 409 rather than reusing them. `chia up --add` is the idempotent path: it
+    # discovers what is already there, provisions only what is missing, and
+    # joins everything to the running head. Use it whenever this cluster already
+    # has instances.
+    local existing; existing="$(gcp count)"
+    if [ "${existing:-0}" -gt 0 ]; then
+        say "chia up --add ($existing existing instance(s) discovered)"
+        (cd "$REPO_ROOT" && "$VENV/bin/chia" up --add -y "$CLUSTER_YAML")
+    else
+        say "chia up"
+        (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
+    fi
 
     say "ray status"
     "$VENV/bin/ray" status | sed -n '1,12p'
+    # 4 nodes: head_local (this machine) + the llm/database/profile GCP VMs.
     local active; active="$("$VENV/bin/ray" status | grep -c '^ 1 node_' || true)"
-    [ "$active" -ge 8 ] && ok "cluster up: $active nodes" \
-        || warn "only $active nodes active (expected 8) — check the log above"
+    [ "$active" -ge 4 ] && ok "cluster up: $active nodes" \
+        || warn "only $active nodes active (expected 4) — check the log above"
 
     [ "$(gcp llm-sa)" != "NONE" ] && [ "$(gcp llm-sa)" != "ABSENT" ] \
         && ok "llm node service account attached (Vertex ADC via metadata)"

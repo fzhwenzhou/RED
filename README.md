@@ -1,114 +1,130 @@
 # RED — an Agentic RISC-V ISA Extension Designer
 
 RED is an agent loop that, given **one application project** and **one processor
-core**, profiles the project, mines its hot loops, and designs a custom
-RISC-V instruction extension for them — then verifies the result across a
-four-link chain (kernel ⇔ C model ⇔ Spike ⇔ RTL ⇔ end-to-end).
+core**, profiles the project, mines its hot loops, and designs a custom RISC-V
+instruction extension for them. Its deliverable is a typed, executable
+**`ISASpec`**.
 
 RED runs on [CHIA](https://github.com/ucb-bar/chia) (UC Berkeley's agentic
 hardware design framework). Its **LLM backend is Google Gemini on Vertex AI**,
-billed to GCP free-trial credit.
+billed to GCP credit.
 
-## What is agentic vs. fixed
+## Scope
 
-| Stage | What it does | Kind |
-|-------|--------------|------|
-| **A1 — Kernel mining** | Profile the project, rank hot loops to ≥80% cycle coverage, bounded by Gate 1 (±5% re-profile reproducibility). | **Agentic** (research contribution) |
-| **A2 — ISA synthesis** | S2a pattern analyzer → S2b instruction designer → S2c spec critic (≤8 rounds), bounded by Gate 2 (C ⇔ Spike, 10⁵ vectors) + links 1–2. | **Agentic** (research contribution) |
-| **A3 — RTL** | Wire the extension into the core's PCPI interface and simulate. | Fixed tool node |
-| **A4 — Compiler** | LLVM opt pass lowers hot kernels to the new instructions. | Fixed tool node |
-| **A5 — E2E** | Compile, run, measure speedup on the extended core. | Fixed tool node |
+The RED proposal places A1 + A2 inside the "research contribution" enclosure and
+A3–A5 (RTL, compiler, end-to-end) outside it as fixed evaluation tool nodes on
+one platform. **This repository implements A1 + A2 only**; the ISASpec is the
+artifact those downstream nodes would consume.
 
-A1 and A2 are the research contribution; A3–A5 are bounded, fixed tool nodes.
+| Stage | What it does | Status |
+|-------|--------------|--------|
+| **A1 — Kernel mining** | Build + profile the project's own workload harness (callgrind), rank hot loops to ≥80% cycle coverage. Agentic ranking over a mechanical profile. | **Implemented** |
+| **Gate 1** | Two independent profile runs must agree within ±5%. | **Implemented** |
+| **A2 — ISA synthesis** | S2a pattern analyzer → S2b instruction designer → S2c spec critic (≤8 rounds), emitting the `ISASpec`. | **Implemented** |
+| **link 1** | Coverage holds, and every instruction's C reference model compiles and survives a 100,000-vector stress run under ASan+UBSan. | **Implemented (partial — see LIMITATIONS)** |
+| **ISS implementation** | A *separate* agent implements each instruction for Spike from the spec's prose + encoding alone — it never sees the C model. | **Implemented** |
+| **Gate 2 / link 2** | The two models must agree on 10⁵ random + corner vectors, with the instruction really executed by a patched Spike. | **Implemented** |
+| A3 / A4 / A5 | RTL (PCPI), LLVM pass, end-to-end speedup. | **Out of scope** |
+
+## LIMITATIONS
+
+Read this before quoting any result.
+
+1. **Gate 2 proves agreement, not correctness.** Two implementations agreeing
+   means the spec was unambiguous enough that two independent readers built the
+   same machine — it does not mean that machine is the one the workload needs.
+   The independence is enforced mechanically, not by asking nicely: the ISS
+   agent's sealed tool serves the spec with every `c_model` stripped out and
+   accepts only `spike_model` back, so it cannot copy the implementation it is
+   supposed to cross-check.
+2. **…and when the algorithm is canonical, the two implementations converge.**
+   Observed on a real run: for a 256x256 multiply specified as "in[0..7] = rs1,
+   in[8..15] = rs2, 512-bit product to out[0..15]", the ISS agent — which never
+   saw the C model — wrote schoolbook long multiplication *character for
+   character* the same as the designer had. Agreement then says the spec is
+   unambiguous (which is what the design claims the gate is for) but provides
+   little implementation diversity, so do not read a Gate 2 pass as two
+   genuinely different machines cross-checking each other. What Gate 2 adds over
+   link 1 regardless, and this part is solid: the instruction is **decoded from
+   the rv32 instruction stream and executed by the simulator** — operands arrive
+   in architectural registers, results go through the MMU — so a wrong
+   funct3/funct7, an encoding collision, or a broken operand convention fails
+   here and *cannot* fail in link 1.
+3. **link 1 is partial.** The design's link 1 proves the instruction's C model
+   *equivalent to the original kernel* by differential testing over the kernel's
+   input space. What runs here builds each `c_model` and stress-runs it on
+   100,000 corner + pseudo-random vectors under AddressSanitizer and
+   UndefinedBehaviorSanitizer, checking it is a pure, total, memory-safe
+   function. That genuinely falsifies broken models (the test suite proves it
+   catches an out-of-bounds write), but it does **not** establish equivalence to
+   the mined kernel — that needs a per-kernel extraction harness.
+4. **Gate 1 has no repair edge.** A failing Gate 1 is recorded and the run is
+   marked not-converged; the design's "re-instrument the harness" repair loop is
+   not wired up. In practice callgrind on a fixed binary is deterministic, so
+   Gate 1 reproduces at 0.00% drift. (link 1 and Gate 2 *do* have bounded
+   agentic repair edges.)
+5. **`perf` cycle counts are corroboration only** and are usually 0 (no PMU
+   access inside WSL/VMs). Ranking comes from callgrind instruction counts.
+6. **The instruction ABI is fixed by RED**, not chosen per instruction: an
+   R-type in a custom opcode slot with `rs1` = input block address, `rs2` =
+   output block address, `rd` = 0. That is what lets any designed instruction be
+   harnessed mechanically, but it means RED currently designs memory-operand
+   coprocessor instructions rather than register-to-register ones.
 
 ## Layout
 
 ```
 red/
-  constants.py    general-purpose config (resources, gates, Gemini/GCP backend)
-  state_def.py    typed artifacts: HotLoopReport, ISASpec, GateResult, …
+  constants.py    config: example inputs, gates, Gemini/GCP backend, output paths
+  state_def.py    typed artifacts: HotLoopReport, ISASpec, GateResult
   db_node.py      durable artifact store (database node)
   tools.py        sealed MCP tools the agents use (source/profile/report/spec/…)
-  nodes.py        programmatic evaluation edges (gates, links, A3–A5)
-  loop.py         the orchestration driver (A1 + Gate 1 → A2 + Gate 2 + links)
-  prompts/        agent charters (mine.md, system.md, debug.md)
+  nodes.py        mechanical edges: A1 profiling, Gate 1, link 1, Gate 2, link 2
+  iss.py          Gate 2: Spike extension codegen, rv32 harness, the diff
+  iss_selftest.py proves Gate 2 both passes agreeing models and fails others
+  loop.py         the orchestration driver (A1 + Gate 1 → A2 + link 1 → Gate 2)
+  prompts/        agent charters (mine.md, system.md, iss.md, debug.md)
 target_project/   one example project (micro-ecc)  — an INPUT, not hard-coded
 target_cpu/       one example core (PicoRV32)      — an INPUT, not hard-coded
-cluster.yaml      GCP cluster definition
-tests/test_env.py environment verification script
+cluster.yaml      GCP cluster definition (llm, database, profile + local head)
+scripts/          red_env.sh (cluster lifecycle), setup_spike.sh (Gate 2
+                  toolchain), gcp_util.py (GCP helper)
+SPIKE_SETUP.md    installing Spike for Gate 2 (what, where, why, verifying)
+tests/test_env.py environment verification
+output/           all run artifacts (git-ignored): output/work + output/db
 ```
 
-RED is **general-purpose**: nothing about any workload, core, or hot function is
-hard-coded. The agents discover hot loops and design instructions from the
-project's own source and measured profiles. The bundled `micro-ecc` /
-`PicoRV32` pair is just a worked example — defaults you can override:
+RED is **general-purpose**: no workload, core, or hot function is hard-coded.
+The bundled `micro-ecc` / `PicoRV32` pair is a worked example — defaults you
+override:
 
 ```bash
 python -m red.loop --project target_project/micro-ecc \
                    --core target_cpu/picorv32 \
                    --workload ECDH-secp256r1 \
-                   --cflags "-DuECC_VLI_N_BYTES=32 -DuECC_CURVE=uECC_secp256r1 -DuECC_WORD_SIZE=8"
+                   --harness test/test_ecdh.c \
+                   --cflags "-DuECC_WORD_SIZE=4 -DuECC_SUPPORTS_secp160r1=0 ..."
 ```
 
-## Setup
-
-Everything is automated by **`scripts/red_env.sh`** (idempotent — safe to re-run):
-
-```bash
-bash scripts/red_env.sh setup    # one-time: sshd on the head, venv, GCP auth+APIs,
-                                 #           self-test, then brings the cluster up
-bash scripts/red_env.sh up       # daily: (re)bring up the cluster
-bash scripts/red_env.sh down     # tear down + verify nothing is left billing
-bash scripts/red_env.sh status   # ray + GCP state at a glance
-```
-
-`setup` asks for interactive input only where unavoidable: your sudo password
-(to install `openssh-server` on the head) and one browser login
-(`gcloud auth application-default login`) if ADC is missing. After that,
-`up`/`down` are fully automatic.
-
-What it does for you:
-
-- **Head (this machine)**: generates the SSH keypair if missing, authorizes it
-  for self-SSH, installs + starts `sshd`, creates `.venv` with `chia` and `red`
-  installed editable, and resolves `HEAD_IP` to the machine's own address
-  (WSL: it changes on every reboot — the script re-resolves it each run).
-- **GCP**: sets the ADC quota project, enables the Compute + Vertex AI APIs,
-  and discovers the project's default compute service account.
-- **Cluster**: runs `chia up`. The `llm` node is created with that service
-  account attached, so the Gemini backend authenticates through the GCE
-  metadata server — **no `gcloud` login on any worker is ever needed**.
-  Workers rsync this repo to the same path and `pip install -e` it, so
-  `import red` works on every node.
-- **`down`**: `chia down` (terminates all instances, removes the firewall
-  rules, stops local ray), then verifies via the Compute API that **0
-  instances, 0 disks, and 0 static addresses remain** — nothing keeps billing.
-
-Manual equivalent of the GCP pieces (what the script runs for you):
-
-```bash
-gcloud auth application-default login
-gcloud auth application-default set-quota-project project-160a0199-6b4a-464c-86a
-```
-
-(Project/location/model are env-overridable: `RED_GCP_PROJECT`, `RED_GCP_LOCATION`, `RED_LLM_MODEL`.)
+`--harness` (the `.c` file holding the workload's `main`) and `--cflags`
+together *define* the workload: micro-ecc compiles every curve into each test
+binary, so pinning the run to ECDH-over-secp256r1 means selecting that test and
+switching the other curves off. `uECC_WORD_SIZE=4` makes the profiled limb
+arithmetic 32-bit, matching the rv32 target the extension is designed for.
 
 ## Run
 
-```bash
-# Smoke test the loop on one machine (no cluster, no LLM — mechanical A1 + Gate 1 only)
-python -m red.loop --local
-
-# Full loop on the cluster (Gemini backend)
-python -m red.loop
-```
-
-## Verify the environment
+See **[run_instructions.md](run_instructions.md)** for the full guide.
 
 ```bash
-python tests/test_env.py     # or: pytest -q tests/test_env.py
+python tests/test_env.py          # verify the environment (19 checks)
+python -m red.loop --local        # mechanical smoke test: A1 + Gate 1, no LLM
+python -m red.loop --local-llm    # full A1+A2 on this machine, real Gemini
+bash scripts/red_env.sh up        # bring the GCP cluster up
+python -m red.loop                # full A1+A2 on the CHIA cluster
+bash scripts/red_env.sh down      # tear down, verify nothing is billing
 ```
 
-The script probes the toolchain, round-trips every typed artifact, runs the
-mechanical nodes (gates, links, A3–A5) directly, and exercises the sealed MCP
-tools — confirming the environment matches the design's requirements.
+Artifacts land in `output/db/<workload>/run_<N>/`: `profile.json`,
+`HotLoopReport.json`, `ISASpec.draft.json`, `ISASpec.json` (the deliverable),
+`gates/`, and `summary.md`.
