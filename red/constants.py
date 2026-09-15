@@ -47,7 +47,17 @@ EXAMPLE_CFLAGS = ("-DuECC_WORD_SIZE=4 "
                   "-DuECC_SUPPORTS_secp224r1=0 -DuECC_SUPPORTS_secp256k1=0")
 
 
-def find_sources(root: str, exts=(".c", ".h", ".S", ".v")):
+# ``.inc``/``.inl`` are C sources under another name and must be included:
+# micro-ecc keeps its whole curve-specific arithmetic -- including the
+# secp256r1 fast reduction that is 43% of this workload's cycles -- in
+# ``curve-specific.inc``. Omitting the extension made that code invisible to
+# every agent, so the designer wrote a model for the hottest kernel in the
+# program without ever being able to read it. ``.sv`` for the same reason on
+# the core side.
+SOURCE_EXTS = (".c", ".h", ".inc", ".inl", ".S", ".s", ".v", ".sv", ".vh")
+
+
+def find_sources(root: str, exts=SOURCE_EXTS):
     """Yield (repo-relative path, absolute path) for source files under *root*.
 
     The A1 mining agent and the sealed SourceTool both locate the project/core
@@ -81,8 +91,97 @@ COVERAGE_TARGET = 0.80           # ranked loops must cover >=80% of cycles
 LINK1_VECTORS = 100_000          # vectors each instruction's C model is run on
 GATE2_VECTORS = 100_000          # vectors the C model and Spike must agree on
 GATE2_BLOCK = 1_024              # vectors per checksum in Gate 2's phase 1
-CRITIC_MAX_ROUNDS = 8            # S2c reject/revise cap, then escalation
+# Gate 2's per-instruction tests are subprocess-bound (cross-compile, native
+# run, Spike run), so they overlap well on threads. Capped so a large spec
+# cannot oversubscribe a small profile/head node.
+GATE2_MAX_PARALLEL = int(os.environ.get("RED_GATE2_PARALLEL", "4"))
+CRITIC_MAX_ROUNDS = 3            # S2c self-critique cap (the review
+                                 # sub-agents in red.review do the rest)
 REPAIR_MAX_ROUNDS = 3            # link-1 failure -> agentic repair, then escalation
+# review -> designer revision -> re-review, capped. Raise it (RED_REVIEW_ROUNDS)
+# when the reviewers are still finding blocking issues at the cap and you want
+# the designer to keep going; each extra round costs one review fan-out plus one
+# designer turn.
+REVIEW_MAX_ROUNDS = int(os.environ.get("RED_REVIEW_ROUNDS", "4"))
+REVIEW_MAX_FINDINGS = 12         # per reviewer; keeps a runaway reply bounded
+
+# ---------------------------------------------------------------------------
+# Platform cost model (red/cost.py) — every number measured, not assumed
+# ---------------------------------------------------------------------------
+#
+# Fitted to the RTL harness in eval/: mac96 moves 10 words and takes 48 cycles,
+# add256 moves 32 and takes 92, so a beat is 2 cycles and the fixed PCPI + FSM
+# overhead is 28. CYCLES_PER_IR converts the profiler's host instruction counts
+# into PicoRV32 cycles, from the measured 298,502,758 cycles / 35,063,482 Ir of
+# one full ECDH exchange. Override for a different core.
+FIXED_CYCLES = float(os.environ.get("RED_FIXED_CYCLES", "28"))
+CYCLES_PER_BEAT = float(os.environ.get("RED_CYCLES_PER_BEAT", "2"))
+MAC_CYCLES = float(os.environ.get("RED_MAC_CYCLES", "1"))
+CPU_LOAD_STORE = float(os.environ.get("RED_CPU_LOAD_STORE", "5"))
+CYCLES_PER_IR = float(os.environ.get("RED_CYCLES_PER_IR", "8.51"))
+
+# Gate 3 rejects an extension predicted to deliver less than this. The point of
+# designing custom instructions is not to break even.
+SPEEDUP_TARGET = float(os.environ.get("RED_SPEEDUP_TARGET", "2.0"))
+PERF_MAX_ROUNDS = int(os.environ.get("RED_PERF_ROUNDS", "4"))
+
+# ---------------------------------------------------------------------------
+# Gate 4 — security bounds (red/security.py)
+# ---------------------------------------------------------------------------
+#
+# An ISA extension is a permanent widening of the machine's attack surface: a
+# custom instruction runs at the privilege of whatever calls it, stalls the
+# pipeline for its whole latency, and — on the crypto kernels RED mines — its
+# operands ARE the secret. None of the other gates ask about that. Gate 4 does,
+# and it asks *mechanically* wherever a machine can answer: a sanitizer, a
+# simulator or an instruction count settles a security claim far better than a
+# model's opinion of one. The security agent (red/prompts/security.md) proposes;
+# these numbers dispose.
+#
+# Vectors the memory-safety battery runs per instruction: every adversarial
+# pattern (all-zeros, all-ones, single bits at every word boundary, carry
+# ripples) plus pseudo-random fill. Each vector is run twice against two
+# different poisoned output buffers, so an unwritten output word — a residue
+# leak of whatever the caller left in the destination block — is caught as a
+# difference rather than being invisible against zeroed memory.
+SECURITY_VECTORS = int(os.environ.get("RED_SECURITY_VECTORS", "512"))
+# Distinct operand values the constant-time check counts instructions for. The
+# model is run under callgrind with collection toggled on inside the model
+# itself, so the count is the instruction's own work and nothing else; if it
+# differs between two operand values, the instruction's latency depends on its
+# data and it leaks that data through timing.
+SECURITY_CT_VECTORS = int(os.environ.get("RED_SECURITY_CT_VECTORS", "6"))
+# A coprocessor instruction is not interruptible: the core is stalled for its
+# whole latency, so its worst-case cycle count is a lower bound on the machine's
+# interrupt latency. Past this, the extension is a denial-of-service risk for
+# anything real-time on the same core.
+SECURITY_MAX_STALL_CYCLES = float(os.environ.get("RED_SECURITY_MAX_STALL", "4096"))
+# How a proven data-dependent latency is treated. RED mines cryptographic
+# kernels, where the operands an instruction moves ARE the secret, so a
+# variable-latency instruction is a leak by default — and on an in-order core it
+# is a scheduling hazard even when the data is public. Set RED_SECURITY_CT to
+# "major" for a workload where the operands are genuinely not secret.
+SECURITY_CT_SEVERITY = os.environ.get("RED_SECURITY_CT", "blocking")
+# security finding -> designer revision -> re-check, capped.
+SECURITY_MAX_ROUNDS = int(os.environ.get("RED_SECURITY_ROUNDS", "2"))
+SECURITY_MAX_FINDINGS = 12       # per agent reply; keeps a runaway reply bounded
+# The agent may ask for at most this many vectors to be executed per turn.
+SECURITY_MAX_PROBES = int(os.environ.get("RED_SECURITY_PROBES", "24"))
+
+# ---------------------------------------------------------------------------
+# Dispatch watchdog (red.loop._await)
+# ---------------------------------------------------------------------------
+#
+# A plain ray.get() on a task whose resource has left the cluster waits
+# forever. When the workers' reverse SSH tunnels dropped mid-run, the driver
+# sat on one unschedulable LLM turn for nine hours while the instances billed.
+# So the driver polls instead: every STAGE_POLL_SECONDS it re-checks that the
+# resource the task needs is still in the cluster, which distinguishes a slow
+# stage (callgrind over a whole ECDH exchange takes ~20 min, and must not be
+# failed) from a dead one. STAGE_MAX_SECONDS is the backstop for a task that is
+# schedulable but wedged.
+STAGE_POLL_SECONDS = float(os.environ.get("RED_STAGE_POLL_SECONDS", "120"))
+STAGE_MAX_SECONDS = float(os.environ.get("RED_STAGE_MAX_SECONDS", "5400"))
 
 # ---------------------------------------------------------------------------
 # Toolchain probing
@@ -143,7 +242,36 @@ GCP_PROJECT = os.environ.get("RED_GCP_PROJECT", "project-160a0199-6b4a-464c-86a"
 GCP_LOCATION = os.environ.get("RED_GCP_LOCATION", "global")
 LLM_RESOURCE = float(os.environ.get("RED_LLM_RESOURCE", "1.0"))   # "llm" token share
 LLM_TIMEOUT_SECONDS = int(os.environ.get("RED_LLM_TIMEOUT_SECONDS", "1800"))
+# Output budget per turn, passed to the backend in red.loop. The backend's
+# 16k default truncates a spec carrying a C model (and a Spike model) for
+# several instructions, and a truncated reply arrives as MaxOutputTokensError
+# rather than as text -- a failed turn, not a short one.
+#
+# 64k, not 32k, because the constant-time rewrites Gate 4 asks for make the
+# models materially longer: a branch-free modular reduction carries its own
+# is_zero/is_greater helpers, and the ISS agent has to emit a Spike model for
+# every instruction in one reply.
+LLM_MAX_TOKENS = int(os.environ.get("RED_LLM_MAX_TOKENS", "64000"))
 LLM_PROMPTS_DIR = os.path.join(REPO_ROOT, "red", "prompts")
+
+# ---------------------------------------------------------------------------
+# Neo4j — the persistent design-knowledge graph (red/graph.py)
+# ---------------------------------------------------------------------------
+#
+# Runs on the HEAD, not on a cluster worker: `red_env.sh up`/`down` creates and
+# destroys the GCP nodes, so a graph living on one would be erased on every
+# teardown. The head's disk outlives any cluster, and tunnelled workers reach it
+# over bolt. Install and run it with scripts/setup_neo4j.sh (a userland install
+# under ~/.local — this host has neither passwordless sudo nor a docker group).
+#
+# The data directory is deliberately OUTSIDE the repo's output/, which the
+# operator is told to delete between test batches: the whole value of the graph
+# is that it remembers earlier runs.
+NEO4J_ENABLED = os.environ.get("RED_NEO4J_ENABLED", "1") not in ("0", "false", "")
+NEO4J_URI = os.environ.get("RED_NEO4J_URI", "bolt://127.0.0.1:7687")
+NEO4J_USER = os.environ.get("RED_NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("RED_NEO4J_PASSWORD", "redgraph1")
+NEO4J_DATABASE = os.environ.get("RED_NEO4J_DATABASE", "neo4j")
 
 # ---------------------------------------------------------------------------
 # Driver scratch + durable DB

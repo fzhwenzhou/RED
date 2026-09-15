@@ -50,6 +50,7 @@ from string import Template
 
 from red import state_def
 from red.constants import (
+    GATE2_MAX_PARALLEL,
     GATE2_BLOCK,
     RISCV_GCC,
     SPIKE_BIN,
@@ -667,15 +668,30 @@ def run_gate2(spec: state_def.ISASpec, work_dir: str,
     if so is None:
         return False, log, log
 
-    failures = []
-    for ins in spec.instructions:
-        ok, detail, counter = differential_test(
-            ins, os.path.join(work_dir, state_def.c_identifier(ins.mnemonic)),
-            so, vectors)
-        if not ok:
-            failures.append(f"{ins.mnemonic}: {detail}"
-                            + (f"\n{counter}" if counter else ""))
+    # Each instruction's differential test is an independent
+    # cross-compile + native run + Spike run, all of it waiting on
+    # subprocesses. Run them on a thread pool so a multi-instruction spec costs
+    # roughly one instruction's wall clock instead of the sum. The extension
+    # (.so) is built once above and only read from here, and each instruction
+    # gets its own work directory, so the tests share nothing.
+    failures: list[str] = []
     n = len(spec.instructions)
+    if n > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(n, GATE2_MAX_PARALLEL)) as pool:
+            results = list(pool.map(
+                lambda ins: (ins.mnemonic, *differential_test(
+                    ins, os.path.join(work_dir, state_def.c_identifier(ins.mnemonic)),
+                    so, vectors)),
+                spec.instructions))
+    else:
+        results = [(ins.mnemonic, *differential_test(
+            ins, os.path.join(work_dir, state_def.c_identifier(ins.mnemonic)),
+            so, vectors)) for ins in spec.instructions]
+    for mnemonic, ok, detail, counter in results:
+        if not ok:
+            failures.append(f"{mnemonic}: {detail}"
+                            + (f"\n{counter}" if counter else ""))
     if failures:
         return False, (f"{n - len(failures)}/{n} instructions agree with Spike over "
                        f"{vectors:,} vectors"), "\n\n".join(failures)

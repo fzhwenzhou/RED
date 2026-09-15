@@ -40,6 +40,7 @@ from typing import Optional
 from chia.base.ChiaFunction import ChiaFunction
 
 from red import state_def
+from red.callgrind import parse_raw as _parse_callgrind_raw
 from red.constants import (
     COVERAGE_TARGET,
     EXPECTED_TOOLS,
@@ -128,23 +129,38 @@ def _build_harness(project: str, work_dir: str, cflags: str,
     return out, cmd, rel
 
 
-def _callgrind_profile(binary: str, work_dir: str) -> tuple[dict, str, str]:
-    """Run the harness under callgrind and return per-function instruction counts.
+def _callgrind_profile(binary: str, work_dir: str) -> tuple[dict, str, str, dict]:
+    """Run the harness under callgrind and return per-function instruction
+    counts and call counts.
 
-    Returns ({} , "", "") when callgrind is unavailable or produced nothing, so
-    the caller can fall back to the static estimate."""
-    if not (_have("valgrind") and _have("callgrind_annotate")):
-        return {}, "", ""
+    Both numbers come from callgrind's OWN output file, parsed by
+    ``_parse_callgrind_raw``. ``callgrind_annotate`` is consulted only as a
+    fallback, because its text is threshold-filtered: it prints a row only
+    above a cost cutoff, so a hot function reached from many individually-cold
+    call sites never appears as a callee row and its call count reads as zero.
+    That is not hypothetical -- on valgrind 3.19 it dropped the call counts of
+    both hot kernels here, and a call count of zero silently disables all
+    benefit crediting in Gate 3 (red/cost.py).
+
+    Returns ({}, "", "", {}) when callgrind is unavailable or produced nothing,
+    so the caller can fall back to the static estimate."""
+    if not _have("valgrind"):
+        return {}, "", "", {}
     out = os.path.join(work_dir, "callgrind.out")
     cmd = (f"valgrind --tool=callgrind --callgrind-out-file={out} "
            f"--quiet {binary} >/dev/null 2>&1")
     subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if not os.path.exists(out):
-        return {}, "", ""
-    annotate = subprocess.run(["callgrind_annotate", out],
+        return {}, "", "", {}
+    counts, calls = _parse_callgrind_raw(out)
+    if not counts and _have("callgrind_annotate"):
+        annotate = subprocess.run(["callgrind_annotate", out],
+                                  capture_output=True, text=True)
+        counts = _parse_callgrind(annotate.stdout)
+        tree = subprocess.run(["callgrind_annotate", "--tree=calling", out],
                               capture_output=True, text=True)
-    counts = _parse_callgrind(annotate.stdout)
-    return (counts, "callgrind", cmd) if counts else ({}, "", "")
+        calls = _parse_callgrind_calls(tree.stdout)
+    return (counts, "callgrind", cmd, calls) if counts else ({}, "", "", {})
 
 
 def _perf_cycles(binary: str) -> int:
@@ -181,6 +197,28 @@ def _parse_callgrind(annotate: str) -> dict:
         fn = m.group(2).rsplit(":", 1)[-1].split("'")[0]
         counts[fn] = counts.get(fn, 0) + int(m.group(1).replace(",", ""))
     return counts
+
+
+def _parse_callgrind_calls(tree: str) -> dict:
+    """Map function name -> number of times it was called, from
+    ``callgrind_annotate --tree=calling``.
+
+    Callee rows carry the count per call site::
+
+        10,586,344 (30.19%)  >   ???:uECC_vli_mult (10,298x) [/path/to/binary]
+
+    A function reached from several sites gets a row each, so the counts are
+    summed; recursion suffixes (``'2``) fold into the base name the same way the
+    cost rows do."""
+    calls: dict = {}
+    row = re.compile(r"^\s*[\d,]+\s+(?:\([\s\d.]+%\)\s+)?[<>]\s+(\S+)\s+\(([\d,]+)x\)")
+    for line in tree.splitlines():
+        m = row.match(line)
+        if not m:
+            continue
+        fn = m.group(1).rsplit(":", 1)[-1].split("'")[0]
+        calls[fn] = calls.get(fn, 0) + int(m.group(2).replace(",", ""))
+    return calls
 
 
 def _static_profile(project: str, work_dir: str, cflags: str) -> tuple[dict, str, str]:
@@ -252,7 +290,7 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
     tc = _toolchain()
     available = sorted(g for g, t in tc.items() if any(t.values()))
     method, counts, command, harness_built, perf_cycles = "none", {}, "", False, 0
-    harness_main, build_log = "", ""
+    harness_main, build_log, calls = "", "", {}
 
     if _have("cc"):
         binary, build_log, harness_main = _build_harness(project, work_dir,
@@ -260,7 +298,7 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
         if binary:
             harness_built = True
             command = build_log
-            counts, method, cmd = _callgrind_profile(binary, work_dir)
+            counts, method, cmd, calls = _callgrind_profile(binary, work_dir)
             if counts:
                 command = cmd
             perf_cycles = _perf_cycles(binary)
@@ -272,6 +310,7 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
         "workload": workload,
         "profile_method": method,
         "cycle_counts": counts,
+        "call_counts": calls,
         "perf_cycles": perf_cycles,
         "available": available,
         "command": command,
@@ -480,6 +519,60 @@ def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
     passed, detail, counterexample = iss.run_gate2(spec, work_dir, GATE2_VECTORS)
     return state_def.GateResult(gate="gate2", passed=passed, detail=detail,
                                 counterexample=counterexample)
+
+
+# ---------------------------------------------------------------------------
+# Gate 4 — the security bound (red.security)
+# ---------------------------------------------------------------------------
+
+@ChiaFunction(resources={"profile": 1.0})
+def security_scan(spec_json: str, core_json: str = "",
+                  work_dir: str = "") -> str:
+    """Run every mechanical security check on the spec; return a SecurityReport
+    as JSON.
+
+    Placed on a profile node because that is where the tools it needs live: a C
+    compiler with the sanitizers, and valgrind for the constant-time checks. The
+    verdict itself is :func:`gate4`, kept separate and pure so the report can be
+    shown to the agents, merged with the security sub-agent's findings, and only
+    then turned into a pass or a fail.
+
+    Returns an empty-report JSON with the failure in ``checks_skipped`` rather
+    than raising, so a malformed draft cannot take the run down here."""
+    from red import security                  # local: only this node needs it
+    try:
+        spec = state_def.from_json(spec_json, state_def.ISASpec)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        return state_def.to_json(state_def.SecurityReport(
+            checks_skipped=[f"every check: the ISASpec did not parse — {e}"]))
+    core = None
+    if core_json:
+        try:
+            core = state_def.from_json(core_json, state_def.CoreProfile)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            core = None
+    work_dir = work_dir or os.path.join(OUTPUT_ROOT, "security")
+    return state_def.to_json(security.analyze(spec, core, work_dir))
+
+
+@ChiaFunction(resources={"head_local": 0.1})
+def gate4(report_json: str) -> state_def.GateResult:
+    """Gate 4: the spec carries no mechanically confirmed security defect.
+
+    Deliberately decided by the machine-established findings alone — a
+    sanitizer trap, an unwritten output word, two different instruction counts
+    for two operand values, an opcode field that decodes outside the custom
+    space. The security sub-agent's own findings ride along in the report as
+    advice to the designer and cannot fail this gate; when the agent wants to
+    fail a design it has to hand over an input vector that actually breaks it,
+    which the loop then executes (see :func:`red.security.probe`)."""
+    from red import security
+    try:
+        report = state_def.from_json(report_json, state_def.SecurityReport)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        return state_def.GateResult(gate="gate4", passed=False,
+                                    detail=f"invalid SecurityReport: {e}")
+    return security.verdict(report)
 
 
 @ChiaFunction(resources={"head_local": 0.1})

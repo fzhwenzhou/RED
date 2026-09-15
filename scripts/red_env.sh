@@ -58,6 +58,32 @@ export_cluster_env() {
     say "HEAD_IP=$HEAD_IP  USER=$USER  project=$RED_GCP_PROJECT"
 }
 
+# ---------------------------------------------------------------------------
+# known_hosts hygiene
+#
+# GCP recycles external IPs within a project, so an address that was the
+# database node last time comes back as the llm node with a different host key.
+# ssh then refuses the connection ("Host key verification failed"), chia's
+# `echo ok` setup probe times out, and the bring-up fails on that node -- or
+# worse, a reverse tunnel dies mid-run and the driver blocks on a resource that
+# has silently left the cluster. Purging the cluster's addresses before we use
+# them and again as we tear them down keeps a recycled IP from carrying a dead
+# key into the next run.
+# ---------------------------------------------------------------------------
+purge_known_hosts() {
+    # `|| true`: with no instances grep finds nothing and exits 1, which under
+    # `set -e` would abort the whole bring-up before it started.
+    local ips; ips="$(gcp list 2>/dev/null \
+        | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | sort -u || true)"
+    [ -z "$ips" ] && return 0
+    local n=0
+    for ip in $ips; do
+        if ssh-keygen -R "$ip" >/dev/null 2>&1; then n=$((n + 1)); fi
+    done
+    [ "$n" -gt 0 ] && ok "purged known_hosts for $n cluster address(es)"
+    return 0
+}
+
 # ===========================================================================
 # setup steps (idempotent)
 # ===========================================================================
@@ -141,12 +167,37 @@ step_tests() {
         || die "tests/test_env.py failed — fix before bringing the cluster up"
 }
 
+# ---------------------------------------------------------------------------
+# Knowledge graph (Neo4j) — see scripts/setup_neo4j.sh
+#
+# It runs on the head and its data outlives every cluster, so bring-up only has
+# to make sure it is up; teardown deliberately leaves it running, because the
+# graph is what the NEXT run reads.
+# ---------------------------------------------------------------------------
+graph_up() {
+    local s="$SCRIPT_DIR/setup_neo4j.sh"
+    local home="${RED_NEO4J_HOME:-$HOME/.local/share/red-neo4j}"
+    if [ ! -x "$home/bin/neo4j" ]; then
+        warn "no knowledge graph installed — runs will not record their history"
+        warn "install it once with:  bash $s install"
+        return 0
+    fi
+    if bash "$s" start >/dev/null 2>&1; then
+        ok "knowledge graph up ($("$VENV/bin/python" -m red.graph --stats 2>/dev/null \
+             | sed 's/^ *//' || echo 'bolt://127.0.0.1:7687'))"
+    else
+        warn "knowledge graph did not start — the run will proceed without history"
+    fi
+}
+
 # ===========================================================================
 # cluster commands
 # ===========================================================================
 
 cmd_up() {
     export_cluster_env
+    purge_known_hosts
+    graph_up
     [ -f "$HOME/.config/gcloud/application_default_credentials.json" ] \
         || die "no ADC — run: bash $0 setup"
     gcp ensure-apis >/dev/null || die "required GCP APIs not enabled"
@@ -172,9 +223,22 @@ cmd_up() {
     # joins everything to the running head. Use it whenever this cluster already
     # has instances.
     local existing; existing="$(gcp count)"
-    if [ "${existing:-0}" -gt 0 ]; then
-        say "chia up --add ($existing existing instance(s) discovered)"
+    local head_live=no
+    "$VENV/bin/ray" status >/dev/null 2>&1 && head_live=yes
+    if [ "${existing:-0}" -gt 0 ] && [ "$head_live" = yes ]; then
+        say "chia up --add ($existing existing instance(s), head is live)"
         (cd "$REPO_ROOT" && "$VENV/bin/chia" up --add -y "$CLUSTER_YAML")
+    elif [ "${existing:-0}" -gt 0 ]; then
+        # Instances exist but the head's ray is not running. `--add` needs a
+        # live head to join them to, so it cannot recover this state — and
+        # leaving the instances up would bill for nodes nothing can reach.
+        # This happens after a `down` that terminated the head's ray while a
+        # bring-up left instances behind (a setup step timing out on SSH, say).
+        warn "$existing orphaned instance(s) with no live head — terminating them first"
+        (cd "$REPO_ROOT" && "$VENV/bin/chia" down -y "$CLUSTER_YAML") || true
+        gcp force-clean
+        say "chia up (fresh)"
+        (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
     else
         say "chia up"
         (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
@@ -195,6 +259,7 @@ cmd_up() {
 
 cmd_down() {
     export_cluster_env
+    purge_known_hosts
     say "chia down"
     (cd "$REPO_ROOT" && "$VENV/bin/chia" down -y "$CLUSTER_YAML") \
         || warn "chia down reported errors — force-cleaning leftovers directly"
@@ -207,6 +272,11 @@ cmd_down() {
     say "verifying nothing is left billing"
     gcp verify-clean || die "leftover resources above — delete them in the console or re-run down"
     ok "cluster down, local ray stopped, nothing billing"
+    # The graph is intentionally left running: it is RED's memory across runs,
+    # and stopping it here would make `down` look like it had deleted history.
+    say "knowledge graph"
+    "$VENV/bin/python" -m red.graph --stats 2>/dev/null \
+        || echo "  (not running — start it with: bash $SCRIPT_DIR/setup_neo4j.sh start)"
 }
 
 cmd_status() {
@@ -216,6 +286,10 @@ cmd_status() {
     echo
     say "GCP project $RED_GCP_PROJECT"
     gcp list
+    echo
+    say "knowledge graph"
+    "$VENV/bin/python" -m red.graph --stats 2>/dev/null \
+        || echo "  (not running — bash $SCRIPT_DIR/setup_neo4j.sh start)"
 }
 
 cmd_setup() {

@@ -40,6 +40,7 @@ class HotLoop:
     body: str                        # the hot-loop source text
     ir: str                          # LLVM-IR / gimple snippet if available
     trip_count: int = 0              # static trip count (0 = unknown)
+    calls: int = 0                   # times called per workload run (profiler)
     dynamic_cycles: int = 0          # measured dynamic cycles (Gate-1 input)
     cycle_share: float = 0.0         # fraction of total dynamic cycles [0, 1]
     # Free-form observations that feed S2a: operand widths, memory access
@@ -65,6 +66,62 @@ class HotLoopReport:
 
     def ranked(self) -> list[HotLoop]:
         return sorted(self.loops, key=lambda l: (-l.cycle_share, l.rank))
+
+
+# ---------------------------------------------------------------------------
+# A0 — Core analysis (what the extension has to live inside)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CoreProfile:
+    """The target core as the designer must understand it.
+
+    A2 was designing instructions for an abstract RISC-V and getting them
+    architecturally wrong: it specified memory-operand instructions for a core
+    whose coprocessor interface cannot address memory, and duplicated a
+    multiplier the core already had (eval/RESULTS.md). This artifact is a
+    separate agent's reading of the core's own RTL, and it is what makes an
+    ISASpec specific to the machine that has to run it.
+
+    The cost fields feed :mod:`red.cost` directly, so a different core changes
+    the numbers Gate 3 gates on rather than requiring new code."""
+
+    name: str                        # e.g. "picorv32"
+    isa: str = ""                    # e.g. "rv32im"
+    microarchitecture: str = ""      # prose: pipeline, issue, hazards
+    coprocessor: str = ""            # e.g. "PCPI"
+    coprocessor_memory_access: bool = False   # can it address memory itself?
+    coprocessor_result: str = ""     # how a result gets back (e.g. "one 32-bit rd")
+    memory_interface: str = ""       # e.g. "native valid/ready, 2-cycle SRAM"
+    existing_units: list[str] = field(default_factory=list)   # don't duplicate these
+    custom_opcode_space: list[str] = field(default_factory=list)
+    register_file: str = ""
+    # --- cost parameters Gate 3 uses (per core, measured or estimated) -----
+    cycles_per_load: float = 0.0
+    cycles_per_alu_op: float = 0.0
+    coprocessor_issue_overhead: float = 0.0   # cycles before the first operand moves
+    cycles_per_word_moved: float = 0.0
+    area_note: str = ""              # what "large" means on this core
+    constraints: list[str] = field(default_factory=list)   # hard facts to respect
+    evidence: list[str] = field(default_factory=list)      # where each claim came from
+
+
+def validate_core_profile(c: CoreProfile) -> None:
+    """A CoreProfile is useful only if it names the core and says how a
+    coprocessor attaches — those are the two facts that decide what an
+    instruction may even look like."""
+    if not c.name:
+        raise ValueError("CoreProfile.name is required")
+    if not c.coprocessor:
+        raise ValueError("CoreProfile must say how a coprocessor attaches "
+                         "(`coprocessor`), e.g. the interface's name")
+    if not c.isa:
+        raise ValueError("CoreProfile.isa is required (e.g. 'rv32im')")
+    for fname in ("cycles_per_load", "cycles_per_alu_op",
+                  "coprocessor_issue_overhead", "cycles_per_word_moved"):
+        v = getattr(c, fname)
+        if not isinstance(v, (int, float)) or v < 0:
+            raise ValueError(f"CoreProfile.{fname}={v!r} must be a non-negative number")
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +158,14 @@ class InstructionSpec:
     c_model: str = ""                # compilable C99 reference model (link 1)
     spike_model: str = ""            # C++ model for the Spike ISS (Gate 2)
     words: int = 8                   # operand width in 32-bit words
+    # --- what it costs and what it buys (Gate 3, see red/cost.py) --------
+    # The operand traffic is fixed by `words`, so an instruction only pays for
+    # itself when it does enough arithmetic per word moved. These make that
+    # claim explicit and checkable instead of leaving it to hope.
+    mac_ops: int = 0                 # 32x32 multiplies performed per invocation
+    replaces: str = ""               # loop_id (or function) from the HotLoopReport
+    invocations: int = 1             # times this runs per call of that loop
+    marshal_words: int = 0           # words the caller must copy per invocation
     operands: list[str] = field(default_factory=list)   # rd, rs1, rs2
     funct3: str = ""
     funct7: str = ""
@@ -139,6 +204,110 @@ class GateResult:
     passed: bool
     detail: str = ""
     counterexample: Optional[str] = None   # e.g. failing vector or divergence
+
+
+# ---------------------------------------------------------------------------
+# Spec review (the sub-agents in red.review)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReviewFinding:
+    """One reviewer's objection to the spec.
+
+    ``blocking`` means the instruction cannot serve its purpose as written —
+    unbuildable on the target, uncallable by the application, or slower than
+    what it replaces. Those are the ones fed back to the designer."""
+
+    reviewer: str                    # implementability | callability | benefit | legality
+    severity: str                    # blocking | major | minor
+    finding: str
+    instruction: str = ""            # mnemonic, or "" for a spec-wide finding
+    evidence: str = ""
+    fix: str = ""
+
+
+@dataclass
+class ReviewReport:
+    """What the reviewers collectively found, ordered worst-first."""
+
+    reviewers: list[str] = field(default_factory=list)
+    findings: list[ReviewFinding] = field(default_factory=list)
+
+    def blocking(self) -> int:
+        return sum(1 for f in self.findings if f.severity == "blocking")
+
+    def actionable(self) -> list[ReviewFinding]:
+        return [f for f in self.findings if f.severity in ("blocking", "major")]
+
+
+# ---------------------------------------------------------------------------
+# Security (Gate 4 — red.security)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SecurityFinding:
+    """One security defect in the spec, and *how it is known*.
+
+    ``confidence`` is the field that matters, because it decides whether the
+    finding can block:
+
+    * ``confirmed`` — a tool observed the failure. AddressSanitizer trapped an
+      out-of-bounds write, the model returned a different answer for the same
+      input, callgrind counted different instruction counts for two operand
+      values, memcheck saw a branch on a secret. There is a reproducible
+      artifact behind it.
+    * ``derived``   — arithmetic or decoding over the spec's own declared
+      fields, with no judgement in between: an encoding whose opcode bits are
+      not in the custom space, two instructions in one encoding slot, a stall
+      longer than the interrupt-latency bound.
+    * ``heuristic`` — a pattern match over the model's source text (the taint
+      scan for secret-dependent control flow). Real signal, but it can be
+      wrong, so it advises rather than blocks.
+    * ``agent``     — the security sub-agent's own reading. It sees what no
+      checker can, and it can also hallucinate; it is never trusted on its own
+      word. When it wants a finding to count, it proposes a concrete input
+      vector, the loop *executes* it, and the resulting evidence comes back as
+      ``confirmed`` through the mechanical path instead.
+    """
+
+    check: str                       # check id, e.g. "memory.bounds"
+    severity: str                    # blocking | major | minor
+    confidence: str                  # confirmed | derived | heuristic | agent
+    finding: str
+    instruction: str = ""            # mnemonic, or "" for a spec-wide finding
+    evidence: str = ""               # the tool output, verbatim where short
+    fix: str = ""
+
+    def is_mechanical(self) -> bool:
+        return self.confidence in ("confirmed", "derived")
+
+
+@dataclass
+class SecurityReport:
+    """What Gate 4 found, plus what it could not check and why.
+
+    ``checks_skipped`` is not bookkeeping: a check that did not run is not a
+    check that passed, and a security report that quietly omits the checks its
+    host could not perform is worse than no report. The loop prints them and
+    the gate's detail names them.
+    """
+
+    checks_run: list[str] = field(default_factory=list)
+    checks_skipped: list[str] = field(default_factory=list)   # "id: reason"
+    findings: list[SecurityFinding] = field(default_factory=list)
+    vectors: int = 0                 # vectors the batteries executed per model
+
+    def blocking(self) -> int:
+        return sum(1 for f in self.findings if f.severity == "blocking")
+
+    def mechanical_blocking(self) -> list[SecurityFinding]:
+        """The blocking findings a machine stands behind — the ones that decide
+        the gate. An agent's unsupported assertion never appears here."""
+        return [f for f in self.findings
+                if f.severity == "blocking" and f.is_mechanical()]
+
+    def actionable(self) -> list[SecurityFinding]:
+        return [f for f in self.findings if f.severity in ("blocking", "major")]
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +453,17 @@ def validate_isa_spec(s: ISASpec) -> None:
         if not isinstance(ins.words, int) or not (1 <= ins.words <= 256):
             raise ValueError(f"instruction {ins.name!r} words={ins.words!r} "
                              "must be an int in [1, 256] (operand width in 32-bit words)")
+        for fname, val in (("mac_ops", ins.mac_ops),
+                           ("invocations", ins.invocations),
+                           ("marshal_words", ins.marshal_words)):
+            if not isinstance(val, int) or val < 0:
+                raise ValueError(f"instruction {ins.name!r} {fname}={val!r} must be "
+                                 "a non-negative int (see red/cost.py)")
+        if ins.invocations < 1:
+            raise ValueError(f"instruction {ins.name!r} invocations must be >= 1")
+        if not ins.replaces:
+            raise ValueError(f"instruction {ins.name!r} must name the mined loop it "
+                             "replaces (`replaces`), so its benefit can be computed")
         expected = f"{c_identifier(ins.mnemonic)}_model"
         if expected not in ins.c_model:
             raise ValueError(

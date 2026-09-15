@@ -36,16 +36,32 @@ export RED_GCP_LOCATION=global            # preview models are served globally
 export RED_LLM_MODEL=gemini-3.1-pro-preview
 ```
 
-Verify the environment — 19 checks covering imports, the toolchain, artifact
+Install the two native dependencies RED brings its own copies of. Both are
+userland installs under `~/.local` and need no root:
+
+```bash
+bash scripts/setup_spike.sh              # Gate 2's patched ISS
+bash scripts/setup_neo4j.sh install      # the persistent knowledge graph
+bash scripts/setup_neo4j.sh start
+```
+
+The graph is where RED remembers earlier runs — what was designed for each hot
+loop, what it was predicted to be worth, and what the reviewers refused — and
+the designer reads it before designing. It lives on the head, and its data
+directory is outside `output/`, so clearing run artifacts does not erase it.
+`red_env.sh up` starts it for you from then on. A run without it still works;
+it just starts from zero. See `NEO4J_SETUP.md`.
+
+Verify the environment — 61 checks covering imports, the toolchain, artifact
 round-trips, every mechanical gate (including that link 1 *rejects* a bad C
-model), the durable store, and the sealed MCP tools:
+model), the durable store, the sealed MCP tools, and the knowledge graph:
 
 ```bash
 python tests/test_env.py
 ```
 
-`cc` and `valgrind` + `callgrind_annotate` must be present, or A1 silently
-falls back to a much weaker static estimate — the test fails loudly if so.
+`cc` and `valgrind` must be present, or A1 silently falls back to a much weaker
+static estimate — the test fails loudly if so.
 
 ---
 
@@ -169,7 +185,14 @@ bash scripts/red_env.sh down
 Runs `chia down`, force-deletes any cluster-labeled leftovers directly through
 the Compute API (in case `chia down` dies midway), stops local Ray, and then
 **verifies** 0 instances, 0 disks and 0 static addresses remain. It exits
-non-zero if anything is still billing. Confirm independently with:
+non-zero if anything is still billing.
+
+It leaves the knowledge graph running, on purpose — that is the head's local
+Neo4j, it costs nothing on GCP, and it is what the next run reads. `down` prints
+its census so you can see the run was recorded. To stop it anyway:
+`bash scripts/setup_neo4j.sh stop` (the data is kept).
+
+Confirm independently with:
 
 ```bash
 gcloud compute instances list --project <YOUR_PROJECT>
@@ -207,6 +230,35 @@ passing means two independently written models of each instruction agreed on
 100,000 vectors with the instruction really executed by Spike — it does *not*
 mean the instruction is the right one for the workload. See LIMITATIONS in
 `README.md` before quoting an ISASpec as verified.
+
+---
+
+## 4-graph. What the run left in the knowledge graph
+
+Every run is also recorded in Neo4j, and unlike `output/` that record persists.
+
+```bash
+bash scripts/setup_neo4j.sh status
+./.venv/bin/python -m red.graph --query \
+  "MATCH (r:Run) RETURN r.run_id, r.converged, r.predicted_speedup, r.coverage
+   ORDER BY r.started DESC"
+```
+
+The query worth knowing is the one the designer itself runs — what has been
+tried for a hot loop, and what it was worth:
+
+```bash
+./.venv/bin/python -m red.graph --query \
+  "MATCH (l:HotLoop {function:'uECC_vli_mult'})<-[:REPLACES]-(i:Instruction)
+         <-[:HAS_INSTRUCTION]-(:Spec)<-[:PRODUCED]-(r:Run)
+   RETURN r.run_id, r.converged, i.mnemonic, i.words, i.mac_ops,
+          i.work_per_word, r.predicted_speedup
+   ORDER BY r.predicted_speedup DESC"
+```
+
+`work_per_word` is the column that explains outcomes: the per-iteration designs
+that lost score ~0.25, the whole-kernel ones that pass Gate 3 score ~2.0. Full
+model and agent-facing queries in `NEO4J_SETUP.md`.
 
 ---
 
@@ -251,6 +303,205 @@ extension RED generated.
 One honest observation from that run: the ISS agent, which never saw the C
 model, wrote schoolbook long multiplication identical to the designer's. See
 LIMITATIONS point 2 in `README.md` for what that does and does not buy you.
+
+---
+
+## 4d. A0 — the core analyst
+
+Before A2 designs anything, a separate agent reads the **target core's own RTL**
+and writes a typed `CoreProfile`: the ISA this configuration implements, whether
+the coprocessor interface can address memory, what functional units already
+exist, how many cycles a load costs, which opcodes are free, and how big the core
+is. It runs concurrently with A1 mining (one reads the project, the other the
+core), and its output goes to A2's charter, the reviewers, and Gate 3's cost
+constants.
+
+On the bundled PicoRV32 example it independently derives the constraint that the
+RTL evaluation in `eval/` discovered the hard way:
+
+```
+CONSTRAINT: The coprocessor interface (PCPI) cannot access memory.
+CONSTRAINT: Operands must be provided entirely via the two 32-bit register reads.
+CONSTRAINT: Results must fit in a single 32-bit register write (rd).
+units already present: multiplier, divider, barrel shifter   <- do not duplicate
+area: extremely small core (~750-1000 LUTs); a 512-bit FF buffer would be massive
+```
+
+Its cycle numbers are the *interface* latency (PCPI handshake = 1 cycle). Gate 3
+composes them with the measured implementation overhead — a coprocessor also
+pays for its own state machine and bus hand-over — so `fixed = 1 + 27` and
+`beat = 1 + 1` reproduce the 28/2 the RTL actually showed. Taking A0's numbers
+raw would make the gate optimistic by an order of magnitude.
+
+Written to `output/db/<workload>/run_<N>/CoreProfile.json`.
+
+## 4e. Gate 3 — the performance gate
+
+Gate 3 costs every instruction against the target's measured platform model and
+rejects an extension predicted to deliver less than `RED_SPEEDUP_TARGET`
+(default 2×), handing the designer the arithmetic for up to `RED_PERF_ROUNDS`
+redesign rounds.
+
+`mac_ops` sets an instruction's price, so Gate 3 **measures it rather than
+trusting it**: each `c_model` is compiled and run once under callgrind, and the
+instruction is costed on what it executes. From a live run:
+
+```
+covers 97.9% of profiled cycles; predicted whole-application speedup 0.91x
+  mul256:       189 cyc (32 beats, 64 MAC, 2.00 MAC/word) vs 10216 cyc  = 29.27x
+  modreduce256: 10536 cyc (32 beats, 10411 MAC) vs 4925 cyc = 0.47x
+                — declares mac_ops=0 but its C model executes 83,295
+                  instructions (~10412 ops); costed on the measurement
+```
+
+Priced on the declaration that spec would have scored ~30× and shipped; priced
+on what it does, it is a **slowdown**, and it went back to the designer.
+
+Verdicts land in `output/db/<workload>/run_<N>/perf/round<N>.{json,md}`.
+
+## 4f. Gate 4 — the security gate
+
+Between Gate 3 and the review, RED asks whether the extension is safe to build
+into the machine. Every other gate can pass on an instruction that leaks the key
+it multiplies: a conditional subtraction in a modular reduction is correct, is
+fast, and is a working timing attack.
+
+The gate is decided **mechanically**, on the designer's own C model:
+
+| check | how |
+|---|---|
+| memory safety | ASan + UBSan, operand blocks in exactly-sized allocations, adversarial vectors (all-ones, single bits at every word boundary, carry ripples) then random |
+| output residue | each vector run twice against two differently poisoned output blocks — a word the model never writes is a leak of the caller's previous data |
+| purity | the same two runs catch state carried between invocations |
+| input integrity | the input block is shadowed and compared after every call |
+| constant time | callgrind counts the instructions **the model itself** executes for several operand values; a difference is a timing side channel |
+| secret branches | the ctgrind technique — the operand block is marked undefined and memcheck reports any branch or address depending on it |
+| decode legality | the low 7 bits decoded against the four custom opcodes; field widths; encoding-slot collisions |
+| no libc | a comment-stripped scan for allocation, I/O, the clock, non-local jumps |
+| interrupt latency | the cost model's cycle count against `RED_SECURITY_MAX_STALL` — a coprocessor instruction cannot be interrupted |
+
+A **security sub-agent** runs alongside (`red/prompts/security.md`). It reads the
+spec and the mechanical report and probes each model with operand values chosen
+from what the arithmetic *means* — the modulus, the reduction threshold, a pair
+whose product is exactly 2³². Those probes are **executed** under the same
+sanitizers, so a vector that breaks a model becomes a confirmed blocking finding.
+What the agent merely asserts is capped at `major`: it reaches the designer as
+advice and cannot fail the gate. A checker a model can talk into rejecting a
+sound design is not a checker; one that passes an unsafe design because the model
+said it looked fine is worse.
+
+Blocking findings go back to the designer (`red/prompts/secure.md`) for up to
+`RED_SECURITY_ROUNDS` rounds (default 2), with the branch-free rewrite spelled
+out — masked select keeps `words` and `mac_ops`, and therefore the Gate 3 result,
+intact. If a revision does change the model, Gate 3 is re-priced on it. The gate
+is then re-run, without the agent, on whatever spec finally ships.
+
+Knobs: `RED_SECURITY_VECTORS` (512), `RED_SECURITY_CT_VECTORS` (6),
+`RED_SECURITY_ROUNDS` (2), `RED_SECURITY_PROBES` (24),
+`RED_SECURITY_MAX_STALL` (4096), and `RED_SECURITY_CT=major` for a workload
+whose operands are genuinely not secret.
+
+**A skipped check is not a passed check.** Anything the host could not run is
+named in `security/round<N>.md`, in the gate's one-line detail, to the reviewers,
+and in the run summary as `NOT CHECKED —`. A host without a C compiler fails the
+gate outright rather than passing on the static checks alone.
+
+Verdicts land in `output/db/<workload>/run_<N>/security/`.
+
+## 4c. The review stage and its feedback edge
+
+After link 1, four **review sub-agents** examine the spec concurrently, each
+answering a question the gates cannot:
+
+| reviewer | question |
+|---|---|
+| `implementability` | can it be built as a coprocessor for this core, and at what latency/area? |
+| `callability` | can the application call it on its own data without marshalling, and does it return every value callers need? |
+| `benefit` | is it faster than the software it replaces, and does that move the whole application (Amdahl)? |
+| `legality` | encodings, collisions, totality, agreement between prose, pseudo-code and operand packing |
+
+They take their whole context in the prompt and answer with JSON, so they carry
+no tool servers and all four dispatch in one round trip. Every **blocking**
+finding goes back to *the designer that wrote the spec* (`red/prompts/revise.md`)
+through the sealed status tool; the designer revises, link 1 is re-established,
+and the reviewers run again — `RED_REVIEW_ROUNDS` rounds (default 2).
+
+A spec with unresolved blocking findings is reported **NOT converged** even when
+Gate 1, link 1, Gate 4 and Gate 2 all pass. That is deliberate: the gates verify that an
+instruction means what it says, and `eval/` showed that is not the same as it
+being worth building.
+
+Findings land in `output/db/<workload>/run_<N>/review/round<N>.{json,md}`.
+
+### What the reviewers actually catch
+
+From three consecutive runs on the bundled example, round 1 raised 12, 9 and 9
+findings (10, 5 and 7 blocking). They are substantive, and they independently
+reproduce what the hand-built RTL evaluation in `eval/` measured:
+
+- *"add256/sub256 are slower than the software they replace — marshalling
+  separate 8-word operands into a contiguous block costs more than the
+  instruction saves"* — `eval/` measured 774 cycles marshalled against 769 for
+  the software routine.
+- *"the latency of all instructions is dominated by data movement"* — `eval/`
+  measured 2.0 cycles per operand word plus 28 cycles of fixed overhead.
+- *"mulu256 discards the existing accumulator, forcing a 512-bit software
+  addition that negates the saving"* — the same class of defect as the dropped
+  carry-out that made `add256` unusable.
+
+The designer acts on them. In run 1 it replaced a one-MAC-per-call `mac96` with
+`mac256_32` — a 32x256 multiply-accumulate that does eight MACs per operand
+block, i.e. eight times the arithmetic for the same data movement — and replaced
+`add256`/`sub256` with `mmod_fast256`, a full modular reduction whose caller
+needs no carry-out. Both survived Gate 2 against an independently written Spike
+model. Blocking findings fell from 10 to 4.
+
+### Five consecutive runs
+
+| run | wall clock | blocking findings, round 1 -> 2 | Gate 2 | outcome |
+|---|---|---|---|---|
+| 1 | 15.6 min | 10 -> 4 | PASS 2/2 | not converged |
+| 2 | 21.4 min | 5 -> 3 | PASS 2/2 | not converged |
+| 3 | — | 7 -> 3 | — | **crashed** in the ISS turn (see below) |
+| 4 | 13.2 min | 7 -> 5 | PASS 3/3 | not converged |
+| 5 | 19.6 min | 8 -> 1 | PASS 2/2 | not converged |
+
+The feedback edge works in every run: blocking findings fall each time the
+designer is given them (37 -> 16 across the five, a 57% reduction), and Gate 2
+passed on the *revised* spec in every completed run. What the designer produces
+varies between runs — one produced `mulu32x256` + `modred256`, another went back
+to `add256`/`sub256`/`mul256` and was told so again — which is why the reviewers
+are a loop rather than a one-shot check.
+
+Run 3 exposed a real robustness bug and is left in the table rather than
+re-rolled: the Vertex backend *raises* on a reply that hits `max_output_tokens`
+instead of reporting it, and that exception tore down a 17-minute run.
+`_dispatch_llm` now converts a raised turn into a failed turn, which every caller
+already handles, and `RED_LLM_MAX_TOKENS` (default 32000) makes truncation far
+less likely. Run 4 proved the fix: it hit a `RateLimitError` mid-revision,
+logged it, and carried on to a clean Gate 2.
+
+That the runs still report **NOT converged** is the honest verdict: the
+reviewers keep finding real problems, because RED's fixed memory-block operand
+ABI makes it hard for *any* instruction on this core to win. See
+[eval/RESULTS.md](eval/RESULTS.md) §5.
+
+## 4b. Does the extension pay off? (`eval/`)
+
+The loop stops at a verified ISASpec. To find out whether that spec actually
+accelerates the application and what it costs in silicon:
+
+```bash
+bash eval/scripts/area.sh              # area: baseline core vs core + accelerator
+bash eval/scripts/run_eval.sh quick    # verify the RTL + per-operation costs (~1 min)
+bash eval/scripts/run_eval.sh          # + the two full-ECDH RTL runs (~8 min)
+```
+
+This builds the extension as PicoRV32 RTL, patches micro-ecc to use it, and runs
+one complete ECDH key exchange both ways on cycle-accurate RTL, checking the
+shared secrets still agree. See [eval/README.md](eval/README.md) for the harness
+and [eval/RESULTS.md](eval/RESULTS.md) for the measured outcome — which for the
+current spec is a 2% *slowdown* at +74% area, with the reasons measured.
 
 ---
 

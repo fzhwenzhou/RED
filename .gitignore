@@ -227,3 +227,6 @@ __marimo__/
 
 # RED run artifacts: output/work (driver scratch) + output/db (durable store)
 output/
+
+# Evaluation harness build products (RTL sims, firmware images, synthesis logs)
+eval/build/

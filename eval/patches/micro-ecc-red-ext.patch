@@ -1,0 +1,84 @@
+RED evaluation: use the agent-designed custom-0 extension in micro-ecc.
+
+Applied to a *copy* of the micro-ecc sources by eval/scripts/build_firmware.sh
+(`ext` variant); the submodule itself is never touched.
+
+uECC_vli_mult's inner loop is where 43% of the ECDH instruction count sits, and
+the ISASpec's mac96 is a literal match for micro-ecc's muladd step. The rewrite
+keeps the 96-bit accumulator inside the instruction's operand block so no words
+are copied per multiply-accumulate -- measured 46 cycles per mac96 against 79
+for the register-accumulator software MAC (eval/firmware/microbench.c).
+
+add256/sub256 are deliberately NOT used: micro-ecc's uECC_vli_add/sub return the
+carry/borrow their callers need and the ISASpec's versions do not produce it,
+and at the sites where the carry is dead the operands are not adjacent, so
+marshalling them costs more than the instruction saves (measured: 90 cycles in
+place, 772 with marshalling, against 769 for the software routine). See
+eval/RESULTS.md.
+
+--- a/uECC.c	2026-09-07 15:17:47.431323422 -0400
++++ b/uECC.c	2026-09-07 15:17:47.431602322 -0400
+@@ -3,6 +3,9 @@
+ #include "uECC.h"
+ #include "uECC_vli.h"
+ 
++/* RED: intrinsics for the agent-designed custom-0 extension. */
++#include "red_ext.h"
++
+ #ifndef uECC_RNG_MAX_TRIES
+     #define uECC_RNG_MAX_TRIES 64
+ #endif
+@@ -417,31 +420,39 @@
+                                 const uECC_word_t *left,
+                                 const uECC_word_t *right,
+                                 wordcount_t num_words) {
+-    uECC_word_t r0 = 0;
+-    uECC_word_t r1 = 0;
+-    uECC_word_t r2 = 0;
++    /* RED extension: mac96 is exactly muladd's step -- acc[0..2] += a * b.
++       RED's ABI puts the operands in memory, so the 96-bit accumulator lives
++       in this block rather than in three registers, and the block is passed as
++       both input and output: mac96 writes out[3..4] = 0, which only clears the
++       a/b slots that are rewritten on the next iteration anyway. Nothing is
++       marshalled -- that is what makes the instruction pay off here. */
++    uint32_t acc[5] = { 0, 0, 0, 0, 0 };   /* [0..2] = r0,r1,r2   [3] = a   [4] = b */
+     wordcount_t i, k;
+ 
+     /* Compute each digit of result in sequence, maintaining the carries. */
+     for (k = 0; k < num_words; ++k) {
+         for (i = 0; i <= k; ++i) {
+-            muladd(left[i], right[k - i], &r0, &r1, &r2);
++            acc[3] = left[i];
++            acc[4] = right[k - i];
++            red_mac96(acc, acc);
+         }
+-        result[k] = r0;
+-        r0 = r1;
+-        r1 = r2;
+-        r2 = 0;
++        result[k] = acc[0];
++        acc[0] = acc[1];
++        acc[1] = acc[2];
++        acc[2] = 0;
+     }
+     for (k = num_words; k < num_words * 2 - 1; ++k) {
+         for (i = (k + 1) - num_words; i < num_words; ++i) {
+-            muladd(left[i], right[k - i], &r0, &r1, &r2);
++            acc[3] = left[i];
++            acc[4] = right[k - i];
++            red_mac96(acc, acc);
+         }
+-        result[k] = r0;
+-        r0 = r1;
+-        r1 = r2;
+-        r2 = 0;
++        result[k] = acc[0];
++        acc[0] = acc[1];
++        acc[1] = acc[2];
++        acc[2] = 0;
+     }
+-    result[num_words * 2 - 1] = r0;
++    result[num_words * 2 - 1] = acc[0];
+ }
+ #endif /* !asm_mult */
+ 
