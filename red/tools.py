@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 from chia.base.tools.ChiaTool import ChiaTool
 
@@ -572,6 +573,57 @@ class IssTool(_IssSpecMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
         for m in self.METHODS:
             self.mcp.add_tool(getattr(self, m), name=f"{name}_{m}")
         super().__post_init__()
+
+class WorkloadTool(_SourceMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
+    """The workload author's surface: read the repository, write one C file.
+
+    It is the only agent in RED that writes something RED then *runs as the
+    subject of the experiment*, so its output is the one thing that must not be
+    taken on trust. `write_harness` accepts the source and nothing else -- no
+    claim about what the workload does, no measurement of its own. Gate 0
+    compiles it, runs it twice under callgrind and decides
+    (:mod:`red.workload`); what comes back through `read_status` is that
+    measurement, in the same words for every round.
+    """
+
+    METHODS = ("list_sources", "read_source", "write_harness", "read_status",
+               "read_knowledge", "append_knowledge")
+
+    def __init__(self, name, source_roots, harness_path, status_path,
+                 knowledge_path, task_options=None):
+        super().__init__(name, task_options=task_options)
+        self.source_roots = source_roots
+        self.harness_path = harness_path
+        self.status_path = status_path
+        self.knowledge_path = knowledge_path
+        for m in self.METHODS:
+            self.mcp.add_tool(getattr(self, m), name=f"{name}_{m}")
+        super().__post_init__()
+
+    def write_harness(self, c_source: str) -> str:
+        """Write the workload harness. `c_source` is one complete C file that
+        defines `int main(void)` and drives the project's public API.
+
+        It is compiled against the project's own sources and run twice under a
+        profiler. Write the file only — do not describe it, do not wrap it in
+        markdown fences, and do not include a `main` in any other form.
+        """
+        text = (c_source or "").strip()
+        fence = re.match(r"^```[a-zA-Z]*\n(.*)\n```$", text, re.S)
+        if fence:
+            text = fence.group(1)
+        if not re.search(r"\bint\s+main\s*\(", text):
+            return ("Rejected: the harness must define `int main(void)`. Send "
+                    "the whole C file.")
+        if len(text) < 40:
+            return "Rejected: that is not a C file."
+        os.makedirs(os.path.dirname(self.harness_path) or ".", exist_ok=True)
+        with open(self.harness_path, "w") as f:
+            f.write(text + "\n")
+        return (f"Accepted ({len(text)} bytes). Gate 0 will now build it against "
+                "the project, run it twice under callgrind, and measure whether "
+                "it is a workload.")
+
 
 class SecurityTool(_CoreMixin, _KnowledgeMixin, ChiaTool):
     """The security sub-agent's surface — and the reason this repo does not

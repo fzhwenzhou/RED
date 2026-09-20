@@ -79,8 +79,21 @@ def _toolchain() -> dict:
 # mining agent in red.loop)
 # ---------------------------------------------------------------------------
 
-def _c_sources(project: str) -> list[str]:
-    return [full for rel, full in find_sources(project) if rel.endswith(".c")]
+def _c_sources(project: str, exclude: str = "") -> list[str]:
+    """The project's ``.c`` files, minus any whose path matches *exclude*.
+
+    *exclude* is a comma-separated list of path fragments. A repository is not
+    always one program: libcrc ships its library in ``src/``, its test driver in
+    ``test/`` and a *table generator* in ``precalc/``, and the generator's
+    translation units reference symbols that only exist in its own ``main``.
+    Linking them into the workload's binary fails at link time on a project that
+    is perfectly well formed -- the files simply belong to a different program.
+    Which TUs make up the workload is the operator's to state, exactly like
+    ``--harness`` and ``--cflags``.
+    """
+    parts = [p.strip() for p in (exclude or "").split(",") if p.strip()]
+    return [full for rel, full in find_sources(project)
+            if rel.endswith(".c") and not any(p in rel for p in parts)]
 
 
 def _has_main(path: str) -> bool:
@@ -89,7 +102,8 @@ def _has_main(path: str) -> bool:
 
 
 def _build_harness(project: str, work_dir: str, cflags: str,
-                   harness: str = "") -> tuple[Optional[str], str, str]:
+                   harness: str = "",
+                   exclude: str = "") -> tuple[Optional[str], str, str]:
     """Compile the project into a runnable native harness for the workload.
 
     *harness* names the translation unit holding ``main`` — project-relative or
@@ -104,7 +118,7 @@ def _build_harness(project: str, work_dir: str, cflags: str,
     ``cflags`` is the operator's compile input. Returns
     (binary | None, command_or_error, harness_main)."""
     os.makedirs(work_dir, exist_ok=True)
-    sources = sorted(_c_sources(project))
+    sources = sorted(_c_sources(project, exclude))
     if not sources:
         return None, "no .c sources found under project", ""
 
@@ -119,7 +133,15 @@ def _build_harness(project: str, work_dir: str, cflags: str,
 
     main = os.path.abspath(main)
     rest = [s for s in sources if os.path.abspath(s) != main and not _has_main(s)]
-    inc = " ".join(f"-I{d}" for d in sorted({os.path.dirname(s) for s in sources}))
+    # Every directory that holds a source file the project ships, headers
+    # included -- not just the ones holding .c files. The common layout puts the
+    # public headers in their own `include/` directory with no .c beside them,
+    # and deriving -I from the .c files alone made every one of those projects
+    # unbuildable: libcrc's whole src/ tree fails on `#include "checksum.h"`
+    # before RED sees a single instruction. The operator can still add more with
+    # `--cflags`; this is about not needing to for an ordinary layout.
+    inc = " ".join(f"-I{d}" for d in sorted(
+        {os.path.dirname(full) for _rel, full in find_sources(project)}))
     out = os.path.join(work_dir, "harness")
     cmd = f"cc -O2 {cflags} {inc} -o {out} {main} {' '.join(rest)}"
     p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -221,13 +243,14 @@ def _parse_callgrind_calls(tree: str) -> dict:
     return calls
 
 
-def _static_profile(project: str, work_dir: str, cflags: str) -> tuple[dict, str, str]:
+def _static_profile(project: str, work_dir: str, cflags: str,
+                    exclude: str = "") -> tuple[dict, str, str]:
     """Fallback: compile each TU to assembly and count instructions per function."""
     os.makedirs(work_dir, exist_ok=True)
     counts: dict = {}
     method = "static-asm"
     cmd = ""
-    for src in _c_sources(project):
+    for src in _c_sources(project, exclude):
         asm = os.path.join(work_dir, os.path.basename(src) + ".s")
         c = (f"cc -O2 -S {cflags} -I{os.path.dirname(src)} "
              f"-o {asm} {src} 2>/dev/null")
@@ -273,9 +296,56 @@ def _parse_asm(text: str) -> dict:
     return counts
 
 
+# ---------------------------------------------------------------------------
+# AW / Gate 0 — is the workload a workload? (red.workload)
+# ---------------------------------------------------------------------------
+
+@ChiaFunction(resources={"profile": 1.0})
+def workload_check(project: str, harness_source: str, work_dir: str,
+                   cflags: str = "", exclude: str = "") -> str:
+    """Build the candidate harness, run it twice under callgrind, and return a
+    measured ``WorkloadSpec`` as JSON.
+
+    Takes the harness's **source text**, not a path. The agent that wrote it
+    talks to a tool server pinned to the head, so the file lands on the head's
+    disk; this node is a different machine, and the run directory is created
+    during the run so it is not part of the rsynced repo. Shipping the content
+    is what makes the harness available on whichever node compiles it.
+
+    On a profile node because it needs the compiler and valgrind, exactly like
+    the A1 profile it is a precondition for. Returns a spec whose ``detail``
+    carries the failure rather than raising, so a harness that does not compile
+    comes back as a measurement the agent can act on."""
+    from red import workload                  # local: only this node needs it
+    os.makedirs(work_dir, exist_ok=True)
+    harness = os.path.join(work_dir, "_red_workload.c")
+    with open(harness, "w") as f:
+        f.write(harness_source)
+    spec = workload.measure(project, harness, work_dir, cflags, exclude)
+    return state_def.to_json(spec)
+
+
+@ChiaFunction(resources={"head_local": 0.1})
+def gate0(spec_json: str) -> state_def.GateResult:
+    """Gate 0: the workload does enough work, in the project's own code,
+    reproducibly.
+
+    Everything it checks was measured by :func:`workload_check`; nothing here
+    consults the agent's description of what it wrote. A harness looping around
+    ``printf`` fails the project-share condition however well it reads."""
+    from red import workload
+    try:
+        spec = state_def.from_json(spec_json, state_def.WorkloadSpec)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        return state_def.GateResult(gate="gate0", passed=False,
+                                    detail=f"invalid WorkloadSpec: {e}")
+    return workload.verdict(spec)
+
+
 @ChiaFunction(resources={"profile": 1.0})
 def A1_profile_workload(project: str, workload: str, work_dir: str,
-                        cflags: str = "", harness: str = "") -> dict:
+                        cflags: str = "", harness: str = "",
+                        exclude: str = "", harness_source: str = "") -> dict:
     """Build + run the domain harness and profile it dynamically (callgrind),
     corroborated by perf's cycle count. Returns a dict the mining agent reads
     via the ProfileTool:
@@ -293,8 +363,16 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
     harness_main, build_log, calls = "", "", {}
 
     if _have("cc"):
+        if harness_source:
+            # A synthesized workload (AW + Gate 0) is content, not a path: it
+            # was written on the head and this node has never seen it.
+            os.makedirs(work_dir, exist_ok=True)
+            harness = os.path.join(work_dir, "_red_workload.c")
+            with open(harness, "w") as f:
+                f.write(harness_source)
         binary, build_log, harness_main = _build_harness(project, work_dir,
-                                                         cflags, harness)
+                                                         cflags, harness,
+                                                         exclude)
         if binary:
             harness_built = True
             command = build_log
@@ -303,7 +381,8 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
                 command = cmd
             perf_cycles = _perf_cycles(binary)
         if not counts:
-            counts, method, command = _static_profile(project, work_dir, cflags)
+            counts, method, command = _static_profile(project, work_dir, cflags,
+                                                      exclude)
 
     return {
         "project": project,

@@ -57,7 +57,8 @@ from chia.base.llm_call import QueryResult
 from chia.models.vertex import VertexGeminiLLM
 from chia.trace.profiler import start_collector, stop_collector
 
-from red import cost, db_node, graph, nodes, review, security, state_def
+from red import (cost, db_node, graph, nodes, review, security, state_def,
+                 workload as workload_mod)
 from red.constants import (
     COVERAGE_TARGET,
     CRITIC_MAX_ROUNDS,
@@ -75,6 +76,8 @@ from red.constants import (
     LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_PROMPTS_DIR,
+    LLM_RATE_LIMIT_BACKOFF,
+    LLM_RATE_LIMIT_RETRIES,
     LLM_RESOURCE,
     LLM_TIMEOUT_SECONDS,
     RED_LOG_ROOT,
@@ -90,11 +93,16 @@ from red.constants import (
     SECURITY_MAX_ROUNDS,
     SPEEDUP_TARGET,
     STAGE_MAX_SECONDS,
+    WORKLOAD_MAX_ROUNDS,
+    WORKLOAD_MIN_IR,
+    WORKLOAD_MIN_PROJECT_SHARE,
+    WORKLOAD_DETERMINISM,
     STAGE_POLL_SECONDS,
     REPO_ROOT,
     find_sources,
 )
-from red.tools import DesignerTool, IssTool, RelayTool, SecurityTool
+from red.tools import (DesignerTool, IssTool, RelayTool, SecurityTool,
+                       WorkloadTool)
 
 HEAD_LOCAL = {"resources": {"head_local": 0.1}}   # sealed-tool placement
 
@@ -112,6 +120,7 @@ class REDResult:
     workload: str
     converged: bool
     iterations: int
+    gate0: state_def.GateResult | None = None
     gate1: state_def.GateResult | None = None
     gate2: state_def.GateResult | None = None
     gate3: state_def.GateResult | None = None
@@ -121,6 +130,7 @@ class REDResult:
     spec: state_def.ISASpec | None = None
     review: state_def.ReviewReport | None = None
     security: state_def.SecurityReport | None = None
+    workload_spec: state_def.WorkloadSpec | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +227,12 @@ def _await(ref, what: str, resource: str | None = None):
             print(f"[red] still waiting on {what} ({waited / 60:.0f} min)")
 
 
+# What the backend says when it is asking us to slow down rather than telling us
+# the request was wrong.
+_THROTTLED = re.compile(r"RateLimit|RESOURCE_EXHAUSTED|\b429\b|Quota exceeded",
+                        re.I)
+
+
 def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
                   log_path: str | None = None):
     """Dispatch one agent turn; None-safe (used by --local smoke runs).
@@ -241,15 +257,34 @@ def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
     # escaping would abandon a run that is twenty minutes in with every artifact
     # so far unsummarised. Turn them into a failed turn, which every caller
     # already knows how to handle: repair rounds, budget caps, escalation.
-    try:
-        res = _await(llm.prompt.options(resources={"llm": LLM_RESOURCE})
-                     .chia_remote(llm, message, [RelayTool(t) for t in tools]),
-                     f"{tag} LLM turn", RES_LLM)
-    except Exception as exc:                                  # noqa: BLE001
-        name = type(exc).__name__
-        print(f"[red] {tag} LLM turn RAISED {name}: {str(exc)[:200]}")
-        res = QueryResult(result="", returncode=-1, stderr=f"{name}: {exc}",
-                          stream_result="", success=False)
+    # A rate limit is not a failed turn, it is a turn that has not happened yet.
+    # Treating the two alike cost three runs in one batch: two consecutive
+    # RateLimitErrors trip the "backend failing on every turn" guard, the run
+    # abandons synthesis, and the report says a design could not be produced
+    # when what actually happened is that Vertex asked us to wait. Back off and
+    # try again; every other failure still comes straight back.
+    res = None
+    for attempt in range(LLM_RATE_LIMIT_RETRIES + 1):
+        try:
+            res = _await(llm.prompt.options(resources={"llm": LLM_RESOURCE})
+                         .chia_remote(llm, message, [RelayTool(t) for t in tools]),
+                         f"{tag} LLM turn", RES_LLM)
+            break
+        except Exception as exc:                              # noqa: BLE001
+            name = type(exc).__name__
+            text = f"{name}: {exc}"
+            throttled = bool(_THROTTLED.search(text))
+            if throttled and attempt < LLM_RATE_LIMIT_RETRIES:
+                wait = LLM_RATE_LIMIT_BACKOFF * (2 ** attempt)
+                print(f"[red] {tag} LLM turn throttled by the backend "
+                      f"(attempt {attempt + 1}/{LLM_RATE_LIMIT_RETRIES + 1}) — "
+                      f"waiting {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            print(f"[red] {tag} LLM turn RAISED {name}: {str(exc)[:200]}")
+            res = QueryResult(result="", returncode=-1, stderr=text,
+                              stream_result="", success=False)
+            break
     if res is not None and not getattr(res, "success", True):
         print(f"[red] WARNING: {tag} LLM turn FAILED "
               f"(returncode={getattr(res, 'returncode', '?')}) — the backend is "
@@ -552,7 +587,7 @@ def _merge_mechanical(report: state_def.HotLoopReport,
 def run_red_loop(project: str, core: str, workload: str, cflags: str,
                  run_id: str, work_root: str, archive_dir: str | None = None,
                  llm=None, tools=None, local: bool = False,
-                 harness: str = "") -> REDResult:
+                 harness: str = "", exclude: str = "") -> REDResult:
     """One end-to-end RED pass: A1 + Gate 1 -> HotLoopReport, then A2 + link 1
     (with a bounded repair edge) -> ISASpec."""
     tag = run_id.rsplit("-", 1)[-1]
@@ -624,15 +659,116 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
     graph.start_run(workload, run_id, project, core, model=LLM_MODEL,
                     harness=harness, cflags=cflags)
 
-    gate1, gate2 = None, None
+    gate0, gate1, gate2 = None, None, None
     iss_tools: list = []          # built lazily when Gate 2's implementer runs
     sec_tools: list = []          # built lazily when Gate 4's reviewer runs
+    wl_tools: list = []           # built lazily when AW writes the workload
+    workload_spec = None
+    synthesized = ""              # AW's harness source, when it wrote one
     chain: list[state_def.GateResult] = []
     report, spec = None, None
     iters = 0
     try:
+        # ---------------- AW: write the workload, Gate 0 measures it --------
+        # RED's input is "a project + representative workloads" and the second
+        # half is usually missing: what a repository ships is a unit test.
+        # libcrc's own test suite executes 272,664 instructions and micro-ecc's
+        # ECDH test executes 10,302,000,000 — the same loop cannot profile both,
+        # and mining the former yields hot "loops" in the dynamic loader.
+        #
+        # So when the operator does not name a harness, an agent reads the
+        # repository and writes one, and Gate 0 decides whether it is a
+        # workload by running it: enough instructions, enough of them inside the
+        # project's own code (from the binary's symbol table, not from the
+        # agent's description), and the same answer twice.
+        if not harness and llm is not None:
+            wl_dir = os.path.join(work_root, "workload")
+            os.makedirs(wl_dir, exist_ok=True)
+            wl_path = os.path.join(
+                wl_dir, f"{os.path.basename(project.rstrip('/'))}_workload.c")
+            wl_status = os.path.join(wl_dir, "gate0.md")
+            wl_tools.append(WorkloadTool(
+                name=f"red_wl_{tag}", source_roots=[project],
+                harness_path=wl_path, status_path=wl_status,
+                knowledge_path=knowledge_path,
+                task_options=None if local else HEAD_LOCAL))
+            wtm = _tool_map(wl_tools)
+            for round_ in range(1, WORKLOAD_MAX_ROUNDS + 1):
+                designer_charter, llm.system_message = llm.system_message, ""
+                try:
+                    _dispatch_llm(llm, _load_prompt(
+                        "workload.md",
+                        PROJECT=project,
+                        LIST_SOURCES=wtm.get("list_sources", ""),
+                        READ_SOURCE=wtm.get("read_source", ""),
+                        WRITE_HARNESS=wtm.get("write_harness", ""),
+                        READ_STATUS=wtm.get("read_status", ""),
+                        READ_KNOWLEDGE=wtm.get("read_knowledge", ""),
+                        MIN_IR=f"{WORKLOAD_MIN_IR:,}",
+                        MIN_SHARE=f"{WORKLOAD_MIN_PROJECT_SHARE:.0%}",
+                        DETERMINISM=f"{WORKLOAD_DETERMINISM:.0%}",
+                        MAX_ROUNDS=str(WORKLOAD_MAX_ROUNDS),
+                        STATUS=(workload_mod.render(workload_spec)
+                                if workload_spec else
+                                "Nothing has been measured yet — this is the "
+                                "first round.")),
+                        wl_tools, tag=f"AW workload {round_}",
+                        log_path=transcript_path)
+                finally:
+                    llm.system_message = designer_charter
+                if not os.path.exists(wl_path):
+                    print(f"[{run_id}] AW round {round_}: no harness written")
+                    continue
+                with open(wl_path) as f:
+                    harness_source = f.read()
+                raw = (nodes.workload_check(project, harness_source,
+                                            os.path.join(wl_dir, f"r{round_}"),
+                                            cflags, exclude) if local
+                       else _await(nodes.workload_check.chia_remote(
+                           project, harness_source,
+                           os.path.join(wl_dir, f"r{round_}"),
+                           cflags, exclude), "workload check", RES_PROFILE))
+                workload_spec = state_def.from_json(raw, state_def.WorkloadSpec)
+                gate0 = (nodes.gate0(raw) if local
+                         else _await(nodes.gate0.chia_remote(raw), "Gate 0",
+                                     RES_HEAD_LOCAL))
+                with open(wl_status, "w") as f:
+                    f.write(workload_mod.render(workload_spec))
+                _mirror(f"workload/round{round_}.json",
+                        state_def.to_json(workload_spec))
+                _mirror(f"workload/round{round_}.md",
+                        workload_mod.render(workload_spec))
+                print(f"[{run_id}] Gate 0 round {round_}: "
+                      f"{'PASS' if gate0.passed else 'FAIL'} — {gate0.detail}")
+                if gate0.passed:
+                    # A1 compiles it on the profile node, which has never seen
+                    # this file: hand on the text, not the path.
+                    synthesized = harness_source
+                    workload_spec.entry = wl_path
+                    break
+            if gate0 is None:
+                # The agent never produced a harness at all (its turns failed).
+                # Record that as a failed Gate 0 rather than leaving it unset:
+                # an unset gate0 reads downstream as "the operator supplied a
+                # harness", which is the opposite of what happened.
+                gate0 = state_def.GateResult(
+                    gate="gate0", passed=False,
+                    detail=f"AW produced no harness in {WORKLOAD_MAX_ROUNDS} "
+                           "rounds (the agent's turns did not complete)")
+            _mirror("gates/gate0.json", state_def.to_json(gate0))
+            if not gate0.passed:
+                # Profiling an unrepresentative workload does not produce a
+                # worse extension, it produces a meaningless one: the mined
+                # "hot loops" are the dynamic loader. Stop here and say so.
+                print(f"[{run_id}] AW could not produce a representative "
+                      f"workload for {project} — stopping before A1")
+                graph.record_gate(workload, run_id, gate0)
+                return REDResult(workload, False, iters, gate0=gate0,
+                                 workload_spec=workload_spec)
+
         # ---------------- A1: profile x2 -> Gate 1 -> mining agent ----------
-        prof_args = (project, workload, profile_dir, cflags, harness)
+        prof_args = (project, workload, profile_dir, cflags, harness, exclude,
+                     synthesized)
         if local:
             prof1 = nodes.A1_profile_workload(*prof_args)
             prof2 = nodes.A1_profile_workload(*prof_args)
@@ -642,7 +778,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
             # They write to sibling directories so they cannot share a harness.
             refs = [nodes.A1_profile_workload.chia_remote(
                         project, workload, os.path.join(profile_dir, f"run{i}"),
-                        cflags, harness)
+                        cflags, harness, exclude, synthesized)
                     for i in (1, 2)]
             # Resolve one at a time: both tasks are already running, so this
             # still costs one profile's wall clock, and get() unwraps the
@@ -742,8 +878,9 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         if spec is None:
             print(f"[{run_id}] A2: no ISASpec produced "
                   f"{'(LLM backend not available)' if llm is None else ''} — stopping before Gate 2")
-            return REDResult(workload, False, iters, gate1=gate1, gate2=gate2,
-                             chain=chain, report=report, spec=spec)
+            return REDResult(workload, False, iters, gate0=gate0, gate1=gate1,
+                             gate2=gate2, chain=chain, report=report, spec=spec,
+                             workload_spec=workload_spec)
 
         spec.critic_rounds = min(iters, CRITIC_MAX_ROUNDS)
         # link-1 status is the loop's to record, never the agent's to claim.
@@ -1233,16 +1370,17 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # spec is recorded under its own stage so a later run can ask what the
         # design actually shipped as, not merely what it looked like mid-loop.
         graph.record_spec(workload, run_id, spec, stage="final")
-        for g in [gate2, gate3, gate4] + list(chain):
+        for g in [gate0, gate2, gate3, gate4] + list(chain):
             graph.record_gate(workload, run_id, g)
         graph.finish_run(
             workload, run_id, converged=converged,
             wallclock=time.monotonic() - run_started, blocking=blocking,
             speedup=(perf.app_speedup if perf else 0.0))
 
-        return REDResult(workload, converged, iters, gate1=gate1, gate2=gate2,
-                         gate3=gate3, gate4=gate4, chain=chain, report=report,
-                         spec=spec, review=review_report, security=sec_report)
+        return REDResult(workload, converged, iters, gate0=gate0, gate1=gate1,
+                         gate2=gate2, gate3=gate3, gate4=gate4, chain=chain,
+                         report=report, spec=spec, review=review_report,
+                         security=sec_report, workload_spec=workload_spec)
     finally:
         # A run that returned early or died must not sit at status='running'.
         # finish_run has already fired on the normal path; this only catches the
@@ -1272,7 +1410,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         "transcript archival", RES_DATABASE)
         except Exception as exc:  # noqa: BLE001 — archival must not fail the run
             print(f"[{run_id}] WARNING: could not archive LLM transcripts: {exc}")
-        for t in list(tools) + iss_tools + sec_tools:
+        for t in list(tools) + iss_tools + sec_tools + wl_tools:
             t.stop()
 
 
@@ -1299,6 +1437,14 @@ def _render_summary(r: REDResult, run_n: int) -> str:
         for f_ in r.review.actionable()[:6]:
             review_line += (f"\n    - [{f_.severity}] "
                             f"{f_.instruction or 'spec'}: {f_.finding}")
+    workload_line = ""
+    if r.workload_spec is not None and r.workload_spec.entry:
+        w = r.workload_spec
+        workload_line = (f"    - {os.path.basename(w.entry)}: "
+                         f"{w.dynamic_ir:,} instructions, "
+                         f"{w.project_share:.1%} in the project's own code\n")
+        if w.api:
+            workload_line += ("    - drives: " + ", ".join(w.api[:6]) + "\n")
     security_line = ""
     if r.security is not None:
         advisory = [f_ for f_ in r.security.findings
@@ -1316,6 +1462,9 @@ def _render_summary(r: REDResult, run_n: int) -> str:
             f"- model: `{LLM_BACKEND}:{LLM_MODEL}` (project `{GCP_PROJECT}`)\n"
             f"- result: **{'converged (A1+A2)' if r.converged else 'NOT converged'}**\n"
             f"- A2 rounds: {r.iterations}\n"
+            f"- Gate 0 (workload): {mark(r.gate0)} "
+            f"{r.gate0.detail if r.gate0 else '(operator-supplied harness)'}\n"
+            f"{workload_line}"
             f"- Gate 1 (re-profile ±5%): {mark(r.gate1)} "
             f"{r.gate1.detail if r.gate1 else ''}\n"
             f"- Gate 2 (C model vs Spike): {mark(r.gate2)} "
@@ -1345,6 +1494,12 @@ def _parse_args():
                         "(default: the bundled ECDH test)")
     p.add_argument("--cflags", default=EXAMPLE_CFLAGS,
                    help="cc flags for the harness build (example default)")
+    p.add_argument("--exclude", default="",
+                   help="comma-separated path fragments whose .c files are NOT "
+                        "part of this workload's program (e.g. 'precalc' for a "
+                        "repo that also ships a code generator with its own "
+                        "main). They stay readable by the agents; they are just "
+                        "not linked.")
     p.add_argument("--run-id", default=None)
     p.add_argument("--work-root", default=None)
     p.add_argument("--local", action="store_true",
@@ -1403,7 +1558,8 @@ def main() -> int:
         result = run_red_loop(args.project, args.core, args.workload, args.cflags,
                               run_id, work_root, archive_dir=sweep_path,
                               llm=llm, tools=([] if args.local else None),
-                              local=args.local, harness=args.harness)
+                              local=args.local, harness=args.harness,
+                              exclude=args.exclude)
     except Exception:
         import traceback
         traceback.print_exc()

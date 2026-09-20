@@ -17,6 +17,10 @@ flowchart TB
         CORE["processor core RTL"]
     end
 
+    PRJ --> AW["<b>AW workload author</b><br/>read the repo, write a harness<br/><i>only when none is supplied</i>"]
+    AW --> G0{"<b>Gate 0</b><br/>enough work, in the project's<br/>own code, twice the same?"}
+    G0 -->|no| AWR["<i>the measurement</i>"] --> AW
+    G0 -->|yes| PROF
     PRJ --> PROF["<b>A1 mechanical</b><br/>build harness, profile x2<br/><i>callgrind: cost + call counts</i>"]
     PROF --> G1{"<b>Gate 1</b><br/>two independent profiles<br/>agree within ±5%?"}
     G1 -->|no| STOP1["report unreproducible<br/>(no repair edge — see §7)"]
@@ -49,6 +53,7 @@ flowchart TB
     G2 -->|agree| OUT[["<b>ISASpec — final</b>"]]
 
     style OUT fill:#2d6a4f,color:#fff
+    style G0 fill:#1d3557,color:#fff
     style G1 fill:#1d3557,color:#fff
     style G2 fill:#1d3557,color:#fff
     style G3 fill:#7f4f24,color:#fff
@@ -88,6 +93,7 @@ Plain-text form, for terminals:
 
 | agent | reads | writes | isolation |
 |---|---|---|---|
+| **AW workload author** | the project's sources | one C file: `int main(void)` driving the library | writes the harness and nothing else — every field that decides Gate 0 is measured by running it |
 | **A0 core analyst** | the core's RTL, via the sealed source tool | `CoreProfile` | — |
 | **A1 mining** | project sources + the mechanical profile | `HotLoopReport` | cannot self-report cycle numbers; the loop merges those from the profile |
 | **A2 synthesis** (S2a→S2b→S2c) | `HotLoopReport`, `CoreProfile`, profile, status, notes | `ISASpec` incl. `c_model` | cannot write `spike_model` — the field is dropped |
@@ -120,6 +126,7 @@ Two isolation boundaries carry real weight:
 
 | edge | asks | mechanism | on failure |
 |---|---|---|---|
+| **Gate 0** | is there a workload to profile at all? | the candidate harness is built and run twice under callgrind: ≥50M instructions, ≥60% of them in functions the binary itself defines (symbol table), <2% run-to-run drift | the measurement → AW rewrites (≤3); if it never passes, the run stops rather than mining libc |
 | **Gate 1** | is the profile reproducible? | two independent callgrind runs, ±5% | run marked not converged |
 | **link 1** | are the C models executable and total? | compile + 10⁵ corner/random vectors under ASan+UBSan | counterexample → repair (≤3) |
 | **Gate 3** | is it actually *faster*? | calibrated cost model vs measured software cost, Amdahl over measured shares | the arithmetic → redesign (≤3) |
@@ -127,11 +134,50 @@ Two isolation boundaries carry real weight:
 | **review** | is it worth building? | 4 concurrent sub-agents | blocking findings → revise (≤2) |
 | **Gate 2** | is the spec unambiguous? | independently written Spike model executes the real encoding on rv32; 10⁵ vectors | divergent vector → repair (≤3) |
 
-A run converges only when **all** of Gate 1, link 1, Gate 3, Gate 4 and Gate 2
-pass with no blocking review findings. Gate 4 is additionally re-run, without its
+Gate 0 is a precondition rather than a convergence condition: it gates whether
+there is anything worth profiling, and a run that cannot get past it stops
+there. A run converges only when **all** of Gate 1, link 1, Gate 3, Gate 4 and
+Gate 2 pass with no blocking review findings. Gate 4 is additionally re-run, without its
 agent, on whatever spec finally ships — the review can revise a design after the
 security stage passed it, and a revision made to satisfy a reviewer can put back
 exactly what the security gate rejected.
+
+### Gate 0, in detail
+
+RED's stated input is "a source repo + representative workloads". Repositories
+ship the first half. The second half is the difference between:
+
+```
+micro-ecc  test/test_ecdh.c   10,302,000,000 instructions   43% in one kernel
+libcrc     test/testall.c            272,664 instructions   hottest: 0x10db4
+matrixmul  test.c                    125,089 instructions   one 2x2 multiply
+```
+
+The bottom two are unit tests. Profiling them mines the dynamic loader, and the
+coverage gate then fails a project whose library is perfectly good — because
+nobody ever wrote the workload. So an agent reads the repository and writes one.
+
+What makes this a gate rather than a hope is the third condition:
+
+| condition | why | how it is decided |
+|---|---|---|
+| ≥ 50M instructions | below it the profile is process startup | callgrind total |
+| ≥ 60% in the project's own code | separates "uses the library" from "prints things" | the **binary's symbol table** (`nm --defined-only`) intersected with what executed — libc arrives through a shared object, so every function defined in this binary is the project's |
+| < 2% run-to-run drift | a workload that is not reproducible is not a measurement | two runs |
+| exits 0, terminates | — | two runs |
+
+The symbol-table condition is the one an agent cannot talk past. A harness that
+loops around `printf` measured 14,193,444 instructions at **9.0%** project share
+and was rejected; the same library driven over a 64 KiB buffer measured
+255,822,904 at **99.9%** and passed. Neither number came from the agent.
+
+Failures come back as the measurement, in the agent's own terms — including the
+list of project functions its harness actually reached, which is the most
+useful line on the page when the agent thinks it is stressing something it is
+not. Three rounds, then the run stops rather than proceeding to mine libc.
+
+`--harness` still wins when the operator supplies one: micro-ecc ships a real
+ECDH exchange and there is nothing to synthesize.
 
 ### Gate 3, in detail
 

@@ -548,6 +548,10 @@ def test_no_prompt_has_an_unsubstituted_placeholder() -> None:
         "redesign.md": dict(READ_SPEC="a", READ_REPORT="b", READ_STATUS="c",
                             WRITE_SPEC="d", APPEND_KNOWLEDGE="e", FINISH="f",
                             TARGET="2.00", VERDICT="g"),
+        "workload.md": dict(PROJECT="p", LIST_SOURCES="a", READ_SOURCE="b",
+                            WRITE_HARNESS="c", READ_STATUS="d",
+                            READ_KNOWLEDGE="e", MIN_IR="5", MIN_SHARE="6",
+                            DETERMINISM="7", MAX_ROUNDS="3", STATUS="s"),
         "secure.md": dict(READ_SPEC="a", READ_REPORT="b", READ_STATUS="c",
                           READ_CORE="d", WRITE_SPEC="e", APPEND_KNOWLEDGE="f",
                           FINISH="g", FINDINGS="h"),
@@ -1871,14 +1875,14 @@ def test_every_tool_a_charter_offers_actually_has_a_name() -> None:
     derived from each tool's own METHODS, and every method has to survive the
     64-character cap the backend imposes on tool names."""
     import red.loop as loop
-    from red.tools import DesignerTool, IssTool, SecurityTool
+    from red.tools import DesignerTool, IssTool, SecurityTool, WorkloadTool
 
     class _Stub:
         def __init__(self, cls):
             self.name = "red_dsn_abc123"
             self.METHODS = cls.METHODS
 
-    for cls in (DesignerTool, IssTool, SecurityTool):
+    for cls in (DesignerTool, IssTool, SecurityTool, WorkloadTool):
         stub = _Stub(cls)
         names = loop._tool_map([stub])
         missing = [m for m in cls.METHODS if not names.get(m)]
@@ -1927,6 +1931,147 @@ def test_no_configuration_is_imported_and_then_ignored() -> None:
     _results.append(("no dead configuration", True,
                      f"all {len(imported)} constants the driver imports are "
                      "actually used"))
+
+
+def test_gate0_tells_a_workload_from_a_unit_test() -> None:
+    """The measurement that decides whether A1 has anything worth profiling.
+
+    RED's input is "a project + representative workloads" and repositories ship
+    the first half: libcrc's own test suite executes 272,664 instructions where
+    micro-ecc's ECDH test executes 10,302,000,000. Profiling the former mines
+    the dynamic loader. So an agent writes the workload — and this is the half
+    that decides whether it wrote one, by running it.
+
+    The condition an agent cannot argue with is the third: the share of executed
+    instructions that lie in functions *the binary itself defines*, read from
+    the symbol table. A harness that loops around `printf` fails it however
+    persuasive its rationale.
+    """
+    from red import workload
+
+    if not shutil.which("cc") or not shutil.which("valgrind"):
+        _results.append(("gate 0", True, "skipped: no cc/valgrind on this host"))
+        return
+
+    proj = tempfile.mkdtemp(prefix="red-test-proj-")
+    try:
+        with open(os.path.join(proj, "lib.h"), "w") as f:
+            f.write("#ifndef LIB_H\n#define LIB_H\n#include <stdint.h>\n"
+                    "uint32_t mix(const uint8_t *p, unsigned n);\n#endif\n")
+        with open(os.path.join(proj, "lib.c"), "w") as f:
+            f.write("#include \"lib.h\"\n"
+                    "uint32_t mix(const uint8_t *p, unsigned n) {\n"
+                    "  uint32_t h = 2166136261u;\n"
+                    "  for (unsigned i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }\n"
+                    "  return h; }\n")
+        harnesses = {
+            # drives the library hard, prints once
+            "workload": ('#include <stdio.h>\n#include "lib.h"\n'
+                         'int main(void){ static uint8_t b[4096];\n'
+                         '  for (unsigned i=0;i<sizeof b;i++) b[i]=(uint8_t)(i*7+1);\n'
+                         '  uint32_t a=0; for (int k=0;k<20000;k++) a^=mix(b,sizeof b);\n'
+                         '  printf("%u\\n", a); return 0; }\n'),
+            # calls the library, but spends its life in printf
+            "printf_bound": ('#include <stdio.h>\n#include "lib.h"\n'
+                             'int main(void){ uint8_t b[4]={1,2,3,4}; uint32_t a=0;\n'
+                             '  for (int k=0;k<20000;k++){ a^=mix(b,4); printf("%u\\n",a);} \n'
+                             '  return 0; }\n'),
+            # the repository's unit test: correct, and far too small
+            "unit_test": ('#include "lib.h"\n'
+                          'int main(void){ uint8_t b[4]={1,2,3,4};\n'
+                          '  return mix(b,4)==0; }\n'),
+            # nondeterministic: big enough and library-bound, but the trip
+            # count is drawn from the clock, so the two runs cannot agree. The
+            # spread is deliberately large — a fixture that straddles the 2%
+            # limit would pass or fail on the draw.
+            "nondeterministic": ('#include <stdio.h>\n#include <stdlib.h>\n'
+                                 '#include <time.h>\n#include "lib.h"\n'
+                                 'int main(void){ static uint8_t b[4096];\n'
+                                 '  for (unsigned i=0;i<sizeof b;i++) b[i]=(uint8_t)(i*7+1);\n'
+                                 '  srand((unsigned)time(NULL));\n'
+                                 '  uint32_t a=0; int n=30000+(rand()%%30000);\n'
+                                 '  for (int k=0;k<n;k++) a^=mix(b,sizeof b);\n'
+                                 '  printf("%%u\\n",a); return 0; }\n').replace("%%", "%"),
+        }
+        verdicts = {}
+        for name, src in harnesses.items():
+            h = os.path.join(proj, f"_h_{name}.c")
+            with open(h, "w") as f:
+                f.write(src)
+            spec = workload.measure(proj, h, os.path.join(proj, f"w_{name}"))
+            verdicts[name] = (workload.verdict(spec).passed, spec)
+            # the harness must not be linked into the next one as a second main
+            os.rename(h, h + ".bak")
+
+        ok, spec = verdicts["workload"]
+        _require(ok, f"a real workload must pass Gate 0: {spec.detail[:200]}")
+        _require(spec.project_share > 0.8,
+                 f"and be attributed to the project ({spec.project_share:.0%})")
+        _require("mix" in spec.api, f"and name the function it drives: {spec.api}")
+
+        ok, spec = verdicts["printf_bound"]
+        _require(not ok, "a printf-bound harness is not a workload")
+        _require(spec.project_share < 0.6,
+                 f"and the reason must be measured: {spec.project_share:.0%}")
+        _require("printf" in spec.detail or "project's own code" in spec.detail,
+                 f"the agent has to be told why: {spec.detail[:200]}")
+
+        ok, spec = verdicts["unit_test"]
+        _require(not ok, "a unit test is not a workload")
+        _require(str(constants.WORKLOAD_MIN_IR)[:3] in spec.detail.replace(",", "")
+                 or "instructions" in spec.detail,
+                 f"and the floor must be quoted: {spec.detail[:160]}")
+
+        ok, spec = verdicts["nondeterministic"]
+        _require(not ok, "a harness seeded from the clock is not a measurement")
+        _require("determin" in spec.detail,
+                 f"and must be told so: {spec.detail[:200]}")
+
+        _results.append(("gate 0", True,
+                         f"workload {verdicts['workload'][1].dynamic_ir:,} Ir "
+                         f"@{verdicts['workload'][1].project_share:.0%} passes; "
+                         "printf-bound, unit-test and nondeterministic rejected"))
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
+
+
+def test_the_workload_agent_cannot_vouch_for_its_own_harness() -> None:
+    """AW writes the workload; it does not get to say whether it is one.
+
+    The tool takes the C source and nothing else — no claimed instruction count,
+    no assertion that it stresses the library — because every field that decides
+    Gate 0 is filled in by running the thing.
+    """
+    from red.tools import WorkloadTool
+
+    work = tempfile.mkdtemp(prefix="red-test-wl-")
+    try:
+        tool = object.__new__(WorkloadTool)
+        tool.source_roots = [EXAMPLE_PROJECT]
+        tool.harness_path = os.path.join(work, "h.c")
+        tool.status_path = os.path.join(work, "status.md")
+        tool.knowledge_path = os.path.join(work, "k.md")
+
+        _require(not any("claim" in m or "report" in m
+                         for m in WorkloadTool.METHODS),
+                 f"AW must not be able to assert anything: {WorkloadTool.METHODS}")
+        out = tool.write_harness("this is not C")
+        _require("Rejected" in out, f"prose is not a harness: {out}")
+        _require(not os.path.exists(tool.harness_path),
+                 "and a rejected harness must not be written")
+        out = tool.write_harness("#include <stdio.h>\nint main(void){"
+                                 "printf(\"x\\n\"); return 0;}")
+        _require("Accepted" in out, out)
+        _require(os.path.exists(tool.harness_path), "an accepted harness lands")
+
+        # Fields Gate 0 owns start empty and are never settable by the agent.
+        spec = state_def.WorkloadSpec(project="p", entry=tool.harness_path)
+        _require(spec.passes_gate0 is False and spec.dynamic_ir == 0,
+                 "a fresh WorkloadSpec claims nothing")
+        _results.append(("workload agent bounds", True,
+                         "write_harness only; every verdict field is measured"))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def test_a_secure_design_is_part_of_converging() -> None:

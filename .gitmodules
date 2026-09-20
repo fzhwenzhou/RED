@@ -4,3 +4,9 @@
 [submodule "target_project/micro-ecc"]
 	path = target_project/micro-ecc
 	url = https://github.com/kmackay/micro-ecc
+[submodule "target_project/libcrc"]
+	path = target_project/libcrc
+	url = https://github.com/lammertb/libcrc
+[submodule "target_project/matrixmul"]
+	path = target_project/matrixmul
+	url = https://github.com/webDva/matrixmul

@@ -126,6 +126,40 @@ SPEEDUP_TARGET = float(os.environ.get("RED_SPEEDUP_TARGET", "2.0"))
 PERF_MAX_ROUNDS = int(os.environ.get("RED_PERF_ROUNDS", "4"))
 
 # ---------------------------------------------------------------------------
+# AW / Gate 0 — workload synthesis (red/workload.py)
+# ---------------------------------------------------------------------------
+#
+# RED's stated input is "a source repo + representative workloads". Most repos
+# do not ship the second half: libcrc's `test/testall.c` CRCs a handful of short
+# strings and matrixmul's `test.c` multiplies one 2x2 matrix, so their profiles
+# are 99% dynamic-loader and printf. Profiling those mines libc startup and the
+# coverage gate fails on a project that is perfectly good -- the workload was
+# simply never written.
+#
+# So a sub-agent reads the repository and writes one. As everywhere else in RED,
+# what it produces is then *measured* rather than believed: Gate 0 compiles the
+# harness, runs it, and checks it does enough work, that the work is in the
+# project's own code rather than in libc, and that it is deterministic.
+#
+# A harness must execute at least this many instructions. Below it the profile
+# is process startup with a rounding error of application on top -- micro-ecc's
+# own ECDH test does 1.0e10, libcrc's unit test does 2.7e5.
+WORKLOAD_MIN_IR = int(os.environ.get("RED_WORKLOAD_MIN_IR", "50000000"))
+# ...and at least this share of those instructions must be in functions the
+# project's own binary defines, not in libc. This is what separates "a program
+# that uses the library" from "a program that prints things".
+WORKLOAD_MIN_PROJECT_SHARE = float(
+    os.environ.get("RED_WORKLOAD_MIN_SHARE", "0.60"))
+# Two runs of the harness must agree this closely, or the workload is not a
+# measurement. (Gate 1 re-checks this on the real profile; this catches a
+# harness built on time(), rand() or uninitialised memory before it gets there.)
+WORKLOAD_DETERMINISM = float(os.environ.get("RED_WORKLOAD_DETERMINISM", "0.02"))
+# The harness must finish in this long, twice, under callgrind.
+WORKLOAD_TIMEOUT_SECONDS = int(os.environ.get("RED_WORKLOAD_TIMEOUT", "900"))
+# agent writes -> Gate 0 measures -> feedback, capped.
+WORKLOAD_MAX_ROUNDS = int(os.environ.get("RED_WORKLOAD_ROUNDS", "4"))
+
+# ---------------------------------------------------------------------------
 # Gate 4 — security bounds (red/security.py)
 # ---------------------------------------------------------------------------
 #
@@ -252,6 +286,11 @@ LLM_TIMEOUT_SECONDS = int(os.environ.get("RED_LLM_TIMEOUT_SECONDS", "1800"))
 # is_zero/is_greater helpers, and the ISS agent has to emit a Spike model for
 # every instruction in one reply.
 LLM_MAX_TOKENS = int(os.environ.get("RED_LLM_MAX_TOKENS", "64000"))
+# Vertex throttles a driver that runs turns back to back, and a throttled turn
+# is not a failed one -- red.loop backs off and retries rather than counting it
+# against the "the backend is down" guard.
+LLM_RATE_LIMIT_RETRIES = int(os.environ.get("RED_LLM_RATE_LIMIT_RETRIES", "3"))
+LLM_RATE_LIMIT_BACKOFF = float(os.environ.get("RED_LLM_RATE_LIMIT_BACKOFF", "45"))
 LLM_PROMPTS_DIR = os.path.join(REPO_ROOT, "red", "prompts")
 
 # ---------------------------------------------------------------------------

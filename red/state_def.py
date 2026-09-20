@@ -26,6 +26,53 @@ from typing import Optional, Union, get_args, get_origin, get_type_hints
 
 
 # ---------------------------------------------------------------------------
+# AW — Workload synthesis (what A1 profiles)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkloadSpec:
+    """A representative workload for a project, and the measurements that say
+    whether it is one.
+
+    RED's input is "a source repo + representative workloads", and repositories
+    routinely ship only the first half. What they do ship is a *unit test*: a
+    few short inputs, a lot of printf, and a total dynamic cost thousands of
+    times too small to profile. Mining that produces hot "loops" in the dynamic
+    loader.
+
+    So the workload is written by an agent that reads the repository, and the
+    fields below the line are filled in by Gate 0 from measurement, never by the
+    agent: how much work it does, how much of that work is in the project's own
+    code, and whether two runs agree.
+    """
+
+    project: str                     # the project directory it drives
+    name: str = ""                   # e.g. "libcrc/crc32-64KiB"
+    rationale: str = ""              # why this is what the library is *for*
+    entry: str = ""                  # path of the generated harness .c
+    api: list[str] = field(default_factory=list)   # functions it drives
+    # --- measured by Gate 0, not claimed by the agent ---------------------
+    dynamic_ir: int = 0              # instructions one run executes
+    project_ir: int = 0              # ...of which are in the project's own code
+    project_share: float = 0.0       # project_ir / dynamic_ir
+    runs: list[int] = field(default_factory=list)  # per-run totals
+    drift: float = 0.0               # |run1 - run2| / run1
+    exit_code: int = 0
+    passes_gate0: bool = False
+    detail: str = ""
+
+
+def validate_workload_spec(w: WorkloadSpec) -> None:
+    """A WorkloadSpec is only meaningful if it names a project and an entry
+    file. Everything that decides whether it is *representative* is measured by
+    Gate 0, so there is nothing here to check about it."""
+    if not w.project:
+        raise ValueError("WorkloadSpec.project is required")
+    if not w.entry:
+        raise ValueError("WorkloadSpec.entry is required (the harness source)")
+
+
+# ---------------------------------------------------------------------------
 # A1 — Kernel mining
 # ---------------------------------------------------------------------------
 

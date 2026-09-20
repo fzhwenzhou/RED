@@ -211,7 +211,12 @@ head_env_commands: ["source $HOME/RED/.venv/bin/activate && export RAY_DEFAULT_P
 
 head_start_ray_commands:
     - ray stop
-    - ulimit -c unlimited && ray start --head --port=6379 --include-dashboard=True --dashboard-agent-listen-port=0
+    # The dashboard costs ~200 MB of agents on the head and RED never opens
+    # it: the driver prints its own progress and the artifacts are on disk.
+    # This head is a 5.7 GB WSL box that has OOMed its GCS mid-batch, which
+    # kills every worker's connection and fails the run for no reason the
+    # design can see.
+    - ulimit -c unlimited && ray start --head --port=6379 --include-dashboard=False --object-store-memory=500000000
 
 worker_start_ray_commands:
     - ray stop
