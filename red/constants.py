@@ -118,12 +118,51 @@ FIXED_CYCLES = float(os.environ.get("RED_FIXED_CYCLES", "28"))
 CYCLES_PER_BEAT = float(os.environ.get("RED_CYCLES_PER_BEAT", "2"))
 MAC_CYCLES = float(os.environ.get("RED_MAC_CYCLES", "1"))
 CPU_LOAD_STORE = float(os.environ.get("RED_CPU_LOAD_STORE", "5"))
+# What the caller pays, per operand word, to lay the operand block out and read
+# the result back. Fitted to the same RTL harness as the constants above: on the
+# measured micro-ecc call, marshalling a 16-word block costs 413 of the 656
+# cycles, i.e. ~12.9 cycles per word moved in each direction -- not the ~5 of a
+# bare load, because the marshalling loop pays address arithmetic and loop
+# overhead per word as well. Charging it at the load/store rate understated the
+# single largest component of every measured call.
+CYCLES_PER_MARSHAL_WORD = float(
+    os.environ.get("RED_CYCLES_PER_MARSHAL_WORD", "12.9"))
 CYCLES_PER_IR = float(os.environ.get("RED_CYCLES_PER_IR", "8.51"))
 
 # Gate 3 rejects an extension predicted to deliver less than this. The point of
 # designing custom instructions is not to break even.
 SPEEDUP_TARGET = float(os.environ.get("RED_SPEEDUP_TARGET", "2.0"))
 PERF_MAX_ROUNDS = int(os.environ.get("RED_PERF_ROUNDS", "4"))
+
+# --- how the bar moves -----------------------------------------------------
+#
+# A fixed 2x bar asks two different questions of two different workloads, and
+# one of them is incoherent. Amdahl caps what any extension can do: a design
+# covering 47.3% of an application cannot exceed 1/(1-0.473) = 1.90x however
+# perfect the silicon, so demanding 2.0x of micro-ecc demanded something no
+# instruction could deliver. The RTL then measured that rejected design at
+# 1.67x -- a real, useful speedup the loop had been told to treat as failure.
+#
+# So the bar is set from what the workload permits, and relaxed as the evidence
+# comes in:
+#
+#   round 1   min(SPEEDUP_TARGET, ceiling x ATTAINMENT)   -- ambition, capped
+#   round r   the same, x RELAX^(r-1)                      -- relaxed per round
+#   never     below SPEEDUP_FLOOR
+#
+# ATTAINMENT is the share of the attainable gain a first design should capture.
+# RELAX is how fast the bar comes down when redesigns are not reaching it --
+# by the third round the loop is asking for something close to the floor,
+# because many workloads simply do not have a 2x in them.
+SPEEDUP_FLOOR = float(os.environ.get("RED_SPEEDUP_FLOOR", "1.15"))
+SPEEDUP_ATTAINMENT = float(os.environ.get("RED_SPEEDUP_ATTAINMENT", "0.75"))
+SPEEDUP_RELAX = float(os.environ.get("RED_SPEEDUP_RELAX", "0.66"))
+
+# How far `invocations` may be out before the spec tool refuses the draft. The
+# estimator behind the check is biased by a factor of a few, so this is set an
+# order of magnitude out: it catches 2-where-128-is-needed without arguing about
+# 1-versus-3.
+INVOCATION_REJECT = float(os.environ.get("RED_INVOCATION_REJECT", "10"))
 
 # ---------------------------------------------------------------------------
 # AW / Gate 0 — workload synthesis (red/workload.py)

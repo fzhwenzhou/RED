@@ -180,11 +180,16 @@ def cmd_list() -> int:
              if f.name.startswith(f"chia-{CLUSTER}")]
     print(f"firewall rules ({len(rules)}): {', '.join(rules) or '-'}")
 
+    # Cluster-owned only: this project may hold resources that are not RED's,
+    # and reporting those as leftovers makes `down` look like it failed.
+    pref = f"chia-{CLUSTER}"
     d = compute_v1.DisksClient()
-    ndisks = sum(len(lst.disks or []) for _z, lst in d.aggregated_list(project=PROJECT))
+    ndisks = sum(1 for _z, lst in d.aggregated_list(project=PROJECT)
+                 for dk in (lst.disks or []) if dk.name.startswith(pref))
     a = compute_v1.AddressesClient()
-    naddr = sum(len(lst.addresses or []) for _r, lst in a.aggregated_list(project=PROJECT))
-    print(f"disks: {ndisks}   static addresses: {naddr}")
+    naddr = sum(1 for _r, lst in a.aggregated_list(project=PROJECT)
+                for ad in (lst.addresses or []) if ad.name.startswith(pref))
+    print(f"disks: {ndisks}   static addresses: {naddr}  (cluster-owned)")
     return 0
 
 
@@ -254,14 +259,29 @@ def cmd_force_clean() -> int:
     return 0
 
 
+def _cluster_prefix() -> str:
+    return f"chia-{CLUSTER}"
+
+
 def cmd_verify_clean() -> int:
+    """Exit 0 when none of *this cluster's* resources remain.
+
+    Scoped to the cluster's own name prefix, not to everything in the project.
+    The GCP project is not RED's alone -- it held an unrelated 100 GB disk for
+    somebody's coursework -- and counting that made `red_env.sh down` end with
+    "leftover resources above" and a non-zero exit after a teardown that had in
+    fact removed everything it owns. A cleanup check that cries wolf about
+    resources it must not touch trains the operator to ignore it, which is the
+    opposite of what it is for.
+    """
+    pref = _cluster_prefix()
     insts = [i.name for i in _cluster_instances()]
     d = compute_v1.DisksClient()
     disks = [dk.name for _z, lst in d.aggregated_list(project=PROJECT)
-             for dk in (lst.disks or [])]
+             for dk in (lst.disks or []) if dk.name.startswith(pref)]
     a = compute_v1.AddressesClient()
     addrs = [ad.name for _r, lst in a.aggregated_list(project=PROJECT)
-             for ad in (lst.addresses or [])]
+             for ad in (lst.addresses or []) if ad.name.startswith(pref)]
     leftovers = insts + disks + addrs
     if leftovers:
         print("LEFTOVER GCP RESOURCES (still billing):")

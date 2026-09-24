@@ -6,6 +6,22 @@ required **${TARGET}x** whole-application speedup.
 
 ${VERDICT}
 
+## The bar this round
+
+You are being asked for **${TARGET}x**. If that is lower than the round before,
+the bar has come down deliberately: the loop relaxes it when redesigns cannot
+reach it, and it is capped by what Amdahl allows for the share of the
+application your design covers. Two consequences worth acting on:
+
+- If your predicted speedup is close to the bar, the cheapest win is usually
+  **more coverage**, not a faster instruction. An instruction that is already
+  30x on its kernel gains almost nothing from being 60x; covering a second hot
+  loop moves the whole-application number directly.
+- If the ceiling itself is the problem — the mined loops simply are not enough
+  of the application — say so in your rationale rather than inflating a
+  declaration to clear the bar. The gate checks `mac_ops` against your own C
+  model and `invocations` against the profile.
+
 ## The one thing that decides this
 
 An instruction's operand traffic is fixed by its `words`: it moves `2 x words`
@@ -53,3 +69,14 @@ Read the current draft with `${READ_SPEC}` and the full verdict with
 `c_model` correct and total for every instruction you keep or add — it is still
 compiled and stress-tested. Record what you changed with `${APPEND_KNOWLEDGE}`,
 call `${FINISH}`, and reply with the new design's expected speedup and why.
+
+## If the verdict says a declaration is UNVERIFIED
+
+Gate 3 measures the software cost from the profile and your instruction's work
+from its own C model, but it cannot measure `invocations` — how many times your
+instruction runs per call of the kernel. When the verdict says that number is
+inconsistent with the profile, fix the number before you change the design: an
+understated `invocations` leaves most of the kernel in software in the model's
+arithmetic, and the speedup it reports is then wrong in whichever direction the
+error happens to push. Count it from the data: bytes per kernel call divided by
+bytes per invocation.

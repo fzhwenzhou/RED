@@ -6,12 +6,13 @@
 #     numbers are in iCE40 LUTs, so these are comparable to the upstream figures
 #   * technology-independent cell count after generic `synth`
 #
-# Usage: bash eval/scripts/area.sh [outdir]
+# Usage: bash eval/scripts/area.sh [outdir] [accelerator-rtl]
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.."
 OUT="${1:-$REPO/eval/build/area}"
+ACCEL_RTL="${2:-$REPO/eval/rtl/red_accel.v}"
 mkdir -p "$OUT"
-RTL="$REPO/target_cpu/picorv32/picorv32.v $REPO/eval/rtl/red_accel.v $REPO/eval/rtl/red_core.v"
+RTL="$REPO/target_cpu/picorv32/picorv32.v $ACCEL_RTL $REPO/eval/rtl/red_core.v"
 
 run() {  # run <name> <top> <accel:0|1> <flow>
     local name="$1" top="$2" accel="$3" flow="$4"

@@ -300,9 +300,92 @@ def review_spec(llm, spec_json: str, report_json: str, core: str,
             continue
         findings.extend(_parse_findings(reviewer, getattr(res, "result", "") or ""))
 
+    findings = _dedupe(findings)
     order = {"blocking": 0, "major": 1, "minor": 2}
     findings.sort(key=lambda f: order.get(f.severity, 3))
     return state_def.ReviewReport(reviewers=ran, findings=findings)
+
+
+_NONWORD = re.compile(r"[^a-z0-9 ]+")
+# Words that carry no signal about *which* defect is being described.
+_NOISE = frozenset("""
+the this that these those with without which what where when will would should
+could must have has been being from into onto over under about across instead
+rather than then them they their there here also only just even more most less
+than because since while during before after both each every some any all none
+instruction instructions spec design model value values field fields
+""".split())
+# How much two findings must overlap to be the same finding.
+_SAME = float(os.environ.get("RED_REVIEW_DEDUPE", "0.45"))
+
+
+def _terms(f) -> set:
+    """The content words of a claim, crudely stemmed.
+
+    Stemming matters more than it looks: four reviewers describing one defect
+    wrote "collides", "collide", "encodings" and "funct7" about the same
+    encoding clash, and an exact match on word sets treats those as four
+    different problems — which is exactly the failure this function exists to
+    stop.
+    """
+    out = set()
+    for w in _NONWORD.sub(" ", (f.finding or "").lower()).split():
+        if len(w) <= 3 or w in _NOISE:
+            continue
+        for suffix in ("ing", "es", "ed", "s"):
+            if len(w) > 5 and w.endswith(suffix):
+                w = w[: -len(suffix)]
+                break
+        out.add(w)
+    return out
+
+
+def _dedupe(findings: list) -> list:
+    """Collapse one objection raised by several reviewers into one finding.
+
+    All four reviewers read the same spec, so a real defect is usually found by
+    all four — and the loop then counted it four times, showed it to the
+    designer four times, and ranked a spec with one defect as though it had
+    four. Merging keeps the part that is genuinely stronger evidence (how many
+    reviewers independently agreed) and drops the repetition.
+
+    Similarity rather than equality, because reviewers paraphrase. The
+    threshold is deliberately high enough that two different objections about
+    the same instruction stay separate.
+    """
+    order = {"blocking": 0, "major": 1, "minor": 2}
+    kept: list = []
+    for f in findings:
+        terms = _terms(f)
+        for group in kept:
+            seen, seen_terms = group
+            if (seen.instruction or "") != (f.instruction or ""):
+                continue
+            union = terms | seen_terms
+            if not union:
+                continue
+            if len(terms & seen_terms) / len(union) < _SAME:
+                continue
+            # Same defect. Keep the worst severity, the fullest evidence, and
+            # record that another reviewer reached it independently.
+            if order.get(f.severity, 3) < order.get(seen.severity, 3):
+                seen.severity = f.severity
+                seen.finding = f.finding
+            who = {r.strip() for r in seen.reviewer.split("+")} | {f.reviewer}
+            seen.reviewer = "+".join(sorted(who))
+            if len(f.evidence or "") > len(seen.evidence or ""):
+                seen.evidence = f.evidence
+            if not seen.fix and f.fix:
+                seen.fix = f.fix
+            # The group now stands for every wording of this defect, so later
+            # findings are compared against the union. Without this, a third
+            # reviewer's phrasing is matched only against the first one that
+            # happened to arrive, and near-misses pile up as separate rows.
+            group[1] = seen_terms | terms
+            break
+        else:
+            kept.append([f, terms])
+    return [f for f, _ in kept]
 
 
 def render(report: state_def.ReviewReport) -> str:

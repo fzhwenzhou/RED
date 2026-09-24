@@ -445,6 +445,12 @@ def c_identifier(mnemonic: str) -> str:
 # The custom opcode space RED designs into (RISC-V reserves custom-0..custom-3).
 CUSTOM_OPCODES = ("custom-0", "custom-1", "custom-2", "custom-3")
 
+# The actual 7-bit opcode each name stands for. RISC-V reserves exactly these
+# four for non-standard extensions; an encoding outside them aliases a real
+# instruction (red/security.py decodes this at Gate 4).
+CUSTOM_OPCODE_BITS = {"custom-0": "0001011", "custom-1": "0101011",
+                      "custom-2": "1011011", "custom-3": "1111011"}
+
 
 def normalize_opcode(value: str) -> str:
     """Canonicalize an opcode spelling to ``custom-N``, or "" if it is not one.
@@ -511,6 +517,25 @@ def validate_isa_spec(s: ISASpec) -> None:
         if not ins.replaces:
             raise ValueError(f"instruction {ins.name!r} must name the mined loop it "
                              "replaces (`replaces`), so its benefit can be computed")
+        # RED's operand ABI is fixed for every instruction it designs:
+        #   <mnemonic> rd, rs1, rs2   rs1 = input block address,
+        #                             rs2 = output block address, rd <- 0
+        # A draft that omits rs2 has no way to say where its result goes, and
+        # the harness, the Spike model and the caller all assume it is there.
+        # This was the single most common blocking review finding in the
+        # project's history -- all four reviewers independently spend a finding
+        # on it and the loop pays a full fan-out plus a revision round for
+        # something decidable from the spec's own fields. Decide it here.
+        named = {str(o).strip().lower() for o in (ins.operands or [])}
+        missing = [r for r in ("rd", "rs1", "rs2") if r not in named]
+        if missing:
+            raise ValueError(
+                f"instruction {ins.name!r} operands={ins.operands!r} is missing "
+                f"{', '.join(missing)}. RED's ABI is fixed for every "
+                "instruction: `<mnemonic> rd, rs1, rs2`, where rs1 holds the "
+                "address of the input block, rs2 holds the address of the "
+                f"output block ({ins.words} words), and rd receives 0. State "
+                'all three: "operands": ["rd", "rs1", "rs2"].')
         expected = f"{c_identifier(ins.mnemonic)}_model"
         if expected not in ins.c_model:
             raise ValueError(

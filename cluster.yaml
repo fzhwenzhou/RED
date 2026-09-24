@@ -46,7 +46,16 @@ available_node_types:
     # The model itself is red/constants.py LLM_MODEL (RED_LLM_MODEL overrides it);
     # this node only runs the thin client, so it never needs pinning here.
     llm:
-        resources: {"llm": 1}
+        # 4, not 1. This node does not compute anything -- it makes HTTPS
+        # calls to Vertex and waits -- so "how many llm units" is really "how
+        # many requests may be in flight". At 1, every agent turn in the loop
+        # serialized, including the four review sub-agents that red/review.py
+        # dispatches together precisely so they cost one round trip instead of
+        # four. That fan-out never actually happened on the cluster: the
+        # reviewers queued behind each other for the whole life of the project.
+        # 4 matches the review fan-out; a burst that Vertex throttles is now
+        # retried with backoff rather than failing the turn.
+        resources: {"llm": 4}
         num_workers: 1
         worker_env_commands: ["source ~/.bashrc && conda activate chia_env && export PATH=$HOME/.local/bin:$PATH && export RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=minor"]
         # The repo is rsynced to the same path (file_mounts below) before this

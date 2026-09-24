@@ -31,7 +31,7 @@ artifact those downstream nodes would consume.
 | **link 1** | Coverage holds, and every instruction's C reference model compiles and survives a 100,000-vector stress run under ASan+UBSan. | **Implemented (partial — see LIMITATIONS)** |
 | **ISS implementation** | A *separate* agent implements each instruction for Spike from the spec's prose + encoding alone — it never sees the C model. | **Implemented** |
 | **Gate 2 / link 2** | The two models must agree on 10⁵ random + corner vectors, with the instruction really executed by a patched Spike. | **Implemented** |
-| A3 / A4 / A5 | RTL (PCPI), LLVM pass, end-to-end speedup. | **Out of scope as loop nodes** — but see `eval/` for a hand-built evaluation of one ISASpec |
+| A3 / A4 / A5 | RTL (PCPI), LLVM pass, end-to-end speedup. | **Out of scope as loop nodes** — but see `eval/` for a hand-built evaluation of every current project ISASpec |
 
 ## LIMITATIONS
 
@@ -201,11 +201,12 @@ instruction is also charged for the part of its kernel it does *not* replace,
 and `replaces` must name a mined loop exactly — both were loopholes that paid an
 instruction for work it never did.
 
-Gate 3 rejects the first two and tells the designer why, in those terms:
-replace *whole kernels, not loop bodies*, drive `invocations` to 1, drive
-`marshal_words` to 0, and cover enough of the profile for Amdahl to matter. Each
-instruction must now declare `mac_ops`, `replaces`, `invocations` and
-`marshal_words`, so its performance claim is explicit and checkable.
+Gate 3 is intended to reject the first two and tell the designer why: replace
+whole kernels, drive `invocations` to 1, minimize `marshal_words`, and cover
+enough of the profile for Amdahl to matter. The renewed RTL evaluation exposed
+a remaining attribution bug: two loops from the same multiply function were
+summed as independent coverage, so a whole-multiply design predicted at 11.60x
+actually measured 1.675x. See `eval/RESULTS.md`.
 
 ## Loop performance
 
@@ -221,25 +222,26 @@ pipeline that did strictly less. Where it went:
 | Gate 2's per-instruction differential tests run on a thread pool | subprocess-bound work overlaps; `RED_GATE2_PARALLEL` (default 4) |
 | self-critique rounds cut from 8 to 3 | the dedicated reviewers do that job better than the designer re-reading itself |
 
-## Does the extension actually pay off?
+## Do the extensions actually pay off?
 
-A1+A2 verify that an instruction *means what its spec says*. They never ask
-whether it can be built, whether the application's data layout lets it be
-called, or whether it is faster. `eval/` answers those for one ISASpec, on
-cycle-accurate PicoRV32 RTL:
+The evaluation now covers every current target project on PicoRV32:
 
-| | baseline | with the extension |
-|---|---|---|
-| whole ECDH exchange | 298,502,758 cycles | 304,410,162 cycles (**0.98x**) |
-| iCE40 LUT4 | 5,582 | 9,696 (**+74%**) |
-| shared secret correct | yes | yes |
+| project | baseline cycles | extended cycles | speedup | area result |
+|---|---:|---:|---:|---|
+| micro-ecc | 298,502,758 | 178,231,186 | **1.6748x** | +76.6% LUT4 |
+| matrixmul | 1,040,318 | 71,392 | **14.5719x** | behavioral model; unavailable |
+| libcrc | 852,200 | 405,322 | **2.1025x** | +18.0% LUT4 |
 
-The extension is verified, correct, and **2% slower for 74% more area**. The
-cause is measured rather than guessed — RED's memory-block operand ABI makes
-each instruction's latency data movement rather than arithmetic (2.0 cycles per
-bus beat, 28 cycles fixed overhead), and `add256`/`sub256` drop the carry-out
-their callers need. Full analysis, per-operation measurements, and the concrete
-feedback for the next A2 round: **[eval/RESULTS.md](eval/RESULTS.md)**.
+All baseline and extended outputs match. Micro-ecc and libcrc use synthesizable
+RTL; matrixmul uses an explicit four-operation behavioral floating-point model,
+so its cycle result is useful for architectural evaluation but has no valid area
+claim yet.
+
+The measurements also expose large prediction gaps: Gate 3 predicted 11.60x,
+92.10x, and 14.71x respectively. The measured results identify overlapping-loop
+attribution, incomplete invocation counts, and underpriced bit-serial work as
+remaining cost-model problems. Full evidence and reproduction commands are in
+**[eval/RESULTS.md](eval/RESULTS.md)**.
 
 This is the answer the design's A3-A5 nodes exist to produce, and the reason a
 `speedup < target -> re-mine` edge is in the proposal.

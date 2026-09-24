@@ -1,0 +1,39 @@
+{
+  "critic_rounds": 3,
+  "description": "Accelerates secp256r1 multiplication by replacing the entire uECC_vli_mult function with a single 256x256->512-bit multiplier.",
+  "encodings": [],
+  "gate2_vectors": 100000,
+  "instructions": [
+    {
+      "c_model": "void secp256r1_mult_model(const uint32_t in[16], uint32_t out[16]) {\n    for (int i = 0; i < 16; i++) out[i] = 0;\n    for (int i = 0; i < 8; i++) {\n        uint64_t carry = 0;\n        for (int j = 0; j < 8; j++) {\n            uint64_t prod = (uint64_t)in[i] * in[8 + j];\n            uint64_t sum = (uint64_t)out[i + j] + prod + carry;\n            out[i + j] = (uint32_t)sum;\n            carry = sum >> 32;\n        }\n        out[i + 8] = (uint32_t)carry;\n    }\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 1,
+      "mac_ops": 64,
+      "marshal_words": 16,
+      "mnemonic": "secp256r1.mult",
+      "name": "secp256r1_mult",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "out[0..15] = left * right;",
+      "replaces": "uECC_vli_mult",
+      "semantics": "Performs a full 256x256-bit to 512-bit multiplication, replacing the entire uECC_vli_mult function. The input block (16 words) contains two 256-bit operands: `left` in `in[0..7]` and `right` in `in[8..15]`. The output block (16 words) contains the 512-bit product in `out[0..15]`.",
+      "spike_model": "void secp256r1_mult_iss(const uint32_t in[16], uint32_t out[16]) {\n    for (int i = 0; i < 16; ++i) {\n        out[i] = 0;\n    }\n    for (int i = 0; i < 8; ++i) {\n        uint64_t carry = 0;\n        for (int j = 0; j < 8; ++j) {\n            uint64_t prod = (uint64_t)in[i] * in[8 + j] + out[i + j] + carry;\n            out[i + j] = (uint32_t)prod;\n            carry = prod >> 32;\n        }\n        out[i + 8] = (uint32_t)carry;\n    }\n}",
+      "words": 16
+    }
+  ],
+  "link1_vectors": 100000,
+  "name": "secp256r1_accel",
+  "passes_gate2": true,
+  "passes_link1": true,
+  "tests": [
+    "link1: coverage 100.00% >= 80%; 1/1 C models built and survived 100,000 vectors under ASan+UBSan",
+    "gate2: 1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors"
+  ],
+  "version": "1.3"
+}

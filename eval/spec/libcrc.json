@@ -1,0 +1,83 @@
+{
+  "critic_rounds": 3,
+  "description": "Custom instructions to accelerate CRC-64-ECMA, CRC-16, and CRC-32 by processing 32 bytes at a time, fitting within the 16-word coprocessor operand buffer limit.",
+  "encodings": [],
+  "gate2_vectors": 100000,
+  "instructions": [
+    {
+      "c_model": "void crc64_ecma_step32b_model(const uint32_t in[10], uint32_t out[10]) {\n    uint64_t crc = ((uint64_t)in[1] << 32) | in[0];\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[2 + i];\n        for (int k = 0; k < 4; k++) {\n            uint8_t b = (w >> (k * 8)) & 0xFF;\n            crc ^= ((uint64_t)b << 56);\n            for (int j = 0; j < 8; j++) {\n                uint64_t mask = (uint64_t)0 - ((crc >> 63) & 1);\n                crc = (crc << 1) ^ (0x42F0E1EBA9EA3693ull & mask);\n            }\n        }\n    }\n    out[0] = (uint32_t)crc;\n    out[1] = (uint32_t)(crc >> 32);\n    for (int i = 2; i < 10; i++) {\n        out[i] = 0;\n    }\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 1111011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 2,
+      "mac_ops": 88,
+      "marshal_words": 12,
+      "mnemonic": "crc64_ecma_step32b",
+      "name": "CRC-64-ECMA 32-byte step",
+      "opcode": "custom-3",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = (in[1] << 32) | in[0]\nfor i = 0 to 7:\n    w = in[2 + i]\n    for k = 0 to 3:\n        b = (w >> (k * 8)) & 0xFF\n        crc = crc ^ (b << 56)\n        for j = 0 to 7:\n            if crc & 0x8000000000000000:\n                crc = (crc << 1) ^ 0x42F0E1EBA9EA3693\n            else:\n                crc = crc << 1\nout[0] = crc & 0xFFFFFFFF\nout[1] = crc >> 32\nout[2..9] = 0",
+      "replaces": "crc_64_ecma::loop",
+      "semantics": "Reads a 64-bit CRC state and 32 bytes of data from a memory block addressed by `rs1`. Computes the updated CRC-64-ECMA value and writes the 64-bit result to the memory block addressed by `rs2`. `rd` receives 0. The input block `in` contains 10 words: `in[0]` (low 32 bits of CRC), `in[1]` (high 32 bits of CRC), and `in[2..9]` (32 bytes of data). The output block `out` is 10 words: `out[0]` (low 32 bits of new CRC), `out[1]` (high 32 bits of new CRC), with `out[2..9]` zero-padded.",
+      "spike_model": "void crc64_ecma_step32b_iss(const uint32_t in[10], uint32_t out[10]) {\n    uint64_t crc = ((uint64_t)in[1] << 32) | in[0];\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[2 + i];\n        for (int k = 0; k < 4; k++) {\n            uint64_t b = (w >> (k * 8)) & 0xFF;\n            crc = crc ^ (b << 56);\n            for (int j = 0; j < 8; j++) {\n                if (crc & 0x8000000000000000ULL) {\n                    crc = (crc << 1) ^ 0x42F0E1EBA9EA3693ULL;\n                } else {\n                    crc = (crc << 1);\n                }\n            }\n        }\n    }\n    out[0] = (uint32_t)(crc & 0xFFFFFFFFULL);\n    out[1] = (uint32_t)(crc >> 32);\n    for (int i = 2; i < 10; i++) {\n        out[i] = 0;\n    }\n}",
+      "words": 10
+    },
+    {
+      "c_model": "void crc16_step32b_model(const uint32_t in[9], uint32_t out[9]) {\n    uint16_t crc = (uint16_t)in[0];\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[1 + i];\n        for (int k = 0; k < 4; k++) {\n            uint8_t b = (w >> (k * 8)) & 0xFF;\n            crc ^= b;\n            for (int j = 0; j < 8; j++) {\n                uint16_t mask = (uint16_t)0 - (crc & 1);\n                crc = (crc >> 1) ^ (0xA001 & mask);\n            }\n        }\n    }\n    out[0] = (uint32_t)crc;\n    for (int i = 1; i < 9; i++) {\n        out[i] = 0;\n    }\n}",
+      "encoding": "0000000 rs2 rs1 001 rd 1111011",
+      "funct3": "001",
+      "funct7": "0000000",
+      "invocations": 2,
+      "mac_ops": 125,
+      "marshal_words": 10,
+      "mnemonic": "crc16_step32b",
+      "name": "CRC-16 32-byte step",
+      "opcode": "custom-3",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = in[0] & 0xFFFF\nfor i = 0 to 7:\n    w = in[1 + i]\n    for k = 0 to 3:\n        b = (w >> (k * 8)) & 0xFF\n        crc = crc ^ b\n        for j = 0 to 7:\n            if crc & 1:\n                crc = (crc >> 1) ^ 0xA001\n            else:\n                crc = crc >> 1\nout[0] = crc\nout[1..8] = 0",
+      "replaces": "crc_16::loop",
+      "semantics": "Reads a 16-bit CRC state and 32 bytes of data from memory addressed by `rs1`. Computes the updated CRC-16 value and writes it to memory addressed by `rs2`. `rd` receives 0. `in[0]` contains the zero-extended CRC state. `in[1..8]` contains 32 bytes of data. `out[0]` contains the updated CRC-16 (zero-extended). `out[1..8]` are zero-padded. Total words is 9.",
+      "spike_model": "void crc16_step32b_iss(const uint32_t in[9], uint32_t out[9]) {\n    uint32_t crc = in[0] & 0xFFFF;\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[1 + i];\n        for (int k = 0; k < 4; k++) {\n            uint32_t b = (w >> (k * 8)) & 0xFF;\n            crc = crc ^ b;\n            for (int j = 0; j < 8; j++) {\n                if (crc & 1) {\n                    crc = (crc >> 1) ^ 0xA001;\n                } else {\n                    crc = (crc >> 1);\n                }\n            }\n        }\n    }\n    out[0] = crc;\n    for (int i = 1; i < 9; i++) {\n        out[i] = 0;\n    }\n}",
+      "words": 9
+    },
+    {
+      "c_model": "void crc32_step32b_model(const uint32_t in[9], uint32_t out[9]) {\n    uint32_t crc = in[0];\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[1 + i];\n        for (int k = 0; k < 4; k++) {\n            uint8_t b = (w >> (k * 8)) & 0xFF;\n            crc ^= b;\n            for (int j = 0; j < 8; j++) {\n                uint32_t mask = (uint32_t)0 - (crc & 1);\n                crc = (crc >> 1) ^ (0xEDB88320ul & mask);\n            }\n        }\n    }\n    out[0] = crc;\n    for (int i = 1; i < 9; i++) {\n        out[i] = 0;\n    }\n}",
+      "encoding": "0000000 rs2 rs1 010 rd 1111011",
+      "funct3": "010",
+      "funct7": "0000000",
+      "invocations": 2,
+      "mac_ops": 107,
+      "marshal_words": 10,
+      "mnemonic": "crc32_step32b",
+      "name": "CRC-32 32-byte step",
+      "opcode": "custom-3",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = in[0]\nfor i = 0 to 7:\n    w = in[1 + i]\n    for k = 0 to 3:\n        b = (w >> (k * 8)) & 0xFF\n        crc = crc ^ b\n        for j = 0 to 7:\n            if crc & 1:\n                crc = (crc >> 1) ^ 0xEDB88320\n            else:\n                crc = crc >> 1\nout[0] = crc\nout[1..8] = 0",
+      "replaces": "crc_32::loop",
+      "semantics": "Reads a 32-bit CRC state and 32 bytes of data from memory addressed by `rs1`. Computes the updated CRC-32 value and writes it to memory addressed by `rs2`. `rd` receives 0. `in[0]` contains the CRC state. `in[1..8]` contains 32 bytes of data. `out[0]` contains the updated CRC-32. `out[1..8]` are zero-padded. Total words is 9.",
+      "spike_model": "void crc32_step32b_iss(const uint32_t in[9], uint32_t out[9]) {\n    uint32_t crc = in[0];\n    for (int i = 0; i < 8; i++) {\n        uint32_t w = in[1 + i];\n        for (int k = 0; k < 4; k++) {\n            uint32_t b = (w >> (k * 8)) & 0xFF;\n            crc = crc ^ b;\n            for (int j = 0; j < 8; j++) {\n                if (crc & 1) {\n                    crc = (crc >> 1) ^ 0xEDB88320;\n                } else {\n                    crc = (crc >> 1);\n                }\n            }\n        }\n    }\n    out[0] = crc;\n    for (int i = 1; i < 9; i++) {\n        out[i] = 0;\n    }\n}",
+      "words": 9
+    }
+  ],
+  "link1_vectors": 100000,
+  "name": "CRC Accelerators",
+  "passes_gate2": true,
+  "passes_link1": true,
+  "tests": [
+    "link1: coverage 99.92% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan",
+    "gate2: 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors"
+  ],
+  "version": "1.2"
+}

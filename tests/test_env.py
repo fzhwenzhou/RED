@@ -142,7 +142,7 @@ def _spec() -> state_def.ISASpec:
             state_def.InstructionSpec(
                 name="secp256r1.xorfold", mnemonic="xorfold",
                 encoding="0000010", opcode="custom-0", funct3="000", funct7="0000010",
-                operands=["rd", "rs1"], words=4,
+                operands=["rd", "rs1", "rs2"], words=4,
                 semantics="rd[i] = rs1[i] ^ rs1[(i+1) mod 4]",
                 pseudocode="for i in 0..3: rd[i] = rs1[i] ^ rs1[(i+1) % 4]",
                 mac_ops=0, replaces="vli_mmod_fast_secp256r1::inner",
@@ -258,7 +258,7 @@ def test_link1_rejects_broken_model() -> None:
     spec = _spec()
     spec.instructions = [state_def.InstructionSpec(
         name="demo.oob", mnemonic="oob", encoding="0000011", opcode="custom-0",
-        funct3="000", funct7="0000011", operands=["rd", "rs1"], words=4,
+        funct3="000", funct7="0000011", operands=["rd", "rs1", "rs2"], words=4,
         semantics="deliberately writes out[4] on a 4-word model",
         pseudocode="rd[i] = rs1[i mod 4] for i in 0..4",
         mac_ops=0, replaces="uECC_vli_mult::inner", invocations=1,
@@ -532,7 +532,7 @@ def test_no_prompt_has_an_unsubstituted_placeholder() -> None:
         "mine.md": dict(LIST_SOURCES="a", READ_SOURCE="b", READ_PROFILE="c",
                         WRITE_REPORT="d"),
         "core.md": dict(LIST_SOURCES="a", READ_SOURCE="b"),
-        "system.md": dict(GRAPH_PRIOR_DESIGNS="gp", GRAPH_PRIOR_FINDINGS="gf", GRAPH_PRIOR_SECURITY="gs", GRAPH_BEST_DESIGN="gb", GRAPH_LOOPS="gl", GRAPH_QUERY="gq", READ_REPORT="a", READ_PROFILE="b", READ_STATUS="c",
+        "system.md": dict(GRAPH_WINNING_SHAPE="gw", GRAPH_PRIOR_DESIGNS="gp", GRAPH_PRIOR_FINDINGS="gf", GRAPH_PRIOR_SECURITY="gs", GRAPH_BEST_DESIGN="gb", GRAPH_LOOPS="gl", GRAPH_QUERY="gq", READ_REPORT="a", READ_PROFILE="b", READ_STATUS="c",
                           READ_KNOWLEDGE="d", READ_SPEC="e", WRITE_SPEC="f",
                           FINISH="g", READ_CORE="h", CORE_PROFILE="i",
                           CRITIC_MAX_ROUNDS="3"),
@@ -607,7 +607,7 @@ def test_core_profile_reaches_the_designer() -> None:
         "system.md", CORE_PROFILE=rendered, READ_CORE="rc", READ_REPORT="rr",
         READ_PROFILE="rp", READ_STATUS="rs", READ_KNOWLEDGE="rk",
         READ_SPEC="rsp", WRITE_SPEC="ws", FINISH="fin", CRITIC_MAX_ROUNDS="3",
-        GRAPH_PRIOR_DESIGNS="gp", GRAPH_PRIOR_FINDINGS="gf",
+        GRAPH_WINNING_SHAPE="gw", GRAPH_PRIOR_DESIGNS="gp", GRAPH_PRIOR_FINDINGS="gf",
         GRAPH_PRIOR_SECURITY="gs", GRAPH_BEST_DESIGN="gb", GRAPH_LOOPS="gl",
         GRAPH_QUERY="gq")
     _require("CANNOT address memory" in charter,
@@ -765,8 +765,12 @@ void liar_model(const uint32_t in[16], uint32_t out[16]) {
         by = {c.mnemonic: c for c in est.per_instruction}
         _require(not by["mulk"].note,
                  f"an honest declaration must stand: {by['mulk'].note}")
-        _require("declares mac_ops=0" in by["liar"].note,
-                 "a false declaration must be named in the verdict")
+        _require("mac_ops=0" in by["liar"].note
+                 and ("sequential logic steps" in by["liar"].note
+                      or "costed on the measurement" in by["liar"].note),
+                 f"a false declaration must be named in the verdict, and the "
+                 f"verdict must say what the work was charged as: "
+                 f"{by['liar'].note!r}")
         _require(by["liar"].cycles > 10 * by["mulk"].cycles,
                  "the liar must be costed on what it measurably does")
 
@@ -1594,7 +1598,7 @@ def _sec_ins(mnemonic: str, model: str, **over):
         encoding="0000001 rs2 rs1 000 rd 0001011", semantics="s",
         pseudocode="p", c_model=model, words=8, mac_ops=0,
         replaces="uECC_vli_mult", invocations=1, opcode="custom-0",
-        funct3="000", funct7="0000001")
+        funct3="000", funct7="0000001", operands=["rd", "rs1", "rs2"])
     fields.update(over)
     return state_def.InstructionSpec(**fields)
 
@@ -2072,6 +2076,328 @@ def test_the_workload_agent_cannot_vouch_for_its_own_harness() -> None:
                          "write_harness only; every verdict field is measured"))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_the_fixed_abi_is_enforced_where_it_is_cheap() -> None:
+    """The most common blocking review finding in this project's history was
+    "the instruction omits rs2" — all four reviewers independently spend a
+    finding on it, and the loop pays a review fan-out plus a designer revision
+    round for something decidable from the spec's own fields.
+
+    RED's ABI is fixed (`<mnemonic> rd, rs1, rs2`), so a draft that omits rs2
+    is wrong by construction. Deciding it at the tool boundary turns a round
+    into a sentence.
+    """
+    spec = _spec()
+    for ins in spec.instructions:
+        ins.operands = ["rd", "rs1", "rs2"]
+    state_def.validate_isa_spec(spec)          # the well-formed case still passes
+
+    for bad, why in (
+            (["rd", "rs1"], "rs2 missing"),
+            ([], "no operands at all"),
+            (["rs1", "rs2"], "rd missing")):
+        broken = state_def.from_json(state_def.to_json(spec), state_def.ISASpec)
+        broken.instructions[0].operands = bad
+        try:
+            state_def.validate_isa_spec(broken)
+            raise AssertionError(f"{why}: should have been rejected")
+        except ValueError as exc:
+            _require("rs1" in str(exc) and "rs2" in str(exc),
+                     f"the rejection must state the ABI, got: {exc}")
+
+    # The rule is about `operands`, deliberately NOT about the text of the
+    # encoding: `write_spec` itself synthesizes an encoding string when the
+    # agent sends the fields nested, so a rule on that text would reject drafts
+    # RED's own normalizer produces.
+    broken = state_def.from_json(state_def.to_json(spec), state_def.ISASpec)
+    broken.instructions[0].operands = ["rd", "rs1"]
+    tool = _designer_tool("red_abi_test")
+    try:
+        out = tool.write_spec(state_def.to_json(broken))
+        _require("Rejected" in out and "rs2" in out,
+                 f"write_spec must refuse it: {out[:200]}")
+        ok = tool.write_spec(state_def.to_json(spec))
+        _require("Accepted" in ok, f"and accept the well-formed one: {ok[:160]}")
+    finally:
+        tool.stop()
+    _results.append(("fixed ABI enforced", True,
+                     "a draft missing rd/rs1/rs2 is refused at the tool "
+                     "boundary instead of costing a review round"))
+
+
+def test_one_defect_is_one_finding() -> None:
+    """Four reviewers reading one spec find the same defect four times.
+
+    The loop counted it four times, showed it to the designer four times, and
+    ranked a spec with one real problem as though it had four. Merging keeps
+    what is genuinely informative — how many reviewers independently agreed —
+    and drops the repetition.
+    """
+    from red import review
+
+    F = state_def.ReviewFinding
+    same = "The instruction omits the rs2 operand required for the output block"
+    out = review._dedupe([
+        F(reviewer="implementability", severity="blocking", finding=same,
+          instruction="mul256"),
+        F(reviewer="callability", severity="blocking", finding=same,
+          instruction="mul256", evidence="the longer evidence"),
+        F(reviewer="benefit", severity="major", finding=same,
+          instruction="mul256", fix="add rs2"),
+        F(reviewer="legality", severity="blocking", instruction="mul256",
+          finding="An entirely separate objection about encoding collisions"),
+    ])
+    _require(len(out) == 2, f"one defect + one other = 2 findings, got {len(out)}")
+    merged = next(f for f in out if "rs2" in f.finding)
+    _require(merged.severity == "blocking",
+             "the worst severity survives the merge")
+    _require(merged.reviewer.count("+") == 2,
+             f"and the agreement is recorded: {merged.reviewer}")
+    _require(merged.evidence == "the longer evidence", "fullest evidence kept")
+    _require(merged.fix == "add rs2", "and a fix from any of them")
+
+    # Different instructions are never merged, however similar the words.
+    out = review._dedupe([
+        F(reviewer="a", severity="blocking", finding=same, instruction="x"),
+        F(reviewer="b", severity="blocking", finding=same, instruction="y"),
+    ])
+    _require(len(out) == 2, "a defect in two instructions is two findings")
+    _results.append(("review dedupe", True,
+                     "one defect reported by four reviewers is one finding "
+                     "that records the agreement"))
+
+
+def test_the_graph_does_not_feed_a_run_its_own_guesses() -> None:
+    """`prior_designs` is labelled "what earlier runs learned". It used to
+    include the asking run's own draft from three minutes earlier, sitting in
+    the same table as ten converged runs of history — the designer's own guess
+    handed back as evidence.
+
+    Also checks the read that matters most for convergence: the shape of what
+    actually shipped.
+    """
+    from red import graph as g
+
+    saved = g._read
+    captured = {}
+
+    def fake_read(cypher, **params):
+        captured["cypher"] = cypher
+        captured["params"] = params
+        return []
+    try:
+        g._read = fake_read
+        g.prior_designs("W", "f", exclude_run="run-123")
+        _require(captured["params"].get("exclude") == "run-123",
+                 "prior_designs must pass the run to exclude")
+        _require("r.run_id <> $exclude" in captured["cypher"],
+                 "and the query must actually filter on it")
+
+        g.winning_shape("W", "f")
+        _require("converged: true" in captured["cypher"],
+                 "winning_shape must return only converged runs")
+        _require("stage: 'final'" in captured["cypher"],
+                 "and only what shipped, not mid-loop drafts")
+
+        g.prior_findings("W", "f", exclude_run="run-123")
+        _require("r.converged AS run_converged" in captured["cypher"],
+                 "prior_findings must say whether the run survived the finding")
+    finally:
+        g._read = saved
+
+    # The designer's tool passes its own run id through.
+    from red.tools import DesignerTool
+    _require("run_id" in DesignerTool.__init__.__code__.co_varnames,
+             "DesignerTool must know which run it is serving")
+    _require("graph_winning_shape" in DesignerTool.METHODS,
+             "and offer the shipped-shape read")
+    _results.append(("graph reads", True,
+                     "a run cannot read its own drafts as history; "
+                     "winning_shape returns only what shipped"))
+
+
+def test_gate3_prices_the_defects_the_rtl_exposed() -> None:
+    """Gate 3 over-predicted all three extensions this project built as RTL, by
+    6.3x to 7.0x. Four causes were separated; three are fixable in the model and
+    are pinned here against the measured hardware.
+
+    The numbers on the right are the only ones in this repository that came from
+    a cycle-accurate simulation rather than from a model.
+    """
+    from red import cost
+
+    # --- coverage cannot be spent twice -----------------------------------
+    # A1 mined two regions of uECC_vli_mult and gave each the function's whole
+    # 47.3% share; Gate 3 summed them and credited 94.6% of the application to a
+    # design that replaces two halves of one function.
+    report = state_def.HotLoopReport(
+        workload="w", profile_method="callgrind", coverage=0.946,
+        loops=[state_def.HotLoop(
+                   loop_id="uECC_vli_mult::a", source_file="u.c",
+                   function="uECC_vli_mult", body="", ir="", calls=1000,
+                   dynamic_cycles=10_000_000, cycle_share=0.473),
+               state_def.HotLoop(
+                   loop_id="uECC_vli_mult::b", source_file="u.c",
+                   function="uECC_vli_mult", body="", ir="", calls=1000,
+                   dynamic_cycles=10_000_000, cycle_share=0.473)])
+    spec = state_def.ISASpec(name="s", instructions=[
+        state_def.InstructionSpec(
+            name=f"m{i}", mnemonic=f"m{i}", encoding="f rs2 rs1 f rd 0001011",
+            semantics="s", pseudocode="p", words=16, mac_ops=64, invocations=1,
+            replaces=f"uECC_vli_mult::{x}", opcode="custom-0", funct3=f"00{i}",
+            funct7="0000001", operands=["rd", "rs1", "rs2"],
+            c_model=f"void m{i}_model(const uint32_t in[16], uint32_t out[16])"
+                    "{ for (int j=0;j<16;j++) out[j]=in[j]; }")
+        for i, x in ((0, "a"), (1, "b"))])
+    est = cost.estimate(spec, report, None, {})
+    _require(est.covered_share <= 0.48,
+             f"two loops of one function cannot cover 94.6%, got "
+             f"{est.covered_share:.1%}")
+
+    # --- marshalling is charged at the rate the hardware showed ------------
+    # On the one call measured end to end, laying out a 16-word block cost 413
+    # of 656 cycles. At the bare load/store rate the model charged 160.
+    plat = cost.Platform.from_core(None)
+    one = state_def.InstructionSpec(
+        name="x", mnemonic="x", encoding="f rs2 rs1 f rd 0001011", semantics="s",
+        pseudocode="p", words=16, mac_ops=64, invocations=1, replaces="k",
+        opcode="custom-0", funct3="000", funct7="0000001",
+        operands=["rd", "rs1", "rs2"], marshal_words=16,
+        c_model="void x_model(const uint32_t in[16], uint32_t out[16])"
+                "{ for (int j=0;j<16;j++) out[j]=in[j]; }")
+    rep2 = state_def.HotLoopReport(
+        workload="w", profile_method="callgrind", coverage=0.9,
+        loops=[state_def.HotLoop(loop_id="k", source_file="u.c", function="k",
+                                 body="", ir="", calls=100,
+                                 dynamic_cycles=1_000_000, cycle_share=0.9)])
+    marshal = cost.estimate(
+        state_def.ISASpec(name="s", instructions=[one]), rep2, None,
+        {}).per_instruction[0].marshal_cycles
+    _require(380 <= marshal <= 460,
+             f"marshalling 16 words should cost ~413 cycles (measured), "
+             f"got {marshal:.0f}")
+
+    # --- an unverifiable declaration is declared unverifiable --------------
+    # `invocations` is the one cost field RED cannot derive. The tempting
+    # estimator is biased (it reads 31 for libcrc's true 128 and 147 for
+    # matrixmul's 4), so the gate reports the inconsistency instead of
+    # substituting a number it cannot stand behind.
+    thin = state_def.InstructionSpec(
+        name="y", mnemonic="y", encoding="f rs2 rs1 f rd 0001011", semantics="s",
+        pseudocode="p", words=8, mac_ops=0, invocations=2, replaces="k",
+        opcode="custom-0", funct3="001", funct7="0000001",
+        operands=["rd", "rs1", "rs2"],
+        c_model="void y_model(const uint32_t in[8], uint32_t out[8])"
+                "{ for (int j=0;j<8;j++) out[j]=in[j]^in[(j+1)%8]; }")
+    est2 = cost.estimate(state_def.ISASpec(name="s", instructions=[thin]),
+                         rep2, None, {"y": 200})
+    _require(est2.unverified,
+             "a declaration the profile contradicts must be reported")
+    _require("invocations" in est2.unverified[0]
+             and "cannot verify" in est2.unverified[0],
+             f"and named plainly: {est2.unverified[0][:120]}")
+    _require("unverified declaration" in est2.detail.lower(),
+             "the gate's own detail must carry it, not only the object")
+    _require(est2.per_instruction[0].invocations == 2,
+             "and the declared value must NOT be silently replaced by the "
+             "biased estimator")
+
+    _results.append(("gate 3 accuracy", True,
+                     "coverage counted once per function; marshalling at the "
+                     "measured 413 cyc/16 words; invocations reported "
+                     "unverified rather than guessed"))
+
+
+def test_the_bar_is_what_the_workload_allows() -> None:
+    """A fixed 2x bar asks two different questions of two different workloads,
+    and for one of them the question is incoherent.
+
+    Amdahl caps an extension at 1/(1-coverage). micro-ecc's mined loops cover
+    47.3% of the application, so no instruction it could ever design exceeds
+    1.90x — and the loop was demanding 2.00x and reporting failure. The RTL then
+    measured that rejected design at 1.67x, a real speedup.
+    """
+    from red import cost
+
+    _require(abs(cost.amdahl_ceiling(0.473) - 1.898) < 0.01,
+             f"47.3% coverage caps at 1.90x, got "
+             f"{cost.amdahl_ceiling(0.473):.3f}")
+    _require(cost.amdahl_ceiling(1.0) == float("inf"), "full coverage is uncapped")
+
+    # The bar is capped by the ceiling, not by the ambition.
+    bar, why = cost.target_for(1, 0.473)
+    _require(bar < 2.0, f"the bar must respect the ceiling, got {bar:.2f}")
+    _require(bar < cost.amdahl_ceiling(0.473),
+             "and must be reachable, not equal to the ceiling")
+    _require("Amdahl" in why, f"and must say why: {why}")
+
+    # A workload with room keeps the full ambition on the first round.
+    bar1, _ = cost.target_for(1, 0.999)
+    _require(abs(bar1 - constants.SPEEDUP_TARGET) < 0.01,
+             f"a workload with headroom keeps the 2x ambition, got {bar1:.2f}")
+
+    # ...and the bar comes down as redesigns fail to reach it, to a floor.
+    bars = [cost.target_for(r, 0.999)[0] for r in (1, 2, 3, 4)]
+    _require(bars == sorted(bars, reverse=True),
+             f"the bar must be monotonically relaxed, got {bars}")
+    _require(bars[2] <= 1.20,
+             f"by the third round it must be a low threshold, got {bars[2]:.2f}")
+    _require(min(bars) >= constants.SPEEDUP_FLOOR - 1e-9,
+             f"but never below the floor: {bars}")
+    _require("floor" in cost.target_for(4, 0.999)[1],
+             "and the floor must be named when it binds")
+
+    # The floor exists because below it a prediction is inside the model's own
+    # error — measured at ~8% against RTL where the declarations are sound.
+    _require(constants.SPEEDUP_FLOOR > 1.0,
+             "a floor at or below 1.0 would pass designs that do nothing")
+    _results.append(("progressive bar", True,
+                     f"2x ambition capped by Amdahl ({bar:.2f}x at 47% "
+                     f"coverage), relaxed {bars[0]:.2f}->{bars[1]:.2f}->"
+                     f"{bars[2]:.2f}x, floored at {constants.SPEEDUP_FLOOR}"))
+
+
+def test_a_wildly_wrong_invocations_is_refused() -> None:
+    """The declaration that misaligned Gate 3 from the RTL more than any other.
+
+    libcrc shipped `invocations=2` where a 4 KiB buffer needs 128; matrixmul
+    shipped 4 where a 10x10 multiply needs 500. The gate then charged the
+    extension for two invocations and credited it with the whole kernel. It
+    cannot be measured — the obvious estimator is biased, because the model and
+    the kernel are different implementations of the same work — but being out by
+    an order of magnitude is not bias, and that is cheaper to refuse here than
+    to spend a redesign round on.
+    """
+    report = _report()
+    hot = report.ranked()[0]
+    hot.calls = 100
+    hot.dynamic_cycles = 100 * 400_000        # 400,000 instructions per call
+    tool = _designer_tool("red_inv_test")
+    try:
+        with open(tool.report_path, "w") as f:
+            f.write(state_def.to_json(report))
+        spec = _spec()
+        for ins in spec.instructions:
+            ins.replaces = hot.loop_id
+            ins.words = 8
+            ins.invocations = 2               # ~1,250 would be consistent
+        out = tool.write_spec(state_def.to_json(spec))
+        _require("Rejected" in out and "invocations" in out,
+                 f"an order-of-magnitude error must be refused: {out[:200]}")
+        _require("bytes" in out.lower(),
+                 f"and the rejection must say how to get it right: {out[:300]}")
+
+        for ins in spec.instructions:
+            ins.invocations = 1000            # within the estimator's bias
+        ok = tool.write_spec(state_def.to_json(spec))
+        _require("Accepted" in ok,
+                 f"a plausible declaration must pass: {ok[:200]}")
+    finally:
+        tool.stop()
+    _results.append(("invocations bounded", True,
+                     "a declaration an order of magnitude out is refused at the "
+                     "tool boundary; a plausible one stands"))
 
 
 def test_a_secure_design_is_part_of_converging() -> None:

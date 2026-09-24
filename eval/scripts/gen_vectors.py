@@ -5,16 +5,15 @@ This script turns the *same* C models into vectors for the RTL testbench, so
 eval/rtl/tb_accel.v closes the next link of the design's verification chain:
 C model <=> RTL.
 
-Output (eval/build/vectors.txt), 34 hex words per vector:
+Output (eval/build/vectors.txt), 36 hex words per vector:
 
-    funct3  nwords  in[0..15]  expected_out[0..15]      (zero padded)
+    opcode  funct3  funct7  nwords  in[0..15]  expected_out[0..15]
 
 Usage:  python eval/scripts/gen_vectors.py [ISASpec.json] [--n 200]
 """
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import subprocess
@@ -39,8 +38,8 @@ static uint32_t xs32(uint32_t *s) {
     return *s = x;
 }
 
-static void emit(int funct3, int words, const uint32_t *in, const uint32_t *out) {
-    printf("%%08x\n%%08x\n", (unsigned)funct3, (unsigned)words);
+static void emit(int opcode, int funct3, int funct7, int words, const uint32_t *in, const uint32_t *out) {
+    printf("%%08x\n%%08x\n%%08x\n%%08x\n", (unsigned)opcode, (unsigned)funct3, (unsigned)funct7, (unsigned)words);
     for (int i = 0; i < %(maxw)d; i++) printf("%%08x\n", i < words ? in[i]  : 0u);
     for (int i = 0; i < %(maxw)d; i++) printf("%%08x\n", i < words ? out[i] : 0u);
 }
@@ -61,13 +60,13 @@ CALL = r"""    /* ---- %(mnemonic)s (funct3=%(f3)d, words=%(words)d) ---- */
         for (int i = 0; i < %(words)d; i++) in[i] = corners[c];
         memset(out, 0, sizeof out);
         %(ident)s_model(in, out);
-        emit(%(f3)d, %(words)d, in, out);
+        emit(%(opcode)d, %(f3)d, %(f7)d, %(words)d, in, out);
     }
     for (int v = 0; v < %(n)d; v++) {
         for (int i = 0; i < %(words)d; i++) in[i] = xs32(&seed);
         memset(out, 0, sizeof out);
         %(ident)s_model(in, out);
-        emit(%(f3)d, %(words)d, in, out);
+        emit(%(opcode)d, %(f3)d, %(f7)d, %(words)d, in, out);
     }
 """
 
@@ -79,32 +78,45 @@ def c_identifier(mnemonic: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("spec", nargs="?", default=None, help="ISASpec.json (default: newest run)")
+    ap.add_argument("spec", nargs="?", default=os.path.join(REPO, "eval", "spec", "micro-ecc.json"),
+                    help="ISASpec.json (default: eval/spec/micro-ecc.json)")
     ap.add_argument("--n", type=int, default=200, help="random vectors per instruction")
     ap.add_argument("--out", default=os.path.join(REPO, "eval", "build", "vectors.txt"))
     args = ap.parse_args()
 
     spec_path = args.spec
-    if spec_path is None:
-        found = sorted(glob.glob(os.path.join(REPO, "output", "db", "*", "*", "ISASpec.json")))
-        if not found:
-            print("no ISASpec.json under output/db — run the RED loop first", file=sys.stderr)
-            return 1
-        spec_path = found[-1]
+    if args.n < 0:
+        ap.error("--n must be nonnegative")
     spec = json.load(open(spec_path))
     print(f"spec: {spec_path}  ({spec['name']}, {len(spec['instructions'])} instructions)")
 
+    instructions = spec["instructions"]
+    if not instructions:
+        ap.error("spec has no instructions")
+    opcode_values = {"custom-0": 0x0B, "custom-1": 0x2B,
+                     "custom-2": 0x5B, "custom-3": 0x7B}
+    seen = set()
     models, calls = [], []
-    for ins in spec["instructions"]:
-        if ins["words"] > MAX_WORDS:
-            print(f"  skipping {ins['mnemonic']}: words={ins['words']} exceeds the "
-                  f"testbench buffer ({MAX_WORDS})", file=sys.stderr)
-            continue
+    for ins in instructions:
+        if not 1 <= ins["words"] <= MAX_WORDS:
+            ap.error(f"{ins['mnemonic']}: words must be in 1..{MAX_WORDS}")
+        opcode = opcode_values.get(ins["opcode"])
+        if opcode is None:
+            try:
+                opcode = int(ins["opcode"], 2)
+            except (TypeError, ValueError):
+                ap.error(f"{ins['mnemonic']}: unsupported opcode {ins['opcode']!r}")
         f3 = int(ins["funct3"], 2)
+        f7 = int(ins["funct7"], 2)
+        encoding = (opcode, f3, f7)
+        if encoding in seen:
+            ap.error(f"duplicate encoding for {ins['mnemonic']}")
+        seen.add(encoding)
         models.append(ins["c_model"])
         calls.append(CALL % {"mnemonic": ins["mnemonic"], "ident": c_identifier(ins["mnemonic"]),
-                             "f3": f3, "words": ins["words"], "n": args.n})
-        print(f"  {ins['mnemonic']:<10} funct3={f3} words={ins['words']}")
+                             "opcode": opcode, "f3": f3, "f7": f7,
+                             "words": ins["words"], "n": args.n})
+        print(f"  {ins['mnemonic']:<24} opcode=0x{opcode:02x} funct3={f3} funct7={f7} words={ins['words']}")
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     src = os.path.join(os.path.dirname(args.out), "gen_vectors.c")
@@ -122,7 +134,7 @@ def main() -> int:
     if run.returncode != 0:
         return 1
     words = sum(1 for _ in open(args.out))
-    stride = 2 + 2 * MAX_WORDS
+    stride = 4 + 2 * MAX_WORDS
     print(f"wrote {args.out}: {words // stride} vectors ({words} hex words)")
     return 0
 

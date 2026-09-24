@@ -1,4 +1,4 @@
-/*  check.c — is the patched uECC_vli_mult (which uses mac96) still correct?
+/*  check.c — is the patched uECC_vli_mult (which uses mult256) still correct?
  *  Compares it against a plain-C schoolbook multiply that uses no extension. */
 #include <stdint.h>
 #include "uECC.h"
@@ -33,7 +33,7 @@ int main(void) {
 	uint32_t a[8], b[8], got[16], ref[16];
 	int bad = 0;
 	uint32_t s = 0x12345678u;
-	for (int t = 0; t < 8; t++) {
+	for (int t = 0; t < 256; t++) {
 		for (int i = 0; i < 8; i++) {
 			s ^= s << 13; s ^= s >> 17; s ^= s << 5; a[i] = s;
 			s ^= s << 13; s ^= s >> 17; s ^= s << 5; b[i] = s;

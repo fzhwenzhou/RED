@@ -442,6 +442,14 @@ Three decisions carry the design:
   An agent that could edit the graph could rewrite its own history, and the
   reviewers' objections would stop meaning anything.
 
+Three reads carry most of the value, and each answers a different question:
+
+| read | question | why it is separate |
+|---|---|---|
+| `graph_winning_shape` | what has actually *shipped* here? | only converged runs, only `stage='final'`. `prior_designs` lists everything ever tried, failures included, and leaves the designer to infer which rows are the lesson — this one is the lesson |
+| `graph_prior_findings` | what did reviewers refuse, **and what became of the run that heard it**? | an objection alone is ambiguous. `run_converged = true` means that design shipped anyway; a finding whose run died with it outstanding is the one to design around |
+| `graph_prior_security` | what has been *proven* unsafe? | `confidence` distinguishes a sanitizer's verdict from an opinion |
+
 `SecurityFinding` is a separate label rather than another `Finding` because the
 question a later run asks of it is a different question: not "what did a reviewer
 dislike" but "what has been *proven* unsafe here before". Its `confidence`
@@ -478,6 +486,11 @@ Nothing here is speculative; each was added after a measurement.
 | **Gate 4** | every gate above can pass on an instruction that leaks the key it multiplies: a conditional subtraction in a modular reduction is correct, fast, and a working timing attack |
 | **the security agent's inability to block** | a model asked "is this safe?" answers confidently either way; the one thing it can do that a checker cannot is *name an interesting input*, so it gets an executor and not a verdict |
 | **requiring the battery to have run** | a memcheck that could not start was being read as "no leak found" — a security report that silently omits what it could not check is worse than none |
+| **the llm node advertising 4 units** | it advertised 1, so every agent turn in the loop serialized — including the four review sub-agents `red/review.py` dispatches together precisely so they cost one round trip instead of four. The fan-out the module documents had never actually happened on a cluster |
+| **enforcing the ABI at the tool boundary** | "the instruction omits rs2" was the most common blocking review finding in the project's history: all four reviewers spend a finding on it and the loop pays a fan-out plus a revision round for something decidable from the spec's own fields |
+| **merging identical findings** | four reviewers read one spec, so one defect arrived as four blocking findings — counted four times, shown to the designer four times, and ranked as four problems |
+| **a repair edge after the final Gate 4 re-check** | matrixmul passed Gate 4 cleanly, the review revised the spec, the re-check caught a reintroduced data-dependent branch, and the run was reported not converged for a defect nobody was given the chance to fix |
+| **`prior_designs` excluding the asking run** | it returned the run's own draft from three minutes earlier in a table labelled "what earlier runs learned" — the designer's guess handed back as evidence |
 | **review adjudication** | independent re-readings never converge: each round was free to invent a new objection, so findings fell but never reached zero |
 | **the reviewers** | the gates only ever asked "does it mean what it says?" |
 | **feedback to the designer** | findings that reach no one change nothing |

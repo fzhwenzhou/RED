@@ -1,0 +1,51 @@
+{
+  "coverage": 0.9665904316053577,
+  "loops": [
+    {
+      "body": "    for (k = 0; k < num_words; ++k) {\n        for (i = 0; i <= k; ++i) {\n            muladd(left[i], right[k - i], &r0, &r1, &r2);\n        }\n        result[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }\n    for (k = num_words; k < num_words * 2 - 1; ++k) {\n        for (i = (k + 1) - num_words; i < num_words; ++i) {\n            muladd(left[i], right[k - i], &r0, &r1, &r2);\n        }\n        result[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }",
+      "calls": 3694592,
+      "cycle_share": 0.4730081986629515,
+      "dynamic_cycles": 4873166848,
+      "function": "uECC_vli_mult",
+      "ir": "",
+      "loop_id": "uECC_vli_mult",
+      "operand_stats": "Nested loops performing 256-bit VLI multiplication using MAC operations. Operands are 32-bit arrays. The outer loop trip count is up to 8 (for secp256r1).",
+      "rank": 1,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 8
+    },
+    {
+      "body": "    /* t */\n    uECC_vli_set(result, product, num_words_secp256r1);\n    \n    /* s1 */\n    tmp[0] = tmp[1] = tmp[2] = 0;\n    tmp[3] = product[11];\n    tmp[4] = product[12];\n    tmp[5] = product[13];\n    tmp[6] = product[14];\n    tmp[7] = product[15];\n    carry = uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    \n    /* s2 */\n    tmp[3] = product[12];\n    tmp[4] = product[13];\n    tmp[5] = product[14];\n    tmp[6] = product[15];\n    tmp[7] = 0;\n    carry += uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    \n    /* s3 */\n    tmp[0] = product[8];\n    tmp[1] = product[9];\n    tmp[2] = product[10];\n    tmp[3] = tmp[4] = tmp[5] = 0;\n    tmp[6] = product[14];\n    tmp[7] = product[15];\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    \n    /* s4 */\n    tmp[0] = product[9];\n    tmp[1] = product[10];\n    tmp[2] = product[11];\n    tmp[3] = product[13];\n    tmp[4] = product[14];\n    tmp[5] = product[15];\n    tmp[6] = product[13];\n    tmp[7] = product[8];\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    \n    /* d1 */\n    tmp[0] = product[11];\n    tmp[1] = product[12];\n    tmp[2] = product[13];\n    tmp[3] = tmp[4] = tmp[5] = 0;\n    tmp[6] = product[8];\n    tmp[7] = product[10];\n    carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);\n    \n    /* d2 */\n    tmp[0] = product[12];\n    tmp[1] = product[13];\n    tmp[2] = product[14];\n    tmp[3] = product[15];\n    tmp[4] = tmp[5] = 0;\n    tmp[6] = product[9];\n    tmp[7] = product[11];\n    carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);\n    \n    /* d3 */\n    tmp[0] = product[13];\n    tmp[1] = product[14];\n    tmp[2] = product[15];\n    tmp[3] = product[8];\n    tmp[4] = product[9];\n    tmp[5] = product[10];\n    tmp[6] = 0;\n    tmp[7] = product[12];\n    carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);\n    \n    /* d4 */\n    tmp[0] = product[14];\n    tmp[1] = product[15];\n    tmp[2] = 0;\n    tmp[3] = product[9];\n    tmp[4] = product[10];\n    tmp[5] = product[11];\n    tmp[6] = 0;\n    tmp[7] = product[13];\n    carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);",
+      "calls": 3694592,
+      "cycle_share": 0.4318408971018748,
+      "dynamic_cycles": 4449040734,
+      "function": "vli_mmod_fast_secp256r1",
+      "ir": "",
+      "loop_id": "vli_mmod_fast_secp256r1",
+      "operand_stats": "Straight-line, heavily repeated pattern of big-integer addition and subtraction on 256-bit data types, primarily executing through calls to uECC_vli_add and uECC_vli_sub.",
+      "rank": 2,
+      "source_file": "micro-ecc/curve-specific.inc",
+      "trip_count": 1
+    },
+    {
+      "body": "    uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);\n    if (l_borrow) {\n        /* In this case, result == -diff == (max int) - diff. Since -x % d == d - x,\n           we can get the correct result from result + mod (with overflow). */\n        uECC_vli_add(result, result, mod, num_words);\n    }",
+      "calls": 3939328,
+      "cycle_share": 0.06174133584053145,
+      "dynamic_cycles": 636090097,
+      "function": "uECC_vli_modSub",
+      "ir": "",
+      "loop_id": "uECC_vli_modSub",
+      "operand_stats": "Performs a wide (256-bit) subtraction followed by an optional conditional addition if a borrow occurred. Operands are arrays of eight 32-bit words.",
+      "rank": 3,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 1
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/micro-ecc/20260923-152136-47bdee/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/micro-ecc/20260923-152136-47bdee/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    10302499749
+  ],
+  "workload": "micro-ecc"
+}

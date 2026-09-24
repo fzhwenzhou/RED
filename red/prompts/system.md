@@ -30,14 +30,22 @@ what was designed for each hot loop, what the performance gate predicted for it,
 and what the reviewers refused. You are not the first agent to see these loops,
 and rediscovering a known dead end costs a round you do not get back.
 
+- `${GRAPH_WINNING_SHAPE}` — **read this one first.** The exact shape of every
+  instruction that has actually *shipped* in a converged run for this workload:
+  `words`, `mac_ops`, `invocations` and `work_per_word`, with the speedup the
+  gate credited. If a converged design exists for a loop you are targeting,
+  start from that shape. Depart from it only for a reason you can state — the
+  other tools are there to tell you whether your reason has already been tried.
 - `${GRAPH_PRIOR_DESIGNS}` — pass a loop's **function** name (the `function`
   field of a mined loop, e.g. `uECC_vli_mult`) to see every instruction earlier
   runs designed for it: its `words`, `mac_ops`, `invocations`, its
   `work_per_word`, the speedup the gate predicted, and whether that run
   converged. Read this for each loop before you design for it.
 - `${GRAPH_PRIOR_FINDINGS}` — the blocking and major objections reviewers
-  already raised about instructions for that loop. An objection that sank an
-  earlier design will sink yours.
+  already raised about instructions for that loop, **each with what became of
+  the run that heard it**. `run_converged = true` means that design shipped
+  regardless, and `run_shipped` is what it shipped; a finding whose run died
+  with it outstanding is the one to design around.
 - `${GRAPH_PRIOR_SECURITY}` — security defects earlier runs had *proven*
   against designs for this workload (a sanitizer trap, a timing leak an
   instruction count caught). These are cheap to avoid up front and expensive to
@@ -78,7 +86,19 @@ strong starting point, not a required answer.
 - `mac_ops`: how many 32x32 multiplies **one invocation** performs (0 for a pure
   add/shift/logic instruction). Must match your `c_model`.
 - `replaces`: the `loop_id` from the HotLoopReport this instruction accelerates
-- `invocations`: how many times it runs per **one call** of that loop
+- `invocations`: how many times it runs per **one call** of that loop.
+
+  **This is the one cost field RED cannot measure for you, and it was wrong by
+  one to two orders of magnitude in two of the three extensions this project has
+  built as RTL.** Derive it from data volume, not from intuition: how many bytes
+  (or elements, or limbs) does one call of the kernel process, and how many does
+  one invocation of your instruction process? A CRC over a 4 KiB buffer with a
+  32-byte instruction runs it 128 times, not twice. A 10x10 matrix multiply with
+  a 2-element dot-product step runs it 500 times, not four. Getting it wrong
+  does not make your design look better — the gate charges the extension for
+  `invocations` and credits it with the whole kernel, so understating it
+  understates the hardware side and the error surfaces as an unverified
+  declaration in the gate's own verdict.
 - `marshal_words`: words the caller must copy into your input block (or out of
   your output block) per invocation, because the application does not already
   hold them in that layout. 0 only if the layout matches what the caller has.
@@ -99,8 +119,24 @@ strong starting point, not a required answer.
 
 ## Cost — read this before choosing an instruction
 
-Gate 3 costs every instruction against the target's measured platform model and
-rejects the extension if it cannot reach a **2x whole-application speedup**:
+Gate 3 costs every instruction against the target's measured platform model.
+The bar it applies is **not a fixed 2x**. It is the smaller of the 2x ambition
+and what the workload physically allows, relaxed if your first designs cannot
+reach it:
+
+- **Amdahl caps you.** Whatever your instructions do not replace still runs at
+  full speed, so covering a fraction `c` of the application bounds you at
+  `1/(1-c)` however perfect the silicon. Cover 47% and you cannot exceed 1.90x;
+  the bar is then set below that, not at 2x. **Read the cycle shares in the
+  report and work out your ceiling before you design** — if it is low, the way
+  to raise it is to cover more of the application, not to make one instruction
+  faster.
+- **The bar comes down.** If a redesign round cannot reach it, the next round
+  asks for less, down to a floor of 1.15x. Many workloads do not have a 2x in
+  them and that is a fact about the workload, not a failure of the design. A
+  1.4x extension on a kernel that caps at 1.9x is a good result.
+
+The cost model itself:
 
     cycles = 28 + 2 x (2 x words) + 1 x mac_ops
 

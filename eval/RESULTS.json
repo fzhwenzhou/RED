@@ -1,0 +1,42 @@
+{
+  "date": "2026-09-23",
+  "projects": {
+    "micro-ecc": {
+      "spec": "eval/spec/micro-ecc.json",
+      "rtl_vectors": 412,
+      "rtl_mismatches": 0,
+      "baseline_cycles": 298502758,
+      "extended_cycles": 178231186,
+      "speedup": 1.6748,
+      "correct": true,
+      "area": {"baseline_lut4": 5590, "extended_lut4": 9873, "overhead_percent": 76.6}
+    },
+    "matrixmul": {
+      "spec": "eval/spec/matrixmul.json",
+      "rtl_vectors": 412,
+      "rtl_mismatches": 0,
+      "baseline_cycles": 1040318,
+      "extended_cycles": 71392,
+      "speedup": 14.5719,
+      "correct": true,
+      "area": null,
+      "area_note": "behavioral shortreal/DPI floating-point model is not synthesizable"
+    },
+    "libcrc": {
+      "spec": "eval/spec/libcrc.json",
+      "rtl_vectors": 1236,
+      "rtl_mismatches": 0,
+      "baseline_cycles": 852200,
+      "extended_cycles": 405322,
+      "speedup": 2.1025,
+      "correct": true,
+      "area": {"baseline_lut4": 5582, "extended_lut4": 6585, "overhead_percent": 18.0}
+    }
+  },
+  "tools": {
+    "verilator": "5.051-devel",
+    "iverilog": "14.0-devel",
+    "yosys": "0.68+136",
+    "riscv_gcc": "13.2.0"
+  }
+}

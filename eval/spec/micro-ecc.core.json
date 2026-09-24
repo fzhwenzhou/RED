@@ -1,0 +1,35 @@
+{
+  "area_note": "Very small core. The entire register file is only 1024 bits (32 words). A 16-word internal coprocessor buffer (512 bits) is massive on this scale and should be avoided.",
+  "constraints": [
+    "The coprocessor interface cannot access memory.",
+    "Operands from memory must be loaded into CPU registers first (using standard LW), then passed to the custom instruction.",
+    "A custom instruction can only accept up to two 32-bit operands at a time (rs1, rs2).",
+    "A custom instruction can only return one 32-bit result (rd) per invocation.",
+    "Do not build stateful buffers in the coprocessor that rival the CPU's register file in size."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI). Receives full 32-bit instruction word, plus rs1 and rs2 register values.",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "32 bits via pcpi_rd, written to the CPU register file when pcpi_wr and pcpi_ready are asserted.",
+  "custom_opcode_space": [
+    "Any opcode not natively decoded by the base core traps to the PCPI interface, making all standard RISC-V custom-0 through custom-3 spaces available."
+  ],
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 5,
+  "cycles_per_word_moved": 2,
+  "evidence": [
+    "picorv32.v ports: pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2, pcpi_wr, pcpi_rd, pcpi_ready, pcpi_wait. No memory signals exist on this interface.",
+    "picorv32.v main state machine (cpu_state_fetch, cpu_state_ld_rs1, cpu_state_exec) proves multi-cycle execution.",
+    "picorv32.v (instr_trap definition): Any unrecognized instruction asserts pcpi_valid and delegates execution to the coprocessor."
+  ],
+  "existing_units": [
+    "Multiplier (sequential or single-cycle array, ENABLE_MUL/ENABLE_FAST_MUL)",
+    "Divider (sequential, ENABLE_DIV)",
+    "Barrel shifter (optional, BARREL_SHIFTER)"
+  ],
+  "isa": "RV32I with optional E, M, and C extensions (configured via ENABLE_REGS_16_31, ENABLE_MUL, ENABLE_DIV, COMPRESSED_ISA parameters).",
+  "memory_interface": "Simple synchronous valid/ready handshake for 32-bit words (mem_valid, mem_ready, mem_wstrb).",
+  "microarchitecture": "Multi-cycle, non-pipelined state machine (fetch -> decode/ld -> exec -> mem -> fetch).",
+  "name": "PicoRV32",
+  "register_file": "32 (or 16) registers. 1 write port. 2 read ports if ENABLE_REGS_DUALPORT=1, otherwise 1 read port."
+}

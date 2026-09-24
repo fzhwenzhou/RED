@@ -179,6 +179,12 @@ class _ReportMixin:
         return f"Accepted HotLoopReport for '{report.workload}' ({len(report.loops)} loops)."
 
 
+# Roughly how many host instructions a reference model spends per operand word
+# it processes. Only used to bound `invocations` by an order of magnitude, so
+# it does not need to be accurate -- it needs to be in the right decade.
+_MODEL_IR_PER_WORD = 40.0
+
+
 class _SpecMixin:
 
     def _mined_loop_ids(self) -> set:
@@ -193,6 +199,48 @@ class _SpecMixin:
             return set()
         return {l.loop_id for l in report.loops} | {l.function for l in report.loops}
 
+
+    def _check_invocations(self, spec) -> None:
+        """Reject an `invocations` the profile contradicts by an order of
+        magnitude. Raises ValueError, which write_spec reports to the agent."""
+        from red.constants import INVOCATION_REJECT
+        path = getattr(self, "report_path", "")
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                report = state_def.from_json(f.read(), state_def.HotLoopReport)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+        loops = {l.loop_id: l for l in report.loops}
+        for l in report.loops:
+            loops.setdefault(l.function, l)
+        for ins in spec.instructions:
+            loop = loops.get(ins.replaces)
+            if loop is None or loop.calls <= 0 or not ins.c_model:
+                continue
+            per_call = loop.dynamic_cycles / loop.calls
+            if per_call <= 0:
+                continue
+            # A cheap static proxy for the model's own work: how many statements
+            # it executes is unknown here, so bound with the operand block. One
+            # invocation cannot process more than `words` words of data, so a
+            # kernel call touching far more data needs proportionally more.
+            implied = per_call / max(_MODEL_IR_PER_WORD * max(ins.words, 1), 1.0)
+            n = max(ins.invocations, 1)
+            if implied > n * INVOCATION_REJECT:
+                raise ValueError(
+                    f"instruction {ins.name!r} declares invocations={n}, but one "
+                    f"call of {loop.function} executes {per_call:,.0f} host "
+                    f"instructions and your operand block is {ins.words} words. "
+                    f"That is consistent with something on the order of "
+                    f"{implied:,.0f} invocations, not {n} — more than "
+                    f"{INVOCATION_REJECT:.0f}x out. Count it from the data: how "
+                    f"many bytes does one call of {loop.function} process, and "
+                    f"how many does one invocation of {ins.mnemonic} process? "
+                    "Gate 3 charges the extension for `invocations` and credits "
+                    "it with the whole kernel, so this field decides the "
+                    "prediction.")
 
     def read_spec(self) -> str:
         """Return the current ISASpec draft JSON."""
@@ -218,13 +266,34 @@ class _SpecMixin:
                     ins.opcode = ins.opcode or str(parts.get("opcode", ""))
                     ins.funct3 = ins.funct3 or str(parts.get("funct3", ""))
                     ins.funct7 = ins.funct7 or str(parts.get("funct7", ""))
-                    ins.encoding = str(parts.get("encoding") or
-                                       " ".join(f"{k}={v}" for k, v in parts.items()))
+                    # Build the real R-type layout, not a list of field
+                    # assignments: the encoding string is what the reviewers and
+                    # the ISS implementer read, and "opcode=custom-0 funct3=110"
+                    # does not tell either of them where the operands sit.
+                    ins.encoding = str(parts.get("encoding") or " ".join(
+                        x for x in (ins.funct7 or "funct7", "rs2", "rs1",
+                                    ins.funct3 or "funct3", "rd",
+                                    state_def.CUSTOM_OPCODE_BITS.get(
+                                        state_def.normalize_opcode(ins.opcode),
+                                        "opcode")) if x))
                 ins.opcode = state_def.normalize_opcode(ins.opcode) or ins.opcode
             state_def.validate_isa_spec(spec)
             # `replaces` decides how much benefit Gate 3 credits, so it has to
             # name a loop that was actually mined. Catching it here turns a
             # silent overcredit into an immediate, specific rejection.
+            # `invocations` is the declaration that misaligned Gate 3 from the
+            # RTL more than anything else: libcrc shipped 2 where a 4 KiB buffer
+            # needs 128 and matrixmul shipped 4 where a 10x10 multiply needs
+            # 500, and the gate then charged the extension for 2 invocations
+            # while crediting it with the whole kernel.
+            #
+            # It cannot be measured -- the obvious estimator is biased, because
+            # the model and the kernel are different implementations of the same
+            # work -- but it can be BOUNDED. The bias is a factor of a few; a
+            # declaration off by more than an order of magnitude is not bias,
+            # it is a mistake, and it is cheaper to reject here than to spend a
+            # redesign round on a prediction built from it.
+            self._check_invocations(spec)
             known = self._mined_loop_ids()
             if known:
                 for ins in spec.instructions:
@@ -392,6 +461,12 @@ class _GraphMixin:
     def _graph_workload(self) -> str:
         return getattr(self, "workload", "") or ""
 
+    def _graph_run(self) -> str:
+        """This run's id, so the reads can leave its own rows out. A designer
+        shown its own draft from three minutes ago, in a table labelled
+        "what earlier runs learned", is being handed its guess as evidence."""
+        return getattr(self, "run_id", "") or ""
+
     @staticmethod
     def _table(rows: list, columns: list) -> str:
         """Rows as a compact markdown table — agents read these far better than
@@ -424,7 +499,8 @@ class _GraphMixin:
         if not graph.available():
             return "The knowledge graph is not running; no history is available."
         try:
-            rows = graph.prior_designs(self._graph_workload(), function)
+            rows = graph.prior_designs(self._graph_workload(), function,
+                                       exclude_run=self._graph_run())
         except Exception as e:                             # noqa: BLE001
             return f"Graph query failed: {e}"
         return ("Earlier designs for `" + function + "` "
@@ -440,7 +516,8 @@ class _GraphMixin:
         if not graph.available():
             return "The knowledge graph is not running; no history is available."
         try:
-            rows = graph.prior_findings(self._graph_workload(), function)
+            rows = graph.prior_findings(self._graph_workload(), function,
+                                        exclude_run=self._graph_run())
         except Exception as e:                             # noqa: BLE001
             return f"Graph query failed: {e}"
         return ("What reviewers previously refused for `" + function + "`:\n\n"
@@ -468,6 +545,34 @@ class _GraphMixin:
                 "\n\n" + self._table(rows, ["severity", "confidence", "check",
                                              "mnemonic", "words", "finding",
                                              "fix"]))
+
+    def graph_winning_shape(self, function: str = "") -> str:
+        """The exact shape of every instruction that shipped in a **converged**
+        run for this workload — the designs that actually made it through all
+        five gates and the reviewers.
+
+        Read this first. `graph_prior_designs` lists everything ever tried, the
+        failures included; this lists only what worked, with the quantity that
+        decides the question: `work_per_word`, arithmetic per operand word
+        moved. If a converged design exists for the loop you are targeting,
+        start from its shape and depart from it only for a reason you can name.
+        """
+        if not graph.available():
+            return "The knowledge graph is not running; no history is available."
+        try:
+            rows = graph.winning_shape(self._graph_workload(), function)
+        except Exception as e:                             # noqa: BLE001
+            return f"Graph query failed: {e}"
+        if not rows:
+            return ("No converged design is recorded for this workload yet — "
+                    "you are the first. Design it from the profile and the "
+                    "core, and it will be here for the next run.")
+        return ("Instruction shapes that SHIPPED in converged runs "
+                "(work_per_word = mac_ops / 2*words — the number that decides "
+                "whether an instruction can pay for its operand traffic):\n\n"
+                + self._table(rows, ["mnemonic", "replaces", "words", "mac_ops",
+                                     "invocations", "work_per_word",
+                                     "run_speedup", "run"]))
 
     def graph_best_design(self) -> str:
         """The best extension recorded for this workload so far: converged runs
@@ -535,13 +640,13 @@ class DesignerTool(_SourceMixin, _ProfileMixin, _CoreMixin, _ReportMixin,
     METHODS = ("list_sources", "read_source", "read_profile", "read_core",
                "read_report", "write_report", "read_spec", "write_spec",
                "read_status", "read_knowledge", "append_knowledge",
-               "graph_prior_designs", "graph_prior_findings",
-               "graph_prior_security", "graph_best_design", "graph_loops",
-               "graph_query", "finish")
+               "graph_winning_shape", "graph_prior_designs",
+               "graph_prior_findings", "graph_prior_security",
+               "graph_best_design", "graph_loops", "graph_query", "finish")
 
     def __init__(self, name, source_roots, profile_path, report_path, spec_path,
                  status_path, knowledge_path, sentinel_path, core_path="",
-                 workload="", task_options=None):
+                 workload="", run_id="", task_options=None):
         super().__init__(name, task_options=task_options)
         self.source_roots = source_roots
         self.profile_path = profile_path
@@ -552,6 +657,7 @@ class DesignerTool(_SourceMixin, _ProfileMixin, _CoreMixin, _ReportMixin,
         self.sentinel_path = sentinel_path
         self.core_path = core_path
         self.workload = workload
+        self.run_id = run_id
         for m in self.METHODS:
             self.mcp.add_tool(getattr(self, m), name=f"{name}_{m}")
         super().__post_init__()

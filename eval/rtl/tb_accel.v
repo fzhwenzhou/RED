@@ -63,7 +63,7 @@ module tb_accel;
 	end
 
 	// ---- vector file ----
-	integer fd, rc, v, i, funct3, nwords, errors, nvec, alias_pass;
+	integer fd, rc, v, i, opcode, funct3, funct7, nwords, errors, nvec, alias_pass;
 	reg [31:0] out_base;
 	reg [31:0] vin  [0:MAXW-1];
 	reg [31:0] vexp [0:MAXW-1];
@@ -89,15 +89,25 @@ module tb_accel;
 	  for (alias_pass = 0; alias_pass <= 1; alias_pass = alias_pass + 1) begin
 		fd = $fopen(vfile, "r");
 		if (fd == 0) begin
-			$display("FAIL: cannot open vector file %0s", vfile);
-			$finish;
+			$fatal(1, "cannot open vector file %0s", vfile);
 		end
 		v  = 0;
-		rc = $fscanf(fd, "%h\n", funct3);
+		rc = $fscanf(fd, "%h\n", opcode);
 		while (rc == 1) begin
+			rc = $fscanf(fd, "%h\n", funct3);
+			if (rc != 1) $fatal(1, "truncated vector encoding");
+			rc = $fscanf(fd, "%h\n", funct7);
+			if (rc != 1) $fatal(1, "truncated vector encoding");
 			rc = $fscanf(fd, "%h\n", nwords);
-			for (i = 0; i < MAXW; i = i + 1) rc = $fscanf(fd, "%h\n", vin[i]);
-			for (i = 0; i < MAXW; i = i + 1) rc = $fscanf(fd, "%h\n", vexp[i]);
+			if (rc != 1 || nwords < 1 || nwords > MAXW) $fatal(1, "invalid vector length");
+			for (i = 0; i < MAXW; i = i + 1) begin
+				rc = $fscanf(fd, "%h\n", vin[i]);
+				if (rc != 1) $fatal(1, "truncated vector");
+			end
+			for (i = 0; i < MAXW; i = i + 1) begin
+				rc = $fscanf(fd, "%h\n", vexp[i]);
+				if (rc != 1) $fatal(1, "truncated vector");
+			end
 
 			// input block into memory; poison the output block so a coprocessor
 			// that fails to write a word cannot accidentally look correct.
@@ -109,16 +119,21 @@ module tb_accel;
 
 			// issue the instruction the way picorv32 drives PCPI
 			t0 = cycle_counter;
-			pcpi_insn  <= {7'b0000000, 5'd0, 5'd0, funct3[2:0], 5'd0, 7'b0001011};
+			pcpi_insn  <= {funct7[6:0], 5'd0, 5'd0, funct3[2:0], 5'd0, opcode[6:0]};
 			pcpi_rs1   <= IN_ADDR;
 			pcpi_rs2   <= out_base;
 			pcpi_valid <= 1;
 			@(posedge clk);
-			while (!pcpi_ready) @(posedge clk);
+			while (!pcpi_ready) begin
+				if (cycle_counter - t0 > 10000) $fatal(1, "instruction timeout");
+				@(posedge clk);
+			end
 			cycles = cycle_counter - t0;
 			pcpi_valid <= 0;
-			if (pcpi_rd !== 32'd0)
-				$display("FAIL vector %0d: rd=%08x, the ABI writes 0", v, pcpi_rd);
+			if (pcpi_rd !== 32'd0 || pcpi_wr !== 1'b1) begin
+				errors = errors + 1;
+				$display("FAIL vector %0d: invalid register writeback", v);
+			end
 			@(posedge clk);
 
 			// check the output block
@@ -138,7 +153,7 @@ module tb_accel;
 			if (cycles > cyc_max[funct3[2:0]]) cyc_max[funct3[2:0]] = cycles;
 			nvec = nvec + 1;
 			v    = v + 1;
-			rc   = $fscanf(fd, "%h\n", funct3);
+			rc   = $fscanf(fd, "%h\n", opcode);
 		end
 		$fclose(fd);
 		$display("pass %0s: %0d vectors, %0d errors so far",
@@ -157,7 +172,7 @@ module tb_accel;
 		if (errors == 0 && nvec > 0)
 			$display("tb_accel: PASS");
 		else
-			$display("tb_accel: FAIL (%0d mismatches over %0d vectors)", errors, nvec);
+			$fatal(1, "tb_accel: FAIL (%0d mismatches over %0d vectors)", errors, nvec);
 		$finish;
 	end
 endmodule

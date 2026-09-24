@@ -1,170 +1,186 @@
-# Outcome: does RED's extension actually accelerate micro-ecc?
+# Evaluation results for all RED projects
 
-RED's A1+A2 produce a *semantically verified* ISASpec — Gate 1, link 1 and Gate 2
-all pass. None of those gates asks whether the instructions can be **built** or
-whether using them makes the application **faster**. This is that measurement,
-end to end, on real hardware RTL.
+Evaluated 2026-09-23 from the three pinned specs under [`spec/`](spec/). All
+current projects now have C-model/RTL differential tests and self-checking
+end-to-end PicoRV32 simulations.
 
-**Headline: no. The extension as designed is 2.0% slower than the baseline
-RISC-V binary and costs 74% more core area.** The reason is measured, specific,
-and fixable, and it is a property of RED's operand ABI rather than of the
-instructions' arithmetic. Details below.
+| Project | Workload measured | Baseline cycles | Extended cycles | Speedup | Correct |
+|---|---|---:|---:|---:|---:|
+| micro-ecc | one secp256r1 ECDH exchange | 298,502,758 | 178,231,186 | **1.6748x** | yes |
+| matrixmul | one 10x10 float matrix multiply | 1,040,318 | 71,392 | **14.5719x** | yes |
+| libcrc | CRC-16/32/64 over one 4 KiB buffer | 852,200 | 405,322 | **2.1025x** | yes |
 
----
+The matrixmul and libcrc inputs match their generated RED workloads, with the
+outer 20,000/2,000 repetition loops removed. Those loops repeat the same kernel
+and would only multiply RTL simulation time; initialization and reference checks
+are outside the timed region.
 
-## 1. What was built
+The previous micro-ecc `mac96`/`add256`/`sub256` evaluation is preserved in
+[`history/2026-09-07.md`](history/2026-09-07.md).
 
-| Step | Artifact | Status |
-|---|---|---|
-| A3-lite: RTL for the extension | [rtl/red_accel.v](rtl/red_accel.v) — PCPI coprocessor, bus master | verified against the ISASpec C models |
-| Core integration | [rtl/red_core.v](rtl/red_core.v) — PicoRV32 ± accelerator | same CPU config both ways |
-| SoC + measurement | [rtl/red_soc_tb.v](rtl/red_soc_tb.v) — 256 KiB SRAM, MMIO, cycle counter | — |
-| A4-lite: compiler support | [patches/micro-ecc-red-ext.patch](patches/micro-ecc-red-ext.patch) — hand-applied, not an LLVM pass | applied to a copy; submodule untouched |
-| A5-lite: end-to-end eval | [firmware/bench.c](firmware/bench.c) — one full ECDH exchange | correctness checked, not just timed |
+## Verification summary
 
-The C-model ⇔ RTL link (link 3 of the design's chain) is closed by
-[rtl/tb_accel.v](rtl/tb_accel.v): **1236 vectors, 0 mismatches**, run twice — once
-with distinct input/output blocks and once with them aliased, which is how
-`uECC_vli_mult` uses `mac96`.
+| Project | Instructions | C-model/RTL vectors | Mismatches | End-to-end signature |
+|---|---:|---:|---:|---|
+| micro-ecc | 1 | 412 | 0 | shared secret `a941684d…696d08e0` |
+| matrixmul | 1 | 412 | 0 | `1f377458` |
+| libcrc | 3 | 1,236 | 0 | `a3891e9f8925af24d81f5f8c0000975d` |
 
-## 2. End-to-end result
+Every vector set runs once with distinct input/output blocks and once with them
+aliased. The application runs also require `RESULT: PASS`, status zero, and an
+identical baseline/extended signature.
 
-One complete ECDH key exchange over secp256r1 (2 × `uECC_make_key` +
-2 × `uECC_shared_secret`), micro-ecc compiled `-Os` for rv32im, deterministic RNG
-so both binaries do identical work:
+## micro-ecc
 
-| | baseline | extended | ratio |
-|---|---|---|---|
-| PicoRV32 config | FAST_MUL, DIV, counters | identical + `red_accel` | — |
-| **cycles (whole application)** | **298,502,758** | **304,410,162** | **0.98× (2.0% slower)** |
-| shared secrets agree | yes | yes | — |
-| image size | 8,548 B | 8,512 B | — |
+The current spec replaces one eight-limb `uECC_vli_mult` call with a complete
+256x256-to-512-bit multiply. Its iterative RTL reuses one 32x32 multiplier.
 
-Both runs print the same shared secret
-(`a941684d…696d08e0`), so the extended binary is *correct* — this is a real
-slowdown, not a broken run being timed.
+| Metric | Baseline | Extended |
+|---|---:|---:|
+| whole ECDH cycles | 298,502,758 | 178,231,186 |
+| `uECC_vli_mult` cycles/call | 9,009 | 656 |
+| firmware image | 8,548 B | 8,624 B |
+| iCE40 LUT4 | 5,590 | 9,873 |
+| iCE40 flip-flops | 3,816 | 6,604 |
+| generic cells | 18,089 | 28,682 |
 
-## 3. Area
+The instruction itself takes 139 cycles in the differential harness and 164
+cycles including issue/loop overhead. Explicit operand marshalling raises that
+to 577 cycles; the patched function including call/return takes 656.
 
-yosys, flattened, no PDK needed. iCE40 is PicoRV32's own published area target,
-so these numbers are comparable to upstream's.
+The multiplication call is 13.73x faster, but multiplication is about 43.5% of
+the application, giving the measured 1.6748x whole-program speedup. Gate 3
+predicted 11.60x after attributing each of two loops the full function cost and
+summing them to 95% coverage.
 
-| metric | baseline | extended | overhead |
-|---|---|---|---|
-| iCE40 LUT4 | 5,582 | 9,696 | **+73.7%** |
-| iCE40 flip-flops | 3,816 | 6,308 | +65.3% |
-| generic cells (tech-independent) | 18,089 | 29,122 | +61.0% |
-| `red_accel` alone | — | 4,001 LUT4 | — |
+## matrixmul
 
-The accelerator is large for what it computes because RED's ABI forces it to be
-a **bus master with a 16-word operand buffer**: 512 bits of registers, a 256-bit
-adder/subtractor, a 32×32 multiplier (duplicating the one already in the CPU's
-`ENABLE_FAST_MUL` unit), and a 16:1 32-bit output mux.
+`fdot2_custom` performs two IEEE-754 binary32 multiplies followed by two adds in
+the exact order specified, canonicalizing NaNs after every operation. The
+application groups each pair of terms in the original 10x10 triple loop; 500
+custom instructions replace 1,000 software float MAC iterations.
 
-**Cost-efficiency: 0.98× performance for 1.74× area.** The extension is not
-cost-effective on this platform.
+| Metric | Baseline | Extended |
+|---|---:|---:|
+| 10x10 multiply cycles | 1,040,318 | 71,392 |
+| instruction latency | — | 28 cycles |
+| result signature | `1f377458` | `1f377458` |
 
-## 4. Why — measured per operation
+This is an **architectural simulation result**, not a completed area result. The
+model uses SystemVerilog `shortreal` for Icarus differential testing and a DPI C
+binary32 implementation under Verilator. It gives an explicit four-operation
+latency and validates the ABI and application transformation, but it is not
+synthesizable. A real floating-point datapath may have different latency and
+area. Gate 3 predicted 92.10x; the measured model gives 14.5719x.
 
-Every number below is measured on the RTL by
-[firmware/microbench.c](firmware/microbench.c) (mean of 256 runs):
+## libcrc
 
-| operation | cycles | vs software |
-|---|---|---|
-| software `uECC_vli_add` (8 words) | 769 | — |
-| `add256`, operands already adjacent | 92 | **8.4× faster** |
-| `add256` + marshalling operands into RED's block | 774 | 0.99× (break-even) |
-| software `uECC_vli_sub` | 769 | — |
-| `sub256`, operands already adjacent | 92 | **8.4× faster** |
-| software `uECC_vli_mult` (64 MACs) | 9,009 | — |
-| `uECC_vli_mult` patched to use `mac96` | 9,399 | **0.96× (slower)** |
-| `mac96`, operands already in place | 48 | — |
-| software MAC, accumulator in registers | 79 | 1.65× faster than software, in isolation |
+The three custom-3 instructions consume 32 bytes per call. Their synthesizable
+RTL uses one bit step per cycle, so the measured instruction latencies are 301
+cycles for CRC-64 and 297 cycles for CRC-16/32. The baseline uses libcrc's real
+lookup-table implementations; the one-time CRC-16 table initialization is
+warmed before timing.
 
-Three things follow, and together they fully explain the end-to-end number.
+| Metric | Baseline | Extended | Change |
+|---|---:|---:|---:|
+| three CRCs over 4 KiB | 852,200 | 405,322 | **2.1025x** |
+| iCE40 LUT4 | 5,582 | 6,585 | +18.0% |
+| iCE40 flip-flops | 3,816 | 7,052 | +84.8% |
+| generic cells | 18,089 | 20,382 | +12.7% |
+| accelerator alone | — | 1,002 LUT4 / 2,206 cells | — |
 
-**(a) The instruction latency is data movement, not arithmetic.** Fitting the two
-measured latencies (`mac96` 10 bus beats → 48 cycles; `add256` 32 beats → 92
-cycles) gives **2.0 cycles per bus beat and 28 cycles of fixed PCPI/FSM
-overhead**. `mac96`'s actual arithmetic is one cycle. RED's ABI — `rs1` = address
-of the input block, `rs2` = address of the output block — means every instruction
-pays for moving its operands through memory.
+Gate 3 predicted 14.71x. The RTL result is lower because the spec's C models
+perform 256 bit steps per 32-byte block while the cost model materially
+underprices those operations, and because operand packing is paid at every call.
 
-**(b) `mac96` wins in isolation and loses in context.** 48 cycles beats the
-79-cycle software MAC sequence, but micro-ecc's software inner loop keeps the
-96-bit accumulator in **three registers across all 64 MACs**, while the ABI
-requires it to live in memory. In context: 147 cycles per MAC patched versus 141
-software. `uECC_vli_mult` is 42.3% of the ECDH instruction count (callgrind, same
-32-bit word size), so 4.3% worse on 43% of the work ⇒ 1.9% worse overall — which
-is what the end-to-end run measured (2.0%). The model and the measurement agree.
+## Does the performance gate predict what the RTL measures?
 
-**(c) `add256`/`sub256` are 8.4× faster but unusable.** Two independent blockers:
-
-- **No carry-out.** micro-ecc's `uECC_vli_add`/`uECC_vli_sub` *return* the
-  carry/borrow, and their callers need it (`uECC_vli_modAdd` uses it to decide
-  whether to subtract the modulus). The ISASpec's versions discard it. Recovering
-  it costs a full 256-bit comparison — more than the instruction saves.
-- **Operands must be adjacent.** Where the carry *is* dead (the correction
-  subtract in `modAdd`/`modSub`), the operands are separate arrays, and
-  marshalling them costs 682 cycles against an instruction that takes 92 — which
-  is exactly why the marshalled row above is break-even.
-
-So the patch uses `mac96` only, and deliberately leaves `add256`/`sub256` unused.
-That is recorded in the patch header.
-
-## 5. Where the performance actually is
-
-From the measured components, the ceiling for these instructions with a
-**register-operand ABI** instead of memory blocks:
-
-- `mac96` would cost the 28-cycle fixed overhead and no bus beats. Per MAC:
-  ~2 operand loads + 28 + loop ≈ 58 cycles against 141 software ⇒ `uECC_vli_mult`
-  ~2.4× faster.
-- Amdahl over the measured 43.5% cycle share: **≈1.34× whole-application
-  speedup**, at a much smaller area than 4,001 LUT4 (no 16-word buffer, no bus
-  master, no second multiplier).
-
-This is an estimate from measured parts, not a measured result — it is what the
-next iteration should be built and measured against.
-
-The single highest-value change to the ISASpec is not a faster datapath but a
-**modular** add: micro-ecc's `uECC_vli_modAdd` is "add, then conditionally
-subtract the modulus", and its carry-out is only needed *for that decision*. An
-instruction that does the whole modular add internally needs no carry-out, keeps
-its operands adjacent by construction, and would replace ~1,540 cycles of
-software with ~92-150. `uECC_vli_modSub` alone is 6.2% of the workload.
-
-## 6. What this says about RED
-
-The loop verified these instructions thoroughly and they are still the wrong
-instructions. Gate 1 (profile reproducibility), link 1 (C models build and
-survive 100k vectors under sanitizers) and Gate 2 (C model ⇔ patched Spike over
-100k vectors) all passed — and all of them only ever ask *"does this instruction
-mean what the spec says?"*. Nothing in A1+A2 asks:
-
-1. can it be implemented within the target's coprocessor interface (PCPI cannot
-   touch memory — `red_accel` had to become a bus master),
-2. does the application's data layout let it be called without marshalling,
-3. does it preserve the values callers need (the dropped carry-out), or
-4. is it faster.
-
-Those four questions are exactly what A3-A5 exist for in the design, and this
-evaluation is the first time the loop has been told the answer. The proposal's
-`speedup < target → re-mine (budgeted)` edge is the mechanism for feeding it
-back; the concrete feedback is section 5. **A verified spec is not a good spec**,
-and A1+A2 alone cannot tell the difference.
-
-## 7. Reproducing
-
-See [eval/README.md](README.md). Short version:
+This is the question `eval/` exists to answer about RED itself, and for a long
+time nobody asked it. Gate 3 over-predicted all three shipped extensions by
+**6.3x to 7.0x** — a consistency that invites a single explanation and does not
+have one. `scripts/reprice.py` re-prices each shipped `ISASpec` with `red.cost`
+on that run's own frozen `HotLoopReport` and `CoreProfile` and prints the
+prediction beside the measurement above:
 
 ```bash
-bash eval/scripts/area.sh                      # ~1 min   -> area table
-./.venv/bin/python eval/scripts/gen_vectors.py # vectors from the ISASpec C models
-iverilog -g2005-sv -o eval/build/tb_accel.vvp eval/rtl/tb_accel.v eval/rtl/red_accel.v
-vvp eval/build/tb_accel.vvp +vectors=eval/build/vectors.txt   # C model <=> RTL
-bash eval/scripts/run_eval.sh                  # ~7 min   -> the end-to-end table
+./.venv/bin/python eval/scripts/reprice.py
 ```
 
-Every number in this document comes from those commands on this machine
-(Verilator 5.051, yosys 0.68, riscv64-unknown-elf-gcc 13.2.0).
+| workload | RTL measured | Gate 3, as it shipped | Gate 3, after the fixes |
+|---|---:|---:|---:|
+| micro-ecc | **1.67x** | 11.60x (6.9x over) | **1.81x** (1.08x) |
+| libcrc | **2.10x** | 14.71x (7.0x over) | 1.09x (0.52x) |
+| matrixmul | **14.57x** | 92.10x (6.3x over) | 1.02x (0.07x) |
+
+Provenance, because it matters for what can be reproduced. The micro-ecc row is
+live: `eval/spec/micro-ecc.report.json` and `.core.json` are pinned beside the
+spec, so `reprice.py` regenerates **1.81x** on demand, and a later run that
+re-derived the same design (16 words, 64 MACs, one invocation per call — the
+same machine, spelled `secp256r1_mult`) reported the same 1.81x from its own
+freshly mined profile. The libcrc and matrixmul figures were measured on the
+runs that shipped those pinned specifications, whose run directories have since
+been cleared; later runs of those two projects produced *different* instruction
+shapes, which the RTL here does not implement, so `reprice.py` marks them "not
+comparable" rather than quietly pricing a different design against these
+measurements.
+
+Four causes were separated, three of them defects in the model:
+
+1. **Gate 3 never re-ran on what shipped.** Every other gate is re-run when the
+   artifact changes under it — link 1 after every repair, Gate 4 on the final
+   spec — but Gate 3 ran before the review and was re-priced only after a
+   *security* revision. All three runs were revised after it last ran. It is now
+   re-priced on the shipped specification, which is the whole of micro-ecc's
+   error: 11.60x was a stale number for a design the review had already merged.
+2. **Coverage was counted twice.** A1 mines several regions of one kernel and
+   gives each the function's whole cycle share; micro-ecc's summed to 143% and
+   the gate credited 94.6% of the application to a design replacing two halves
+   of one function. Shares are now counted once per function.
+3. **Bit-serial work was priced as multiplies.** libcrc's models perform 256
+   sequential bit steps per block and the RTL runs one per cycle, measuring
+   297–301 cycles where the multiply-rate model predicted ~112. Work the
+   declared `mac_ops` cannot account for is now charged as sequential logic
+   steps, calibrated on this machine like the multiply rate already was.
+4. **`invocations` is a declaration nothing can verify.** libcrc shipped 2 where
+   a 4 KiB buffer needs 128; matrixmul shipped 4 where a 10x10 multiply needs
+   500. The obvious estimator — kernel instructions per call over model
+   instructions per invocation — is *biased*, because the two sides are
+   different implementations of the same work: it reads 31 for libcrc's true
+   128 and 147 for matrixmul's 4. Substituting it moved the prediction by an
+   order of magnitude in both directions, so the gate now **reports the
+   inconsistency** instead of guessing, and the redesign edge asks the designer
+   to fix the field.
+
+What that leaves: when the declarations are right, the model is accurate to
+**8%** (micro-ecc). When `invocations` is wrong the prediction is wrong, and the
+gate now says so in its own verdict rather than silently compensating. The two
+remaining errors are both traceable to that one field — and correcting it by
+hand does not rescue them either (libcrc 5.39x, matrixmul 0.87x), because
+`marshal_words` is a second unverifiable declaration whose weight grows once
+marshalling is charged at the rate the hardware showed. **Gate 3's accuracy is
+bounded by two fields the designer declares and RED cannot measure**, which is a
+sharper statement than "the model is optimistic" and a more useful one.
+
+The direction of the error also changed, and that matters for a gate: it was
+uniformly optimistic, shipping designs believed to be ~7x better than they are.
+
+## Reproduction
+
+```bash
+./.venv/bin/python eval/scripts/reprice.py   # gate 3 prediction vs the RTL below
+bash eval/scripts/run_all.sh quick  # all link tests; micro-ecc skips full ECDH
+bash eval/scripts/run_all.sh        # all projects including full micro-ecc ECDH
+bash eval/scripts/area_all.sh       # micro-ecc + libcrc synthesis
+```
+
+Individual runs:
+
+```bash
+bash eval/scripts/run_eval.sh                    # micro-ecc
+bash eval/scripts/run_project_eval.sh matrixmul
+bash eval/scripts/run_project_eval.sh libcrc
+```
+
+Generated binaries and complete logs are under ignored `eval/build/`. Tool
+versions: Verilator 5.051-devel, Icarus Verilog 14.0-devel, Yosys 0.68+136, and
+riscv64-unknown-elf-gcc 13.2.0.

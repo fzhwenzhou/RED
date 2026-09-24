@@ -165,16 +165,28 @@ def _tool_map(tools) -> dict[str, str]:
     return names
 
 
-def _review_rank(report, link1_result) -> tuple:
+def _review_rank(report, link1_result, perf=None, bar=None) -> tuple:
     """How good a reviewed spec is, lowest is best.
 
     Blocking findings first — they are what convergence is defined by — then
-    whether link 1 still passes, then total findings. Nothing here is anything
-    the designer asserts about its own spec; every term is a gate's or a
-    reviewer's verdict.
+    whether link 1 still passes, then whether the design still clears the
+    performance bar, then total findings. Nothing here is anything the designer
+    asserts about its own spec; every term is a gate's or a reviewer's verdict.
+
+    Performance is in the tuple because leaving it out let the review destroy a
+    design and be rewarded for it: on matrixmul the reviewers took a draft Gate
+    3 priced at 14.57x — the number the RTL independently measured — down to
+    three blocking findings, and the revision that cleared them priced at
+    1.03x. Both revisions are "0 blocking" as far as the old ranking could see,
+    so it kept the one that had given the performance away. Answering a reviewer
+    is not worth having if the extension stops being worth building.
     """
+    fast_enough = 0
+    if perf is not None and bar is not None:
+        fast_enough = 0 if perf.meets_target(bar) else 1
     return (report.blocking(),
             0 if (link1_result is not None and link1_result.passed) else 1,
+            fast_enough,
             len(report.findings))
 
 
@@ -617,7 +629,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
             profile_path=profile_path, report_path=report_path,
             spec_path=spec_path, status_path=status_path,
             knowledge_path=knowledge_path, sentinel_path=sentinel_path,
-            core_path=core_path, workload=workload, task_options=task_opts)]
+            core_path=core_path, workload=workload, run_id=run_id,
+            task_options=task_opts)]
     finish_tool = next((t for t in tools if hasattr(t, "was_finished")), None)
     if finish_tool is not None:
         finish_tool.reset()
@@ -755,6 +768,11 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     gate="gate0", passed=False,
                     detail=f"AW produced no harness in {WORKLOAD_MAX_ROUNDS} "
                            "rounds (the agent's turns did not complete)")
+            # AW is finished; its tool server is a Ray actor on a head with
+            # little memory to spare, and nothing reads it again.
+            for t in wl_tools:
+                t.stop()
+            wl_tools.clear()
             _mirror("gates/gate0.json", state_def.to_json(gate0))
             if not gate0.passed:
                 # Profiling an unrepresentative workload does not produce a
@@ -844,6 +862,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 READ_SPEC=tm.get("read_spec", ""),
                 WRITE_SPEC=tm.get("write_spec", ""), FINISH=tm.get("finish", ""),
                 READ_CORE=tm.get("read_core", ""),
+                GRAPH_WINNING_SHAPE=tm.get("graph_winning_shape", ""),
                 GRAPH_PRIOR_DESIGNS=tm.get("graph_prior_designs", ""),
                 GRAPH_PRIOR_FINDINGS=tm.get("graph_prior_findings", ""),
                 GRAPH_BEST_DESIGN=tm.get("graph_best_design", ""),
@@ -940,6 +959,11 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # 1.64x, then 0.96x, then 8.33x. Keep the best spec seen so the loop
         # never hands on a design worse than one it already had.
         best_spec_json, best_perf = None, None
+        # Which Gate 3 round the loop actually reached. The shipped re-price is
+        # judged at the bar that was in force then, not at the most relaxed bar
+        # the schedule would ever have offered — otherwise the final check is
+        # always at the floor and the schedule means nothing where it matters.
+        perf_rounds_used = 1
         if llm is not None:
             for round_ in range(1, PERF_MAX_ROUNDS + 1):
                 # Measure what each C model really does before costing it:
@@ -952,7 +976,9 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 graph.record_spec(workload, run_id, spec, stage=f"gate3.{round_}")
                 graph.record_perf(workload, run_id, perf, round_)
                 _mirror(f"perf/round{round_}.md",
-                        cost.render_feedback(perf, platform=plat))
+                        cost.render_feedback(
+                            perf, target=cost.target_for(
+                                round_, perf.covered_share)[0], platform=plat))
                 if perf.measurement_error:
                     # The profile, not the design, is unusable. Redesigning
                     # cannot help, and pretending otherwise burns the budget
@@ -962,14 +988,21 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     break
                 regressed = (best_perf is not None
                              and perf.app_speedup < best_perf.app_speedup)
+                # The bar this round: the ambition, capped by what Amdahl allows
+                # on the share this design covers, relaxed as redesigns fail to
+                # reach it. A fixed 2.00x asked micro-ecc for more than its
+                # 47.3% coverage can ever yield.
+                perf_rounds_used = round_
+                bar, why = cost.target_for(round_, perf.covered_share)
                 print(f"[{run_id}] Gate 3 round {round_}: predicted "
                       f"{perf.app_speedup:.2f}x over {perf.covered_share:.0%} of "
-                      f"cycles (target {SPEEDUP_TARGET:.2f}x)"
+                      f"cycles (bar {bar:.2f}x"
+                      + (f" — {why}" if why else "") + ")"
                       + (f" — worse than round {round_ - 1}'s "
                          f"{best_perf.app_speedup:.2f}x" if regressed else ""))
                 if best_perf is None or perf.app_speedup > best_perf.app_speedup:
                     best_spec_json, best_perf = spec_json, perf
-                if perf.meets_target():
+                if perf.meets_target(bar):
                     break
                 if round_ == PERF_MAX_ROUNDS:
                     # Hand on the best design, not the most recent one.
@@ -986,7 +1019,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                           f"{perf.app_speedup:.2f}x — escalating")
                     break
                 with open(status_path, "w") as f:
-                    f.write(cost.render_feedback(perf, platform=plat))
+                    f.write(cost.render_feedback(perf, target=bar,
+                                                 platform=plat))
                 iters += 1
                 _dispatch_llm(llm, _load_prompt(
                     "redesign.md",
@@ -994,8 +1028,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     READ_STATUS=tm.get("read_status", ""), WRITE_SPEC=tm.get("write_spec", ""),
                     APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
                     FINISH=tm.get("finish", ""),
-                    TARGET=f"{SPEEDUP_TARGET:.2f}",
-                    VERDICT=(cost.render_feedback(perf, platform=plat)
+                    TARGET=f"{cost.target_for(round_ + 1, perf.covered_share)[0]:.2f}",
+                    VERDICT=(cost.render_feedback(perf, target=bar, platform=plat)
                              + (f"\n**Your last change made this worse** — the "
                                 f"previous design reached "
                                 f"{best_perf.app_speedup:.2f}x. Reconsider it "
@@ -1009,12 +1043,17 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 spec_json = state_def.to_json(spec)
                 l1 = _run_link1(spec_json)
                 _mirror(f"gates/link1.perf{round_}.json", state_def.to_json(l1))
+            final_bar, final_why = (
+                cost.target_for(min(round_, PERF_MAX_ROUNDS), perf.covered_share)
+                if perf else (SPEEDUP_TARGET, ""))
             gate3 = state_def.GateResult(
-                gate="gate3", passed=bool(perf and perf.meets_target()),
+                gate="gate3", passed=bool(perf and perf.meets_target(final_bar)),
                 detail=(f"predicted {perf.app_speedup:.2f}x over "
                         f"{perf.covered_share:.0%} of cycles "
-                        f"(target {SPEEDUP_TARGET:.2f}x)" if perf else "not run"),
-                counterexample=None if (perf and perf.meets_target())
+                        f"(bar {final_bar:.2f}x"
+                        + (f"; {final_why}" if final_why else "") + ")"
+                        if perf else "not run"),
+                counterexample=None if (perf and perf.meets_target(final_bar))
                 else (perf.detail if perf else None))
             _mirror("gates/gate3.json", state_def.to_json(gate3))
 
@@ -1192,7 +1231,22 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 graph.record_review(workload, run_id, review_report, round_)
                 _mirror(f"review/round{round_}.md", review.render(review_report))
                 n_block = review_report.blocking()
-                rank = _review_rank(review_report, l1)
+                # Re-price this round's spec. Cheap (a compile and one callgrind
+                # pass per model, no agent) and it is the only thing that can
+                # tell a revision that answered the reviewers from one that
+                # answered them by giving up the design.
+                round_perf, round_bar = perf, None
+                try:
+                    round_perf = cost.estimate(
+                        spec, report, core_profile,
+                        cost.measure_ops(spec, os.path.join(
+                            work_root, "gate3", f"review{round_}")))
+                    round_bar = cost.target_for(perf_rounds_used,
+                                                round_perf.covered_share)[0]
+                except Exception as exc:              # noqa: BLE001
+                    print(f"[{run_id}] could not re-price review round "
+                          f"{round_}: {exc}")
+                rank = _review_rank(review_report, l1, round_perf, round_bar)
                 regressed = best_review is not None and rank > best_review[0]
                 print(f"[{run_id}] review round {round_}: "
                       f"{len(review_report.findings)} finding(s), {n_block} blocking "
@@ -1200,9 +1254,26 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                       + (f" — worse than the best so far "
                          f"({best_review[2].blocking()} blocking)" if regressed else ""))
                 if best_review is None or rank < best_review[0]:
-                    best_review = (rank, spec_json, review_report, l1)
-                if not n_block:
+                    best_review = (rank, spec_json, review_report, l1,
+                                   round_perf)
+                # Clearing the findings is not the goal; shipping something
+                # worth building is. A revision that answers every reviewer by
+                # making the extension pointless used to end the loop here,
+                # because "0 blocking" was the whole exit condition: matrixmul
+                # took a design Gate 3 priced at 16.84x — the shape whose RTL
+                # measures 14.57x — down to 1.07x, cleared its last finding
+                # doing it, and the loop called that done. Keep going while
+                # there is budget, and tell the designer what it gave away.
+                gave_away = (round_perf is not None and round_bar is not None
+                             and not round_perf.meets_target(round_bar))
+                if not n_block and not gave_away:
                     break
+                if not n_block and gave_away:
+                    print(f"[{run_id}] review round {round_}: 0 blocking, but "
+                          f"the revision priced at {round_perf.app_speedup:.2f}x "
+                          f"against a {round_bar:.2f}x bar — continuing rather "
+                          "than shipping a design the reviewers approved into "
+                          "uselessness")
                 if round_ == REVIEW_MAX_ROUNDS:
                     # Hand on the best spec the review reached, not the last one.
                     if best_review is not None and best_review[2] is not review_report:
@@ -1216,8 +1287,9 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         l1 = _run_link1(spec_json)
                         _mirror("gates/link1.review_best.json", state_def.to_json(l1))
                         n_block = review_report.blocking()
-                    print(f"[{run_id}] review budget spent with {n_block} blocking "
-                          "finding(s) outstanding — escalating to the summary")
+                    print(f"[{run_id}] review budget spent with {n_block} "
+                          "blocking finding(s) outstanding — escalating to the "
+                          "summary")
                     break
                 # Hand the findings to the designer that wrote the spec.
                 with open(status_path, "w") as f:
@@ -1230,7 +1302,31 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     READ_CORE=tm.get("read_core", ""),
                     APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
                     FINISH=tm.get("finish", ""),
-                    FINDINGS=review.render(review_report)),
+                    FINDINGS=(review.render(review_report)
+                              + ((f"\n\n## Your last revision gave away the "
+                                  f"performance\n\nThe draft before it was "
+                                  f"priced at {best_review[4].app_speedup:.2f}x; "
+                                  f"this one prices at "
+                                  f"{round_perf.app_speedup:.2f}x. Answering a "
+                                  f"reviewer is not worth having if the "
+                                  f"extension stops being worth building — the "
+                                  f"findings have to be answered *and* the "
+                                  f"speedup kept. Go back to the faster design "
+                                  f"and make the smallest change that addresses "
+                                  f"the findings.\n")
+                                 if (round_perf is not None and best_review
+                                     and best_review[4] is not None
+                                     and round_perf.app_speedup
+                                     < best_review[4].app_speedup * 0.5) else "")
+                              + (f"\n\n## Your last revision made this worse\n\n"
+                                 f"The previous draft had "
+                                 f"{best_review[2].blocking()} blocking "
+                                 f"finding(s); this one has {n_block}. The loop "
+                                 f"keeps the better draft, so you are revising "
+                                 f"from it — but changing more is not working. "
+                                 f"Make the smallest change that answers the "
+                                 f"findings above and change nothing else.\n"
+                                 if regressed and best_review else ""))),
                     tools, tag=f"designer revision {round_}", log_path=transcript_path)
                 revised = _read_artifact(spec_path, state_def.ISASpec)
                 if revised is None:
@@ -1349,11 +1445,117 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 for f in final_sec.mechanical_blocking():
                     print(f"[{run_id}]   [{f.check}] "
                           f"{f.instruction or 'spec-wide'}: {f.finding}")
+                # ...and then fix it. A defect found here is one the review
+                # reintroduced into a design the security stage had already
+                # cleared, so it is a regression with a known fix, detected,
+                # against a spec that is otherwise finished. Failing the run at
+                # this point threw all of that away: matrixmul passed Gate 4
+                # round 1 cleanly, the review revised the spec, the re-check
+                # caught a data-dependent branch, and the run was reported not
+                # converged for a defect nobody was ever given the chance to
+                # repair. One round, then the verdict stands.
+                for fix_round in range(1, SECURITY_MAX_ROUNDS + 1):
+                    with open(status_path, "w") as f:
+                        f.write(security.render(final_sec))
+                    iters += 1
+                    _dispatch_llm(llm, _load_prompt(
+                        "secure.md",
+                        READ_SPEC=tm.get("read_spec", ""),
+                        READ_REPORT=tm.get("read_report", ""),
+                        READ_STATUS=tm.get("read_status", ""),
+                        READ_CORE=tm.get("read_core", ""),
+                        WRITE_SPEC=tm.get("write_spec", ""),
+                        APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
+                        FINISH=tm.get("finish", ""),
+                        FINDINGS=security.render(final_sec)),
+                        tools, tag=f"final security repair {fix_round}",
+                        log_path=transcript_path)
+                    revised = _read_artifact(spec_path, state_def.ISASpec)
+                    if revised is None:
+                        break
+                    spec = revised
+                    spec_json = state_def.to_json(spec)
+                    # The models changed under every downstream verdict, so
+                    # re-establish them rather than shipping a spec whose
+                    # link 1 and Gate 2 describe the previous version.
+                    l1 = _run_link1(spec_json)
+                    _mirror(f"gates/link1.finalsec{fix_round}.json",
+                            state_def.to_json(l1))
+                    final_sec = _scan(spec_json,
+                                      os.path.join(sec_dir, f"final{fix_round}"))
+                    gate4 = security.verdict(final_sec)
+                    print(f"[{run_id}] final security repair {fix_round}: "
+                          f"{'PASS' if gate4.passed else 'FAIL'} — {gate4.detail}")
+                    if gate4.passed:
+                        # Gate 2 verified the pre-repair wording; re-run it so
+                        # the shipped spec's verdict is about the shipped spec.
+                        for ins in spec.instructions:
+                            ins.spike_model = ""
+                        _write_json(spec_path, spec)
+                        if _dispatch_iss(llm, iss_tools, transcript_path,
+                                         "ISS implementer (after security repair)"):
+                            spec = _read_artifact(spec_path,
+                                                  state_def.ISASpec) or spec
+                            spec_json = state_def.to_json(spec)
+                            gate2 = _run_gate2(spec_json)
+                            l2 = (nodes.link2(state_def.to_json(gate2)) if local
+                                  else _await(nodes.link2.chia_remote(
+                                      state_def.to_json(gate2)), "link 2",
+                                      RES_HEAD_LOCAL))
+                            chain = [l1, l2]
+                            _mirror("gates/gate2.json", state_def.to_json(gate2))
+                            _mirror("gates/chain.json", state_def.to_json(chain))
+                            print(f"[{run_id}] Gate 2 re-verified after the "
+                                  f"security repair: "
+                                  f"{'PASS' if gate2.passed else 'FAIL'}")
+                        break
             sec_report = final_sec
             _mirror("security/final.json", state_def.to_json(sec_report))
             _mirror("security/final.md", security.render(sec_report))
             _mirror("gates/gate4.json", state_def.to_json(gate4))
             graph.record_security(workload, run_id, sec_report, 0)
+
+        # Gate 3, on the spec that actually ships. Every other gate in the loop
+        # is re-run when the artifact changes under it — link 1 after every
+        # repair, redesign, security revision and review revision; Gate 4 on
+        # whatever finally ships — and Gate 3 was the one place where the loop
+        # reasoned about the artifact instead of re-measuring it. It runs before
+        # Gate 4 and the review, and was re-priced only after a *security*
+        # revision, so a reviewer could change the design afterwards and the
+        # stale number stood.
+        #
+        # That is not hypothetical: all three shipped extensions were revised
+        # after Gate 3 last ran. On micro-ecc the review merged two instructions
+        # into one and gave up a mined loop; the run reported 11.60x, re-pricing
+        # what shipped gives 1.85x, and the RTL subsequently measured 1.67x.
+        # The entire error was bookkeeping.
+        if llm is not None and spec is not None:
+            measured = cost.measure_ops(
+                spec, os.path.join(work_root, "gate3", "shipped"))
+            shipped_perf = cost.estimate(spec, report, core_profile, measured)
+            if perf is None or abs(shipped_perf.app_speedup
+                                   - perf.app_speedup) > 0.01:
+                print(f"[{run_id}] Gate 3 re-priced on the shipped spec: "
+                      f"{shipped_perf.app_speedup:.2f}x"
+                      + (f" (was {perf.app_speedup:.2f}x before the review "
+                         f"revised it)" if perf else ""))
+            perf = shipped_perf
+            # The same bar the loop settled on, so the shipped verdict answers
+            # the question the loop was actually asking by the end.
+            ship_bar, ship_why = cost.target_for(perf_rounds_used,
+                                                  perf.covered_share)
+            gate3 = state_def.GateResult(
+                gate="gate3", passed=bool(perf.meets_target(ship_bar)),
+                detail=(f"predicted {perf.app_speedup:.2f}x over "
+                        f"{perf.covered_share:.0%} of cycles (bar "
+                        f"{ship_bar:.2f}x"
+                        + (f"; {ship_why}" if ship_why else "")
+                        + ", priced on the shipped spec)"),
+                counterexample=None if perf.meets_target(ship_bar) else perf.detail)
+            _mirror("gates/gate3.json", state_def.to_json(gate3))
+            _mirror("perf/shipped.json", state_def.to_json(perf))
+            _mirror("perf/shipped.md", cost.render_feedback(perf, platform=plat))
+            graph.record_perf(workload, run_id, perf, PERF_MAX_ROUNDS + 2)
 
         # A spec with unresolved blocking findings has not converged, however
         # cleanly it verifies: the reviewers are asking whether it is worth

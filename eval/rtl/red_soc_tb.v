@@ -58,6 +58,7 @@ module red_soc_tb;
 				$fflush();
 			end else if (mem_addr == 32'h1000_0004 && mem_wstrb) begin
 				mem_ready <= 1;
+				if (mem_wdata != 0) $fatal(1, "firmware exit status=%0d", mem_wdata);
 				$display("\n[sim] finished: status=%0d  cycles=%0d", mem_wdata, cycles);
 				$finish;
 			end else if (mem_addr == 32'h1000_0008) begin
@@ -66,7 +67,7 @@ module red_soc_tb;
 			end else begin
 				mem_ready <= 1;
 				mem_rdata <= 32'h0;
-				$display("[sim] unmapped access at 0x%08x (wstrb=%b)", mem_addr, mem_wstrb);
+				$fatal(1, "[sim] unmapped access at 0x%08x (wstrb=%b)", mem_addr, mem_wstrb);
 			end
 		end
 	end
@@ -84,7 +85,7 @@ module red_soc_tb;
 	integer timeout;
 	initial begin
 		if (!$value$plusargs("firmware=%s", firmware)) begin
-			$display("[sim] give +firmware=<hex>"); $finish;
+			$fatal(1, "[sim] give +firmware=<hex>");
 		end
 		if (!$value$plusargs("timeout=%d", timeout)) timeout = 2000000000;
 		for (integer i = 0; i < MEM_WORDS; i = i + 1) memory[i] = 32'h0;
@@ -95,12 +96,10 @@ module red_soc_tb;
 
 	always @(posedge clk) begin
 		if (resetn && trap) begin
-			$display("\n[sim] TRAP after %0d cycles", cycles);
-			$finish;
+			$fatal(1, "[sim] TRAP after %0d cycles", cycles);
 		end
 		if (resetn && cycles > timeout) begin
-			$display("\n[sim] TIMEOUT after %0d cycles", cycles);
-			$finish;
+			$fatal(1, "[sim] TIMEOUT after %0d cycles", cycles);
 		end
 	end
 endmodule

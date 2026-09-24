@@ -519,18 +519,25 @@ def abort_run(workload: str, run_id: str, reason: str = "") -> None:
 # Reads — what the agents ask
 # ---------------------------------------------------------------------------
 
-def prior_designs(workload: str, function: str, limit: int = 12) -> list:
-    """Every instruction earlier runs designed for this kernel, with its shape,
-    what the performance gate predicted for it, and how that run ended.
+def prior_designs(workload: str, function: str, limit: int = 12,
+                  exclude_run: str = "") -> list:
+    """Every instruction *earlier* runs designed for this kernel, with its
+    shape, what the performance gate predicted for it, and how that run ended.
 
     This is the query the whole graph exists for: without it each run
     rediscovers from scratch that (say) replacing a loop *body* cannot pay,
     because the operand traffic is charged per invocation.
+
+    ``exclude_run`` drops the asking run's own rows. It used to see them, and
+    that is worse than noise: a designer reading back its own draft from three
+    minutes ago, labelled the same way as ten converged runs of history, has
+    been handed its own guess as evidence.
     """
     return _read(
         """
         MATCH (l:HotLoop {uid: $loop})<-[:REPLACES]-(i:Instruction)
               <-[:HAS_INSTRUCTION]-(s:Spec)<-[:PRODUCED]-(r:Run)
+        WHERE $exclude = '' OR r.run_id <> $exclude
         OPTIONAL MATCH (p:PerfEstimate)-[sc:SCORES]->(i)
         WITH r, i, s, max(p.app_speedup) AS app, max(sc.speedup) AS ins_speedup,
              head(collect(sc.note)) AS note
@@ -542,23 +549,76 @@ def prior_designs(workload: str, function: str, limit: int = 12) -> list:
         ORDER BY converged DESC, app_speedup DESC
         LIMIT $limit
         """,
-        loop=_loop_uid(workload, function), limit=limit)
+        loop=_loop_uid(workload, function), limit=limit,
+        exclude=exclude_run or "")
 
 
-def prior_findings(workload: str, function: str, limit: int = 15) -> list:
-    """Blocking and major findings earlier reviewers raised about instructions
-    that replaced this kernel — the mistakes not worth making twice."""
+def winning_shape(workload: str, function: str = "") -> list:
+    """The exact shape of every instruction that shipped in a **converged** run.
+
+    ``prior_designs`` lists everything ever tried, worst included, and leaves
+    the designer to work out which rows are the lesson. This returns only what
+    actually shipped, so "start from the design that worked" is one tool call
+    rather than an inference over a table. It carries the number that decides
+    the whole question -- arithmetic per operand word moved -- alongside the
+    speedup the gate credited it with.
+    """
     return _read(
         """
-        MATCH (l:HotLoop {uid: $loop})<-[:REPLACES]-(i:Instruction)<-[:ABOUT]-(f:Finding)
+        MATCH (r:Run {converged: true})-[:OF_WORKLOAD]->(w:Workload {name: $workload})
+        MATCH (r)-[:PRODUCED {stage: 'final'}]->(:Spec)-[:HAS_INSTRUCTION]->(i:Instruction)
+        OPTIONAL MATCH (i)-[:REPLACES]->(l:HotLoop)
+        WHERE $function = '' OR l.function = $function
+        RETURN i.mnemonic AS mnemonic, l.function AS replaces,
+               i.words AS words, i.mac_ops AS mac_ops,
+               i.invocations AS invocations, i.work_per_word AS work_per_word,
+               r.predicted_speedup AS run_speedup, r.run_id AS run
+        ORDER BY run_speedup DESC
+        LIMIT 12
+        """,
+        workload=workload, function=function or "")
+
+
+def prior_findings(workload: str, function: str, limit: int = 15,
+                   exclude_run: str = "") -> list:
+    """Blocking and major review objections raised against earlier designs for
+    this kernel — and, for each, **what became of the run that heard it**.
+
+    An objection on its own is ambiguous: the designer cannot tell a fatal one
+    from one the run absorbed and shipped anyway. So every row carries the
+    verdict of the run it was raised in and the shape that run finally
+    produced. "This was raised, the run converged anyway, and here is what it
+    shipped" and "this was raised and the run died with it outstanding" are
+    different lessons, and only the second is a reason to change course.
+    """
+    return _read(
+        """
+        MATCH (r:Run)-[:OF_WORKLOAD]->(w:Workload {name: $workload})
+        MATCH (r)-[rev:REVIEWED]->(f:Finding)
         WHERE f.severity IN ['blocking', 'major']
-        RETURN DISTINCT f.severity AS severity, f.reviewer AS reviewer,
-               i.mnemonic AS mnemonic, i.words AS words, i.mac_ops AS mac_ops,
-               f.finding AS finding, f.fix AS fix
-        ORDER BY severity, reviewer
+          AND ($exclude = '' OR r.run_id <> $exclude)
+          AND ($function = '' OR EXISTS {
+                MATCH (f)-[:ABOUT]->(:Instruction)-[:REPLACES]->
+                      (:HotLoop {function: $function}) })
+        OPTIONAL MATCH (f)-[:ABOUT]->(i:Instruction)
+        OPTIONAL MATCH (r)-[:PRODUCED {stage: 'final'}]->(:Spec)
+                        -[:HAS_INSTRUCTION]->(fin:Instruction)
+        WITH f, rev, r, i,
+             collect(DISTINCT fin.mnemonic + ' w' + toString(fin.words) +
+                     ' mac' + toString(fin.mac_ops) +
+                     ' x' + toString(fin.invocations))[0..3] AS shipped
+        RETURN f.severity AS severity, f.reviewer AS reviewer,
+               rev.round AS round,
+               coalesce(i.mnemonic, f.instruction) AS mnemonic,
+               i.words AS words, f.finding AS finding, f.fix AS fix,
+               r.converged AS run_converged,
+               r.blocking_findings AS unresolved_at_end,
+               shipped AS run_shipped
+        ORDER BY run_converged ASC, severity, round DESC
         LIMIT $limit
         """,
-        loop=_loop_uid(workload, function), limit=limit)
+        workload=workload, function=function or "", limit=limit,
+        exclude=exclude_run or "")
 
 
 def prior_security(workload: str, function: str = "", limit: int = 15) -> list:

@@ -34,6 +34,7 @@ a 0.98x one — which is all the gate needs to do.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -42,7 +43,11 @@ from dataclasses import dataclass, field
 
 from red import callgrind, state_def
 from red.constants import (
+    SPEEDUP_ATTAINMENT,
+    SPEEDUP_FLOOR,
+    SPEEDUP_RELAX,
     CPU_LOAD_STORE,
+    CYCLES_PER_MARSHAL_WORD,
     CYCLES_PER_BEAT,
     CYCLES_PER_IR,
     FIXED_CYCLES,
@@ -70,6 +75,8 @@ class InstructionCost:
     beats: int                       # 32-bit words moved in + out
     marshal_cycles: float            # what the caller pays to lay operands out
     replaces: str = ""               # loop_id from the HotLoopReport
+    invocations: float = 1.0         # per kernel call — the designer's, unverified
+    unverified: str = ""             # why this instruction's cost is not settled
     replaced_cycles: float = 0.0     # software cost of the work one invocation replaces
     speedup: float = 0.0             # replaced_cycles / (cycles + marshal_cycles)
     note: str = ""
@@ -91,6 +98,10 @@ class SpeedupEstimate:
     # spends its whole redesign budget asking the designer to fix a profiler
     # bug it cannot see. Three full cluster runs were lost that way.
     measurement_error: str = ""
+    # Declarations the prediction depends on that RED could not verify. Not an
+    # error — the number may well be right — but the gate must not present a
+    # prediction resting on one as though it were measured throughout.
+    unverified: list = field(default_factory=list)
 
     def meets_target(self, target: float = SPEEDUP_TARGET) -> bool:
         return self.app_speedup >= target
@@ -165,6 +176,8 @@ def work_per_beat(words: int, mac_ops: int) -> float:
 # honest 64-MAC model measures ~14 Ir per MAC, so a truthful `mac_ops=64` was
 # rejected as an understatement and the instruction was overpriced.
 _IR_PER_OP_FALLBACK = 8.0
+# Host instructions per sequential logic step when the calibration cannot run.
+_IR_PER_LOGIC_FALLBACK = 5.0
 # A reference kernel whose MAC count is known exactly: 8x8 limbs, schoolbook.
 _CALIB_MACS = 64
 _CALIB_MODEL = r"""
@@ -184,10 +197,41 @@ void calib_model(const uint32_t in[16], uint32_t out[16]) {
 }
 """
 # Below this, a model is too small for the measurement to say anything.
+# A reference kernel whose *sequential* step count is known exactly and which
+# contains no multiplies at all: 32 rounds of a CRC-style shift/xor over 8
+# words, 256 steps. The multiply calibration above cannot price this work --
+# dividing a bit-serial model's instruction count by ~15 Ir-per-MAC turns 256
+# hardware steps into ~80 "ops" and charges a third of the real latency. libcrc
+# is exactly that case: its models perform 256 bit steps per block, the
+# synthesizable RTL runs one step per cycle and measures 297-301 cycles, and
+# (\ref{eq:cost}) predicted ~112.
+_CALIB_STEPS = 256
+_CALIB_LOGIC_MODEL = r"""
+void caliblogic_model(const uint32_t in[8], uint32_t out[8]) {
+    uint32_t crc = in[0];
+    for (int i = 0; i < 8; i++) {
+        uint32_t byte = in[i];
+        for (int b = 0; b < 32; b++) {
+            uint32_t mask = (uint32_t)0 - ((crc ^ byte) & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            byte >>= 1;
+        }
+        out[i] = crc;
+    }
+}
+"""
+# Cycles the datapath takes per sequential logic step. One step per cycle is
+# what the measured RTL does.
+LOGIC_CYCLES = float(os.environ.get("RED_LOGIC_CYCLES", "1.0"))
+
 _IR_FLOOR = 40.0
 # How far an instruction's measured work may fall short of the work it claims to
 # replace before the claim, not the measurement, is treated as the error.
 _WORK_MISMATCH = 4.0
+# How far `invocations` may understate before it is replaced by the measured
+# ratio. Loose enough to tolerate a model that is a little cheaper than the
+# kernel iteration it replaces, tight enough to catch 2-where-128-is-needed.
+_INVOCATION_MISMATCH = float(os.environ.get("RED_INVOCATION_MISMATCH", "2.0"))
 
 _OPS_HARNESS = r"""
 #include <stdint.h>
@@ -201,6 +245,9 @@ int main(void) {
     return (int)(out[0] & 1);
 }
 """
+
+
+_OPS_CACHE: dict = {}
 
 
 def measure_ops(spec: state_def.ISASpec, work_dir: str) -> dict:
@@ -218,8 +265,22 @@ def measure_ops(spec: state_def.ISASpec, work_dir: str) -> dict:
         return {}
     os.makedirs(work_dir, exist_ok=True)
     _ir_per_op(work_dir)          # calibrate this machine once, before costing
+    _ir_per_logic_step(work_dir)  # ...and the sequential-step rate with it
     out: dict = {}
     for ins in spec.instructions:
+        # A model's instruction count is a property of the model, so measuring
+        # it twice is wasted work -- and not cheap waste: every measurement
+        # compiles the model and runs it under callgrind. Re-pricing each review
+        # round (which is what keeps a revision from giving the design away)
+        # multiplied that by the round count, and on a twelve-instruction libcrc
+        # spec it ran 48 callgrind passes on the head where 12 would do. The
+        # head has 5.7 GB and Ray's memory monitor killed a tool server mid-run.
+        key = hashlib.sha1(
+            (ins.mnemonic + "\0" + (ins.c_model or "")).encode()).hexdigest()
+        if key in _OPS_CACHE:
+            if _OPS_CACHE[key] is not None:
+                out[ins.mnemonic] = _OPS_CACHE[key]
+            continue
         ident = state_def.c_identifier(ins.mnemonic)
         src = os.path.join(work_dir, f"{ident}_ops.c")
         exe = os.path.join(work_dir, f"{ident}_ops")
@@ -239,12 +300,40 @@ def measure_ops(spec: state_def.ISASpec, work_dir: str) -> dict:
             self_ir, _calls = callgrind.parse_raw(cg)
             if f"{ident}_model" in self_ir:
                 out[ins.mnemonic] = self_ir[f"{ident}_model"]
+                _OPS_CACHE[key] = self_ir[f"{ident}_model"]
+            else:
+                _OPS_CACHE[key] = None
         except (OSError, subprocess.TimeoutExpired):
             continue
     return out
 
 
 _IR_PER_OP_CACHE: dict = {}
+_IR_PER_STEP_CACHE: dict = {}
+
+
+def _ir_per_logic_step(work_dir: str) -> float:
+    """Host instructions per sequential logic step, measured on THIS machine.
+
+    The multiply calibration answers "how many host instructions is one 32x32
+    MAC"; this answers the same question for a shift/xor step, and they are not
+    the same number. Pricing bit-serial work with the multiply ratio is what
+    made Gate 3 charge a third of libcrc's real instruction latency.
+    """
+    if "v" in _IR_PER_STEP_CACHE:
+        return _IR_PER_STEP_CACHE["v"]
+    _IR_PER_STEP_CACHE["v"] = _IR_PER_LOGIC_FALLBACK
+    probe = state_def.ISASpec(name="caliblogic", instructions=[
+        state_def.InstructionSpec(
+            name="caliblogic", mnemonic="caliblogic", encoding="-",
+            semantics="-", pseudocode="-", c_model=_CALIB_LOGIC_MODEL, words=8,
+            mac_ops=0, replaces="", invocations=1,
+            operands=["rd", "rs1", "rs2"])])
+    measured = measure_ops(probe, os.path.join(work_dir, "caliblogic"))
+    ir = measured.get("caliblogic")
+    if ir and ir > _IR_FLOOR:
+        _IR_PER_STEP_CACHE["v"] = ir / float(_CALIB_STEPS)
+    return _IR_PER_STEP_CACHE["v"]
 
 
 def _ir_per_op(work_dir: str) -> float:
@@ -271,6 +360,51 @@ def _ir_per_op(work_dir: str) -> float:
         ratio = ir / float(_CALIB_MACS)
     _IR_PER_OP_CACHE["v"] = ratio
     return ratio
+
+
+def amdahl_ceiling(covered_share: float) -> float:
+    """The most any extension can deliver on a workload it covers this much of.
+
+    Everything the extension does not touch runs at its original speed, so the
+    whole-application speedup is bounded by 1/(1-covered) no matter how fast the
+    instructions are. This is the number that makes a fixed target incoherent:
+    at 47.3% coverage the ceiling is 1.90x, and asking for 2.0x asks for
+    something arithmetic forbids.
+    """
+    if covered_share >= 1.0:
+        return float("inf")
+    return 1.0 / max(1e-9, 1.0 - covered_share)
+
+
+def target_for(round_: int, covered_share: float,
+               base: float = SPEEDUP_TARGET) -> tuple:
+    """The bar in force this round, and why.
+
+    Returns ``(target, reason)``. The bar is the ambition capped by what the
+    workload permits, relaxed geometrically per redesign round and never taken
+    below the floor. Below the floor a "speedup" is inside the cost model's own
+    error -- measured at ~8% against RTL where the declarations are sound -- and
+    passing a design there would be reporting noise as a result.
+    """
+    ceiling = amdahl_ceiling(covered_share)
+    attainable = ceiling * SPEEDUP_ATTAINMENT
+    reasons = []
+    bar = base
+    if attainable < base:
+        bar = attainable
+        reasons.append(
+            f"Amdahl caps this workload at {ceiling:.2f}x for the "
+            f"{covered_share:.1%} it covers, so the bar is "
+            f"{SPEEDUP_ATTAINMENT:.0%} of that rather than the {base:.2f}x "
+            "default")
+    if round_ > 1:
+        bar *= SPEEDUP_RELAX ** (round_ - 1)
+        reasons.append(f"relaxed for redesign round {round_}")
+    if bar < SPEEDUP_FLOOR:
+        bar = SPEEDUP_FLOOR
+        reasons.append(f"held at the {SPEEDUP_FLOOR:.2f}x floor, below which a "
+                       "prediction is inside the model's own error")
+    return bar, "; ".join(reasons)
 
 
 def estimate(spec: state_def.ISASpec,
@@ -324,23 +458,38 @@ def estimate(spec: state_def.ISASpec,
 
     measured_ops = measured_ops or {}
     ir_per_op = _IR_PER_OP_CACHE.get("v", _IR_PER_OP_FALLBACK)
+    ir_per_step = _IR_PER_STEP_CACHE.get("v", _IR_PER_LOGIC_FALLBACK)
     for ins in spec.instructions:
         beats = 2 * max(ins.words, 1)
-        # Trust the measurement over the declaration. A model that executes far
-        # more work than its `mac_ops` admits is costed on what it actually
-        # does, and the discrepancy is reported rather than quietly absorbed.
+        # Split the measured work into the part the declared multiplies can
+        # account for and the part they cannot, and charge each at the rate the
+        # datapath runs it. Pricing everything as multiplies was the defect
+        # behind libcrc: its models perform 256 sequential bit steps per block
+        # and the synthesizable RTL takes one cycle each, measuring 297-301
+        # cycles where the multiply-rate model predicted ~112.
+        #
+        # This also subsumes the older "declares mac_ops=0 but executes 60,000
+        # instructions" override, and more accurately: that work is now charged
+        # as the sequential steps it is, rather than as a number of multiplies
+        # inferred through the wrong ratio.
         ops = ins.mac_ops
+        logic_steps = 0.0
         note = ""
         ir = measured_ops.get(ins.mnemonic)
         if ir is not None and ir > _IR_FLOOR:
-            implied = ir / ir_per_op
-            if implied > max(ins.mac_ops, 1) * 1.5:
-                note = (f"declares mac_ops={ins.mac_ops} but its C model executes "
-                        f"{ir:,} instructions (~{implied:.0f} ops); costed on the "
-                        "measurement")
-                ops = int(implied)
-        cycles = plat.instruction_cycles(ins.words, ops)
-        marshal = ins.marshal_words * plat.cpu_load_store * 2  # copy in and back out
+            mac_ir = min(float(ir), max(ins.mac_ops, 0) * ir_per_op)
+            logic_steps = max(0.0, (ir - mac_ir) / ir_per_step)
+            if logic_steps > max(ins.mac_ops, 1):
+                note = (f"its C model executes {ir:,} instructions, of which "
+                        f"{ir - mac_ir:,.0f} are not accounted for by "
+                        f"mac_ops={ins.mac_ops}; charged as "
+                        f"{logic_steps:.0f} sequential logic steps")
+        cycles = plat.instruction_cycles(ins.words, ops) + logic_steps * LOGIC_CYCLES
+        # Copy in and back out, at the measured marshalling rate rather than the
+        # bare load/store rate. On the one call anyone has measured end to end,
+        # this is 413 of 656 cycles -- the largest single component, and a
+        # direct consequence of the memory-block ABI.
+        marshal = ins.marshal_words * CYCLES_PER_MARSHAL_WORD * 2
         cost = InstructionCost(mnemonic=ins.mnemonic, words=ins.words,
                                mac_ops=ops, cycles=cycles, beats=beats,
                                marshal_cycles=marshal, replaces=ins.replaces,
@@ -366,8 +515,56 @@ def estimate(spec: state_def.ISASpec,
             continue
 
         # What one call of the kernel costs today, in target cycles.
-        kernel_cycles = (loop.dynamic_cycles / loop.calls) * plat.cycles_per_ir
+        kernel_ir_per_call = loop.dynamic_cycles / loop.calls
+        kernel_cycles = kernel_ir_per_call * plat.cycles_per_ir
+
+        # `invocations` — how many times the instruction runs per call of the
+        # kernel — was the one cost declaration nothing ever measured. mac_ops
+        # is profiled from the reference model and `replaces` is matched against
+        # the frozen report, but this was taken on the designer's word, and it
+        # was wrong by one to two orders of magnitude in two of three shipped
+        # specifications: libcrc declared 2 where a 4 KiB buffer needs 128, and
+        # matrixmul declared 4 where a 10x10 multiply needs 500. Understating it
+        # understates the hardware side of the comparison by the same factor,
+        # because the extension is charged for n invocations and credited with
+        # the whole kernel.
+        #
+        # It is derivable: the kernel executes `kernel_ir_per_call` host
+        # instructions per call and the model executes `ir` per invocation, so
+        # their ratio is how many invocations that call needs. Measure it.
         n = max(ins.invocations, 1)
+        # `invocations` is the one cost declaration RED cannot derive, and it
+        # was wrong by one to two orders of magnitude in two of three shipped
+        # specifications (libcrc declared 2 where a 4 KiB buffer needs 128,
+        # matrixmul 4 where a 10x10 multiply needs 500).
+        #
+        # The tempting estimator -- kernel instructions per call divided by the
+        # model's instructions per invocation -- is *biased*, because the two
+        # sides are different implementations of the same work: it reads 31 for
+        # libcrc's 128 because the model spends more instructions per byte than
+        # the table-driven software does, and 147 for matrixmul's 4 because the
+        # model spends fewer. Substituting it silently moved the prediction by
+        # an order of magnitude in both directions. So it is a *check*, not a
+        # measurement: the discrepancy is reported to the designer and carried
+        # into the gate's own detail, and the number stays the designer's until
+        # RED can measure it.
+        if ir is not None and ir > _IR_FLOOR and kernel_ir_per_call > 0:
+            implied = kernel_ir_per_call / ir
+            if implied > n * _INVOCATION_MISMATCH or n > implied * _INVOCATION_MISMATCH:
+                cost.unverified = (
+                    f"invocations={ins.invocations} is the designer's "
+                    f"declaration and RED cannot verify it: one call of "
+                    f"{loop.function} executes {kernel_ir_per_call:,.0f} host "
+                    f"instructions against this model's {ir:,}, which is "
+                    f"consistent with roughly {implied:,.0f} invocations, not "
+                    f"{ins.invocations}. That ratio is itself only indicative — "
+                    "the two sides are different implementations — but the gap "
+                    "is too large to ignore. Check it against the data volume: "
+                    "how many bytes does one call process, and how many does "
+                    "one invocation?")
+                cost.note = ((cost.note + "; " if cost.note else "")
+                             + f"invocations UNVERIFIED (~{implied:,.0f} implied)")
+        cost.invocations = n
         cost.replaced_cycles = kernel_cycles / n
 
         # Does the instruction actually do the work it is being paid for? The
@@ -377,7 +574,7 @@ def estimate(spec: state_def.ISASpec,
         # whole function while implementing one iteration of it, or the reverse.
         replaced_per_invocation = cost.replaced_cycles
         if ir is not None and ir > _IR_FLOOR:
-            expected_ir = (loop.dynamic_cycles / loop.calls) / n
+            expected_ir = kernel_ir_per_call / n
             if expected_ir > 0 and ir < expected_ir / _WORK_MISMATCH:
                 credited = ir * plat.cycles_per_ir
                 cost.note = ((cost.note + "; " if cost.note else "") +
@@ -400,12 +597,29 @@ def estimate(spec: state_def.ISASpec,
         # A kernel accelerated by several instructions keeps the best claim
         # rather than compounding them — they are alternatives, not a pipeline.
         kernel_speedup = (kernel_cycles / new_kernel) if new_kernel > 0 else 0.0
-        prev = accelerated.get(loop.loop_id)
+        # Keyed by FUNCTION, not by loop id. A1 routinely mines two regions of
+        # one kernel and gives each the function's whole cycle share: micro-ecc
+        # reported two loops inside uECC_vli_mult at 47.3% each, plus the add
+        # and sub loops those kernels call, and the shares summed to 143%
+        # because the regions nest. Gate 3 was arithmetically correct on the
+        # report it was given and credited a two-instruction design with 94.6%
+        # of the application for replacing two halves of one function. One
+        # function's cycles can only be spent once.
+        key = loop.function or loop.loop_id
+        prev = accelerated.get(key)
         if prev is None or kernel_speedup > prev[1]:
-            accelerated[loop.loop_id] = (share, kernel_speedup)
+            accelerated[key] = (max(share, prev[0]) if prev else share,
+                                kernel_speedup)
         costs.append(cost)
 
+    # ...and the total still cannot exceed the application. Nested mined regions
+    # can make even the per-function shares sum past 1.0; scale them back rather
+    # than handing Amdahl a negative remainder.
     covered = sum(sh for sh, _ in accelerated.values())
+    if covered > 1.0:
+        scale = 1.0 / covered
+        accelerated = {k: (sh * scale, sp) for k, (sh, sp) in accelerated.items()}
+        covered = 1.0
     # Amdahl over the whole application: everything the extension does not
     # touch — unaccelerated mined loops *and* the cycles A1 never mined — runs
     # at its original speed and bounds the result.
@@ -419,13 +633,25 @@ def estimate(spec: state_def.ISASpec,
         wpb = work_per_beat(c.words, c.mac_ops)
         lines.append(
             f"  {c.mnemonic}: {c.cycles:.0f} cyc "
-            f"({c.beats} beats, {c.mac_ops} MAC, {wpb:.2f} MAC/word)"
+            f"({c.beats} beats, {c.mac_ops} MAC, {wpb:.2f} MAC/word"
+            + (f", x{c.invocations:,.0f} per call" if c.invocations > 1 else "")
+            + ")"
             + (f" + {c.marshal_cycles:.0f} marshalling" if c.marshal_cycles else "")
             + (f" vs {c.replaced_cycles:.0f} cyc of software = {c.speedup:.2f}x"
                if c.replaced_cycles else "")
             + (f" — {c.note}" if c.note else ""))
+    unverified = [c.unverified for c in costs if c.unverified]
+    if unverified:
+        lines.append("")
+        lines.append("**This prediction rests on an unverified declaration.** "
+                     "Gate 3 measures everything else it uses — the software "
+                     "cost from the profile, the instruction's work from its own "
+                     "C model — but not this:")
+        for u in unverified:
+            lines.append(f"  - {u}")
     return SpeedupEstimate(per_instruction=costs, covered_share=covered,
-                           app_speedup=app_speedup, detail="\n".join(lines))
+                           app_speedup=app_speedup, detail="\n".join(lines),
+                           unverified=unverified)
 
 
 def render_feedback(est: SpeedupEstimate, target: float = SPEEDUP_TARGET,
