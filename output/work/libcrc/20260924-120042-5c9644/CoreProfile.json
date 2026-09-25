@@ -1,0 +1,36 @@
+{
+  "area_note": "Extremely small, area-optimized core (~750-1000 LUTs). A 16-word (512-bit) buffer would be huge relative to the baseline core.",
+  "constraints": [
+    "The PCPI coprocessor interface cannot access memory; it has no address or data buses.",
+    "Any memory operands must be explicitly loaded into GPRs by the core before being passed to a custom instruction.",
+    "A custom instruction can return at most one 32-bit value to the register file per invocation.",
+    "The core completely stalls until the coprocessor asserts pcpi_ready; pipelining for throughput inside the coprocessor is useless.",
+    "Internal state inside the coprocessor is possible, but feeding or draining it must be done 32 bits at a time via standard registers."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI). Provides pcpi_insn, pcpi_rs1, pcpi_rs2 and accepts pcpi_wr, pcpi_rd, pcpi_ready, pcpi_wait.",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "A single 32-bit register value returned via pcpi_rd when pcpi_wr is asserted.",
+  "custom_opcode_space": [
+    "Any unassigned 32-bit opcode. Unrecognized opcodes trigger an internal trap which forwards the instruction directly to the PCPI interface."
+  ],
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 5,
+  "cycles_per_word_moved": 2,
+  "evidence": [
+    "picorv32/picorv32.v port list: PCPI ports include only instruction and register data, completely lacking memory signals.",
+    "picorv32/picorv32.v `cpu_state` parameters define a sequential state machine without pipeline stages.",
+    "picorv32/picorv32.v `instr_trap` logic intercepts CATCH_ILLINSN and forwards the instruction to PCPI.",
+    "picorv32/picorv32.v memory interface `mem_state` requires a minimum of 2 cycles to complete a word transfer (0->1->0)."
+  ],
+  "existing_units": [
+    "Multiplier: picorv32_pcpi_mul (sequential carry-save) or picorv32_pcpi_fast_mul (array)",
+    "Divider: picorv32_pcpi_div (sequential shift-subtract)",
+    "Barrel shifter (optional via BARREL_SHIFTER, otherwise sequential)"
+  ],
+  "isa": "RV32I or RV32IC with optional M extension (configurable via ENABLE_MUL, COMPRESSED_ISA)",
+  "memory_interface": "Native valid/ready interface (mem_valid, mem_ready, mem_addr, mem_wdata, mem_wstrb, mem_rdata) mapped to AXI4-Lite or Wishbone wrappers.",
+  "microarchitecture": "Multi-cycle, unpipelined state machine (states: fetch, ld_rs1, ld_rs2, exec, shift, stmem, ldmem). Instructions execute strictly sequentially.",
+  "name": "PicoRV32",
+  "register_file": "16 or 32 registers (ENABLE_REGS_16_31), implemented as distributed or block RAM. Up to 2 read ports (ENABLE_REGS_DUALPORT)."
+}

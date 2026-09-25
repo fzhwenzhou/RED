@@ -1,0 +1,146 @@
+{
+  "critic_rounds": 1,
+  "description": "Hardware acceleration for 8/16/32/64-bit CRC variants processing 4 bytes per invocation.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "void crc64_ecma_step32b_model(const uint32_t in[3], uint32_t out[3]) {\n    uint64_t crc = ((uint64_t)in[1] << 32) | in[0];\n    uint32_t data = in[2];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint64_t c = crc ^ ((uint64_t)val << 56);\n        for(int j=0; j<8; j++) {\n            uint64_t mask = (uint64_t)0 - (c >> 63);\n            c = (c << 1) ^ (0x42F0E1EBA9EA3693ull & mask);\n        }\n        crc = c;\n    }\n    out[0] = (uint32_t)crc;\n    out[1] = (uint32_t)(crc >> 32);\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 3,
+      "mnemonic": "crc64_ecma_step32b",
+      "name": "crc64_ecma_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint64_t crc = ((uint64_t)in[1] << 32) | in[0]; uint32_t data = in[2]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint64_t c = crc ^ ((uint64_t)val << 56); for(int j=0; j<8; j++) { uint64_t mask = (uint64_t)0 - (c >> 63); c = ((c << 1) & 0xFFFFFFFFFFFFFFFFull) ^ (0x42F0E1EBA9EA3693ull & mask); } crc = c; } out[0] = (uint32_t)crc; out[1] = (uint32_t)(crc >> 32); out[2] = 0;",
+      "replaces": "crc_64_ecma::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads a 64-bit CRC state from in[0..1] and 4 bytes of data from in[2]. Performs 4 bytes of CRC64-ECMA (poly 0x42F0E1EBA9EA3693) computation, writing the new 64-bit state to out[0..1] and padding out[2] with 0.",
+      "spike_model": "void crc64_ecma_step32b_iss(const uint32_t in[3], uint32_t out[3]) {\n    uint64_t crc = ((uint64_t)in[1] << 32) | in[0];\n    uint32_t data = in[2];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint64_t c = crc ^ ((uint64_t)val << 56);\n        for(int j=0; j<8; j++) {\n            uint64_t mask = (uint64_t)0 - (c >> 63);\n            c = ((c << 1) & 0xFFFFFFFFFFFFFFFFull) ^ (0x42F0E1EBA9EA3693ull & mask);\n        }\n        crc = c;\n    }\n    out[0] = (uint32_t)crc;\n    out[1] = (uint32_t)(crc >> 32);\n    out[2] = 0;\n}",
+      "words": 3
+    },
+    {
+      "c_model": "void crcccitt_step32b_model(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ ((uint16_t)val << 8);\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c >> 15);\n            c = (c << 1) ^ (0x1021 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 001 rd 0001011",
+      "funct3": "001",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 2,
+      "mnemonic": "crcccitt_step32b",
+      "name": "crcccitt_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint16_t crc = (uint16_t)in[0]; uint32_t data = in[1]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint16_t c = crc ^ ((uint16_t)val << 8); for(int j=0; j<8; j++) { uint16_t mask = (uint16_t)0 - (c >> 15); c = ((c << 1) & 0xFFFF) ^ (0x1021 & mask); } crc = c; } out[0] = crc; out[1] = 0;",
+      "replaces": "crc_ccitt_1d0f::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads a 16-bit CRC state from in[0] and 4 bytes of data from in[1]. Performs 4 bytes of CRC-CCITT (poly 0x1021) computation, writing the new 16-bit state to out[0] and padding out[1] with 0.",
+      "spike_model": "void crcccitt_step32b_iss(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ ((uint16_t)val << 8);\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c >> 15);\n            c = ((c << 1) & 0xFFFF) ^ (0x1021 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "words": 2
+    },
+    {
+      "c_model": "void crc32_step32b_model(const uint32_t in[2], uint32_t out[2]) {\n    uint32_t crc = in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint32_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint32_t mask = (uint32_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xEDB88320ul & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 010 rd 0001011",
+      "funct3": "010",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 2,
+      "mnemonic": "crc32_step32b",
+      "name": "crc32_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint32_t crc = in[0]; uint32_t data = in[1]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint32_t c = crc ^ val; for(int j=0; j<8; j++) { uint32_t mask = (uint32_t)0 - (c & 1); c = (c >> 1) ^ (0xEDB88320ul & mask); } crc = c; } out[0] = crc; out[1] = 0;",
+      "replaces": "crc_32::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads a 32-bit CRC state from in[0] and 4 bytes of data from in[1]. Performs 4 bytes of CRC32 (poly 0xEDB88320) right-shifting computation, writing the new 32-bit state to out[0] and padding out[1] with 0.",
+      "spike_model": "void crc32_step32b_iss(const uint32_t in[2], uint32_t out[2]) {\n    uint32_t crc = in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint32_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint32_t mask = (uint32_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xEDB88320ul & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "words": 2
+    },
+    {
+      "c_model": "void crc16_step32b_model(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xA001 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 011 rd 0001011",
+      "funct3": "011",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 2,
+      "mnemonic": "crc16_step32b",
+      "name": "crc16_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint16_t crc = (uint16_t)in[0]; uint32_t data = in[1]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint16_t c = crc ^ val; for(int j=0; j<8; j++) { uint16_t mask = (uint16_t)0 - (c & 1); c = (c >> 1) ^ (0xA001 & mask); } crc = c; } out[0] = crc; out[1] = 0;",
+      "replaces": "crc_16::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads a 16-bit CRC state from in[0] and 4 bytes of data from in[1]. Performs 4 bytes of CRC-16 (poly 0xA001) right-shifting computation, writing the new 16-bit state to out[0] and padding out[1] with 0.",
+      "spike_model": "void crc16_step32b_iss(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xA001 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "words": 2
+    },
+    {
+      "c_model": "void crcdnp_step32b_model(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xA6BC & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 100 rd 0001011",
+      "funct3": "100",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 2,
+      "mnemonic": "crcdnp_step32b",
+      "name": "crcdnp_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint16_t crc = (uint16_t)in[0]; uint32_t data = in[1]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint16_t c = crc ^ val; for(int j=0; j<8; j++) { uint16_t mask = (uint16_t)0 - (c & 1); c = (c >> 1) ^ (0xA6BC & mask); } crc = c; } out[0] = crc; out[1] = 0;",
+      "replaces": "crc_dnp::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads a 16-bit CRC state from in[0] and 4 bytes of data from in[1]. Performs 4 bytes of CRC-DNP (poly 0xA6BC) right-shifting computation, writing the new 16-bit state to out[0] and padding out[1] with 0.",
+      "spike_model": "void crcdnp_step32b_iss(const uint32_t in[2], uint32_t out[2]) {\n    uint16_t crc = (uint16_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint16_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint16_t mask = (uint16_t)0 - (c & 1);\n            c = (c >> 1) ^ (0xA6BC & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "words": 2
+    },
+    {
+      "c_model": "void crc8_step32b_model(const uint32_t in[2], uint32_t out[2]) {\n    uint8_t crc = (uint8_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint8_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint8_t mask = (uint8_t)0 - (c >> 7);\n            c = (c << 1) ^ (0x31 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 101 rd 0001011",
+      "funct3": "101",
+      "funct7": "0000000",
+      "invocations": 833,
+      "mac_ops": 0,
+      "marshal_words": 2,
+      "mnemonic": "crc8_step32b",
+      "name": "crc8_step32b",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint8_t crc = (uint8_t)in[0]; uint32_t data = in[1]; for(int i=0; i<4; i++) { uint8_t val = (data >> (i*8)) & 0xFF; uint8_t c = crc ^ val; for(int j=0; j<8; j++) { uint8_t mask = (uint8_t)0 - (c >> 7); c = ((c << 1) & 0xFF) ^ (0x31 & mask); } crc = c; } out[0] = crc; out[1] = 0;",
+      "replaces": "crc_8::for (a=0; a<num_bytes; a++)",
+      "semantics": "Reads an 8-bit CRC state from in[0] and 4 bytes of data from in[1]. Performs 4 bytes of CRC-8 (poly 0x31) left-shifting computation, writing the new 8-bit state to out[0] and padding out[1] with 0.",
+      "spike_model": "void crc8_step32b_iss(const uint32_t in[2], uint32_t out[2]) {\n    uint8_t crc = (uint8_t)in[0];\n    uint32_t data = in[1];\n    for(int i=0; i<4; i++) {\n        uint8_t val = (data >> (i*8)) & 0xFF;\n        uint8_t c = crc ^ val;\n        for(int j=0; j<8; j++) {\n            uint8_t mask = (uint8_t)0 - (c >> 7);\n            c = ((c << 1) & 0xFF) ^ (0x31 & mask);\n        }\n        crc = c;\n    }\n    out[0] = crc;\n    out[1] = 0;\n}",
+      "words": 2
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "CRC_Accel",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

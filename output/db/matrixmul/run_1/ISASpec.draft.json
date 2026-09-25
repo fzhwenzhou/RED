@@ -1,0 +1,36 @@
+{
+  "critic_rounds": 1,
+  "description": "Accelerates the floating-point matrix multiplication kernel using a 2-element dot-product instruction.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n#include <string.h>\n\nstatic inline uint32_t nan_canon(uint32_t u) {\n    uint32_t exp = (u >> 23) & 0xFFu;\n    uint32_t frac = u & 0x7FFFFFu;\n    uint32_t sign = u & 0x80000000u;\n    \n    uint32_t exp_nz = (exp | (0u - exp)) >> 31;\n    uint32_t exp_zero_mask = (exp_nz ^ 1u) * 0xFFFFFFFFu;\n    \n    uint32_t frac_nz = (frac | (0u - frac)) >> 31;\n    uint32_t frac_nz_mask = frac_nz * 0xFFFFFFFFu;\n    \n    uint32_t subnormal_mask = exp_zero_mask & frac_nz_mask;\n    \n    uint32_t exp_not_ff = exp ^ 0xFFu;\n    uint32_t exp_not_ff_nz = (exp_not_ff | (0u - exp_not_ff)) >> 31;\n    uint32_t exp_ff_mask = (exp_not_ff_nz ^ 1u) * 0xFFFFFFFFu;\n    \n    uint32_t nan_mask = exp_ff_mask & frac_nz_mask;\n    \n    uint32_t flushed = (u & ~subnormal_mask) | (sign & subnormal_mask);\n    uint32_t res = (flushed & ~nan_mask) | (0x7FC00000u & nan_mask);\n    \n    return res;\n}\n\nstatic inline float ftz(float f) {\n    uint32_t u;\n    memcpy(&u, &f, 4);\n    u = nan_canon(u);\n    float res;\n    memcpy(&res, &u, 4);\n    return res;\n}\n\nvoid fdot2_custom_model(const uint32_t in[5], uint32_t out[5]) {\n    float c, a0, a1, b0, b1;\n    \n    memcpy(&c,  &in[0], 4);\n    memcpy(&a0, &in[1], 4);\n    memcpy(&a1, &in[2], 4);\n    memcpy(&b0, &in[3], 4);\n    memcpy(&b1, &in[4], 4);\n    \n    c = ftz(c);\n    a0 = ftz(a0);\n    a1 = ftz(a1);\n    b0 = ftz(b0);\n    b1 = ftz(b1);\n    \n    float p0 = ftz(a0 * b0);\n    float sum1 = ftz(c + p0);\n    \n    float p1 = ftz(a1 * b1);\n    float sum2 = ftz(sum1 + p1);\n    \n    uint32_t res_u;\n    memcpy(&res_u, &sum2, 4);\n    res_u = nan_canon(res_u);\n    \n    out[0] = res_u;\n    out[1] = 0;\n    out[2] = 0;\n    out[3] = 0;\n    out[4] = 0;\n}",
+      "encoding": "0000110 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000110",
+      "invocations": 48,
+      "mac_ops": 2,
+      "marshal_words": 5,
+      "mnemonic": "fdot2_custom",
+      "name": "Float Dot Product 2",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "float c = as_float(in[0]);\nfloat a0 = as_float(in[1]);\nfloat a1 = as_float(in[2]);\nfloat b0 = as_float(in[3]);\nfloat b1 = as_float(in[4]);\n\n// Flush subnormals\nif (is_subnormal(c)) c = 0.0f;\nif (is_subnormal(a0)) a0 = 0.0f;\nif (is_subnormal(a1)) a1 = 0.0f;\nif (is_subnormal(b0)) b0 = 0.0f;\nif (is_subnormal(b1)) b1 = 0.0f;\n\nfloat p0 = a0 * b0;\nif (is_subnormal(p0)) p0 = 0.0f;\nfloat sum1 = c + p0;\nif (is_subnormal(sum1)) sum1 = 0.0f;\n\nfloat p1 = a1 * b1;\nif (is_subnormal(p1)) p1 = 0.0f;\nfloat sum2 = sum1 + p1;\nif (is_subnormal(sum2)) sum2 = 0.0f;\n\nif (is_nan(sum2)) sum2 = canon_nan();\n\nout[0] = as_uint32(sum2);\nout[1] = 0;\nout[2] = 0;\nout[3] = 0;\nout[4] = 0;\n\nrd = 0;",
+      "replaces": "multiply::hot",
+      "semantics": "This instruction computes a 2-element single-precision floating point dot product. The RED ABI expects `rs1` to be a pointer to a 5-word input block in memory, and `rs2` to be a pointer to a 5-word output block. The input block `in[0..4]` contains five 32-bit floating-point values: `in[0]` is the scalar accumulator `C`. `in[1]` and `in[2]` are elements from vector A. `in[3]` and `in[4]` are elements from vector B. The instruction computes `C = C + (A0 * B0) + (A1 * B1)` using standard round-to-nearest-even semantics, accumulating sequentially (`(C + A0*B0) + A1*B1`). To guarantee strictly constant-time hardware execution without an FPU, it explicitly flushes subnormal inputs and intermediate/output values to zero, canonizes NaNs, and silently discards all floating-point exceptions without modifying the FCSR. The computed single-precision float is written to `out[0]`. The remaining output words `out[1]` through `out[4]` are zero-padded. The architectural register `rd` is written with 0.",
+      "spike_model": "",
+      "words": 5
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "matrixmul_fdot",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

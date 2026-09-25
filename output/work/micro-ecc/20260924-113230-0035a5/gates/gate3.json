@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "predicted 1.79x over 47% of cycles (bar 1.42x; Amdahl caps this workload at 1.90x for the 47.3% it covers, so the bar is 75% of that rather than the 2.00x default, priced on the shipped spec)",
+  "gate": "gate3",
+  "passed": true
+}

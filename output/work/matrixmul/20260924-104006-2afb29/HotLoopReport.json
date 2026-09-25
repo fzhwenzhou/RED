@@ -1,0 +1,38 @@
+{
+  "coverage": 0.9990831589242889,
+  "loops": [
+    {
+      "body": "int multiply(Matrix *matrixA, Matrix *matrixB, Matrix *matrixC) {\n\n    // un-equal number of columns and rows yield an error value\n    if (matrixA->columns != matrixB->rows) {\n        return -1;\n    }\n\n    // set the result matrix's rows and columns numbers and initialize its elements to zero\n    setRowsColumns(matrixA->rows, matrixB->columns, matrixC);\n    clearMatrix(matrixC);\n\n    for (int i = 1; i <= matrixC->rows; i++) {\n        for (int j = 1; j <= matrixC->columns; j++) {\n            for (int k = 1; k <= matrixA->columns; k++) {\n                setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);\n            }\n        }\n    }\n\n    return 0;\n}",
+      "calls": 15000,
+      "cycle_share": 0.9662785846954888,
+      "dynamic_cycles": 143190000,
+      "function": "multiply",
+      "ir": "",
+      "loop_id": "multiply::hot",
+      "operand_stats": {},
+      "rank": 1,
+      "source_file": "",
+      "trip_count": 0
+    },
+    {
+      "body": "/* 9 definitions of main() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- test.c:3 ---- */\nint main(int argc, char const *argv[])\n{\n\n    static Matrix A, B, C;\n\n    setRowsColumns(2, 2, &A);\n    setRowsColumns(2, 2, &B);\n\n    setElement(1, 1, 2, &A);\n    setElement(1, 2, 1, &A);\n    setElement(2, 1, 0, &A);\n    setElement(2, 2, 3, &A);\n\n    setElement(1, 1, 1, &B);\n    setElement(1, 2, 0, &B);\n    setElement(2, 1, 1, &B);\n    setElement(2, 2, 2, &B);\n\n    multiply(&A, &B, &C);\n\n    return 0;\n}\n\n/* ---- firmware.c:7 ---- */\nvoid main()\n{\n  int z;\n  x1 = 50;\n  x2 = 50;\n\n  printf(\"hello\\n\");\n  z = (x1 + x2);\n  if (z == 100)\n    printf(\"TEST PASSED\\n\");\n  else\n    printf(\"TEST FAILED, z=%d\\n\", z);\n  exit(0);\n}\n\n/* ---- firmware.c:20 ---- */\nvoid main()\n{\n\tchar message[] = \"$Uryyb+Jbeyq!+Vs+lbh+pna+ernq+guvf+zrffntr+gura$gur+CvpbEI32+PCH\"\n\t\t\t\"+frrzf+gb+or+jbexvat+whfg+svar.$$++++++++++++++++GRFG+CNFFRQ!$$\";\n\tfor (int i = 0; message[i]; i++)\n\t\tswitch (message[i])\n\t\t{\n\t\tcase 'a' ... 'm':\n\t\tcase 'A' ... 'M':\n\t\t\tmessage[i] += 13;\n\t\t\tbreak;\n\t\tcase 'n' ... 'z':\n\t\tcase 'N' ... 'Z':\n\t\t\tmessage[i] -= 13;\n\t\t\tbreak;\n\t\tcase '$':\n\t\t\tmessage[i] = '\\n';\n\t\t\tbreak;\n\t\tcase '+':\n\t\t\tmessage[i] = ' ';\n\t\t\tbreak;\n\t\t}\n\tputs(message);\n}\n\n/* ---- firmware.c:51 ---- */\nvoid main()\n{\n\tfor (uint32_t counter = (2+4+32+64) << SHIFT_COUNTER_BITS;; counter++) {\n\t\tasm volatile (\"\" : : \"r\"(counter));\n\t\tif ((counter & ~(~0 << SHIFT_COUNTER_BITS)) == 0)\n\t\t\tgray(counter >> SHIFT_COUNTER_BITS);\n\t}\n}\n\n/* ---- firmware.c:20 ---- */\nvoid main()\n{\n\tchar message[] = \"$Uryyb+Jbeyq!+Vs+lbh+pna+ernq+guvf+zrffntr+gura$gur+CvpbEI32+PCH\"\n\t\t\t\"+frrzf+gb+or+jbexvat+whfg+svar.$$++++++++++++++++GRFG+CNFFRQ!$$\";\n\tfor (int i = 0; message[i]; i++)\n\t\tswitch (message[i])\n\t\t{\n\t\tcase 'a' ... 'm':\n\t\tcase 'A' ... 'M':\n\t\t\tmessage[i] += 13;\n\t\t\tbreak;\n\t\tcase 'n' ... 'z':\n\t\tcase 'N' ... 'Z':\n\t\t\tmessage[i] -= 13;\n\t\t\tbreak;\n\t\tcase '$':\n\t\t\tmessage[i] = '\\n';\n\t\t\tbreak;\n\t\tcase '+':\n\t\t\tmessage[i] = ' ';\n\t\t\tbreak;\n\t\t}\n\tputs(message);\n}\n\n/* ---- firmware.c:20 ---- */\nvoid main()\n{\n\tchar message[] = \"$Uryyb+Jbeyq!+Vs+lbh+pna+ernq+guvf+zrffntr+gura$gur+CvpbEI32+PCH\"\n\t\t\t\"+frrzf+gb+or+jbexvat+whfg+svar.$$++++++++++++++++GRFG+CNFFRQ!$$\";\n\tfor (int i = 0; message[i]; i++)\n\t\tswitch (message[i])\n\t\t{\n\t\tcase 'a' ... 'm':\n\t\tcase 'A' ... 'M':\n\t\t\tmessage[i] += 13;\n\t\t\tbreak;\n\t\tcase 'n' ... 'z':\n\t\tcase 'N' ... 'Z':\n\t\t\tmessage[i] -= 13;\n\t\t\tbreak;\n\t\tcase '$':\n\t\t\tmessage[i] = '\\n';\n\t\t\tbreak;\n\t\tcase '+':\n\t\t\tmessage[i] = ' ';\n\t\t\tbreak;\n\t\t}\n\tputs(message);\n}\n\n/* ---- firmware.c:666 ---- */\nvoid main()\n{\n\treg_leds = 31;\n\treg_uart_clkdiv = 104;\n\tprint(\"Booting..\\n\");\n\n\treg_leds = 63;\n\tset_flash_qspi_flag();\n\n\treg_leds = 127;\n\twhile (getchar_prompt(\"Press ENTER to continue..\\n\") != '\\r') { /* wait */ }\n\n\tprint(\"\\n\");\n\tprint(\"  ____  _          ____         ____\\n\");\n\tprint(\" |  _ \\\\(_) ___ ___/ ___|  ___  / ___|\\n\");\n\tprint(\" | |_) | |/ __/ _ \\\\___ \\\\ / _ \\\\| |\\n\");\n\tprint(\" |  __/| | (_| (_) |__) | (_) | |___\\n\");\n\tprint(\" |_|   |_|\\\\___\\\\___/____/ \\\\___/ \\\\____|\\n\");\n\tprint(\"\\n\");\n\n\tprint(\"Total memory: \");\n\tprint_dec(MEM_TOTAL / 1024);\n\tprint(\" KiB\\n\");\n\tprint(\"\\n\");\n\n\t//cmd_memtest(); // test overwrites bss and data memory\n\tprint(\"\\n\");\n\n\tcmd_print_spi_state();\n\tprint(\"\\n\");\n\n\twhile (1)\n\t{\n\t\tprint(\"\\n\");\n\n\t\tprint(\"Select an action:\\n\");\n\t\tprint(\"\\n\");\n\t\tprint(\"   [1] Read S\n/* ... truncated */\n\n/* ---- dhry_1.c:82 ---- */\n\nmain ()\n/*****/\n\n  /* main program, corresponds to procedures        */\n  /* Main and Proc_0 in the Ada version             */\n{\n        One_Fifty       Int_1_Loc;\n  REG   One_Fifty       Int_2_Loc;\n        One_Fifty       Int_3_Loc;\n  REG   char            Ch_Index;\n        Enumeration     Enum_Loc;\n        Str_30          Str_1_Loc;\n        Str_30          Str_2_Loc;\n  REG   int             Run_Index;\n  REG   int             Number_Of_Runs;\n\n  /* Initializations */\n\n  Next_Ptr_Glob = (Rec_Pointer) malloc (sizeof (Rec_Type));\n  Ptr_Glob = (Rec_Pointer) malloc (sizeof (Rec_Type));\n\n  Ptr_Glob->Ptr_Comp                    = Next_Ptr_Glob;\n  Ptr_Glob->Discr                       = Ident_1;\n  Ptr_Glob->variant.var_1.Enum_Comp     = Ident_3;\n  Ptr_Glob->variant.var_1.Int_Comp      = 40;\n  str\n/* ... truncated */\n\n/* ---- dhry_1_orig.c:68 ---- */\n\nmain ()\n/*****/\n\n  /* main program, corresponds to procedures        */\n  /* Main and Proc_0 in the Ada version             */\n{\n        One_Fifty       Int_1_Loc;\n  REG   One_Fifty       Int_2_Loc;\n        One_Fifty       Int_3_Loc;\n  REG   char            Ch_Index;\n        Enumeration     Enum_Loc;\n        Str_30          Str_1_Loc;\n        Str_30          Str_2_Loc;\n  REG   int             Run_Index;\n  REG   int             Number_Of_Runs;\n\n  /* Initializations */\n\n  Next_Ptr_Glob = (Rec_Pointer) malloc (sizeof (Rec_Type));\n  Ptr_Glob = (Rec_Pointer) malloc (sizeof (Rec_Type));\n\n  Ptr_Glob->Ptr_Comp                    = Next_Ptr_Glob;\n  Ptr_Glob->Discr                       = Ident_1;\n  Ptr_Glob->variant.var_1.Enum_Comp     = Ident_3;\n  Ptr_Glob->variant.var_1.Int_Comp      = 40;\n  str\n/* ... truncated */",
+      "calls": 1,
+      "cycle_share": 0.03280457422880016,
+      "dynamic_cycles": 4861214,
+      "function": "main",
+      "ir": "",
+      "loop_id": "main::hot",
+      "operand_stats": {},
+      "rank": 2,
+      "source_file": "",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20260924-104006-2afb29/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20260924-104006-2afb29/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    148187078
+  ],
+  "workload": "matrixmul"
+}

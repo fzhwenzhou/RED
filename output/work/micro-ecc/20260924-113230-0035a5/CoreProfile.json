@@ -1,0 +1,37 @@
+{
+  "area_note": "Extremely small size-optimized core. The entire core register file is 1024 flops. A custom 16-word operand buffer (512 flops) is massive relative to this core and would increase its size by a significant fraction.",
+  "constraints": [
+    "The PCPI coprocessor interface has no memory access capability.",
+    "All operands required by a custom instruction must be loaded from memory into core registers explicitly by standard load instructions before invocation.",
+    "A custom instruction can consume at most two 32-bit source registers (pcpi_rs1, pcpi_rs2) and produce at most one 32-bit result (pcpi_rd).",
+    "Given the core's minimal footprint, large internal memory buffers or excessive combinatorial logic in the coprocessor should be avoided."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI). Exposes ports pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2. The coprocessor receives the instruction and up to two register values. It DOES NOT have memory address or data ports and therefore cannot address memory by itself.",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "32 bits returned per instruction via pcpi_rd, enabled by pcpi_wr, and signaling completion via pcpi_ready.",
+  "custom_opcode_space": [
+    "Any opcode not natively decoded by the core will trigger instr_trap and be forwarded to the PCPI (e.g., standard custom0-3 spaces)."
+  ],
+  "cycles_per_alu_op": 4,
+  "cycles_per_load": 6,
+  "cycles_per_word_moved": 6,
+  "evidence": [
+    "picorv32 module parameters (ENABLE_MUL, COMPRESSED_ISA, ENABLE_DIV) establish the ISA support.",
+    "cpu_state FSM in picorv32.v proves the multi-cycle microarchitecture.",
+    "PCPI ports (pcpi_valid, pcpi_rs1, pcpi_rs2, pcpi_rd, pcpi_wr, pcpi_wait, pcpi_ready) entirely lack memory bus signals, proving the coprocessor cannot address memory.",
+    "instr_trap logic explicitly forwards unrecognized instructions to the PCPI if WITH_PCPI is enabled.",
+    "picorv32_regs definition shows the physical layout of the register file (max 2 read ports, 1 write port)."
+  ],
+  "existing_units": [
+    "picorv32_pcpi_mul (iterative multi-cycle shift-add multiplier)",
+    "picorv32_pcpi_fast_mul (DSP/array multiplier with 3-4 cycle latency)",
+    "picorv32_pcpi_div (iterative multi-cycle shift-subtract divider)",
+    "Barrel shifter (enabled via BARREL_SHIFTER, otherwise iterative shift)"
+  ],
+  "isa": "RV32I with configurable options for M (ENABLE_MUL, ENABLE_FAST_MUL, ENABLE_DIV) and C (COMPRESSED_ISA) extensions.",
+  "memory_interface": "Native 32-bit valid/ready multi-cycle handshake (mem_valid, mem_ready, mem_addr, mem_wdata, mem_wstrb, mem_rdata). Optional AXI4-Lite adapter (picorv32_axi_adapter) provided.",
+  "microarchitecture": "Multi-cycle FSM. Core transitions through cpu_state_fetch, cpu_state_ld_rs1, cpu_state_ld_rs2, cpu_state_exec, cpu_state_ldmem, cpu_state_stmem. Assuming single-cycle memory, ALU ops take ~3-4 cycles and loads ~5-6 cycles.",
+  "name": "PicoRV32",
+  "register_file": "16 or 32 32-bit registers (ENABLE_REGS_16_31). Has 2 read ports and 1 write port when ENABLE_REGS_DUALPORT is true, otherwise 1 read port."
+}

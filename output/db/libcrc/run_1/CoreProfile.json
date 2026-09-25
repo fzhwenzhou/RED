@@ -1,0 +1,35 @@
+{
+  "area_note": "Highly area-optimized, minimal core. The register file is just 1024 flops. Adding large buffers (e.g., 16 words / 512 bits) inside a custom instruction pays a massive area cost relative to the base machine.",
+  "constraints": [
+    "The PCPI coprocessor interface CANNOT address memory by itself. All operands in memory must be explicitly loaded into registers by base instructions.",
+    "Custom instructions can only return a single 32-bit result to the register file per invocation.",
+    "The core evaluates PCPI instructions sequentially; it stalls instruction fetch until `pcpi_ready` is asserted.",
+    "An instruction can read at most two 32-bit source registers per invocation."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI). The coprocessor decodes directly from `pcpi_insn`. It receives up to two source registers via `pcpi_rs1` and `pcpi_rs2`, and handshakes via `pcpi_wait` and `pcpi_ready`.",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "A single 32-bit register value (`pcpi_rd`) written to the register file when `pcpi_ready` and `pcpi_wr` are asserted.",
+  "custom_opcode_space": [
+    "Any 32-bit opcode not recognized by the base RV32I decoder triggers the PCPI interface if `WITH_PCPI` is enabled. Custom-0 through Custom-3 are fully available."
+  ],
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 5,
+  "cycles_per_word_moved": 2,
+  "evidence": [
+    "Parameters COMPRESSED_ISA, ENABLE_MUL, ENABLE_DIV in picorv32.v gate the base ISA features.",
+    "Multi-cycle execution is evident from cpu_state transitions (fetch -> ld_rs1 -> exec) in picorv32.v.",
+    "The lack of memory addressing signals on PCPI (only pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2, pcpi_wr, pcpi_rd, pcpi_wait, pcpi_ready are present).",
+    "picorv32_pcpi_mul and picorv32_pcpi_div examples confirm sequential, multi-cycle existing units."
+  ],
+  "existing_units": [
+    "Optional sequential shift-add Multiplier (`picorv32_pcpi_mul`) or fast DSP-based Multiplier (`picorv32_pcpi_fast_mul`)",
+    "Optional sequential multi-cycle Divider (`picorv32_pcpi_div`)",
+    "Optional Barrel Shifter (if disabled, shifts take 1 cycle per bit)"
+  ],
+  "isa": "RV32I with optional M (multi-cycle or fast) and C (compressed) extensions.",
+  "memory_interface": "Valid/Ready handshake (`mem_valid`, `mem_ready`) with 32-bit address/data and 4-bit write strobe. The PCPI coprocessor has no access to this interface.",
+  "microarchitecture": "Multi-cycle state machine (fetch, decode/read, execute, memory, writeback). Typical ALU instructions take 3-4 cycles minimum.",
+  "name": "picorv32",
+  "register_file": "32 registers of 32 bits. Dual-port read is parameterizable and enabled by default."
+}

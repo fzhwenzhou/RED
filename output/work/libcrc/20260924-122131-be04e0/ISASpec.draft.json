@@ -1,0 +1,80 @@
+{
+  "critic_rounds": 1,
+  "description": "Custom instructions to accelerate CRC-64-ECMA, CRC-32, and CRC-16.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\nvoid crc64_ecma_step_model(const uint32_t in[3], uint32_t out[3]) {\n    uint64_t crc = ((uint64_t)in[1] << 32) | in[0];\n    uint32_t data = in[2];\n    for (int i = 0; i < 4; i++) {\n        uint64_t byte = (data >> (i * 8)) & 0xFF;\n        crc = crc ^ (byte << 56);\n        for (int b = 0; b < 8; b++) {\n            uint64_t mask = (uint64_t)0 - ((crc >> 63) & 1);\n            crc = (crc << 1) ^ (0x42F0E1EBA9EA3693ull & mask);\n        }\n    }\n    out[0] = (uint32_t)crc;\n    out[1] = (uint32_t)(crc >> 32);\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 1024,
+      "mac_ops": 0,
+      "marshal_words": 3,
+      "mnemonic": "crc64_ecma_step",
+      "name": "CRC-64 ECMA Step",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = (in[1] << 32) | in[0]; data = in[2]; for i in 0..3 { byte = (data >> (i*8)) & 0xFF; crc ^= (byte << 56); for b in 0..7 { mask = -(crc >> 63); crc = (crc << 1) ^ (0x42F0E1EBA9EA3693 & mask); } } out[0] = crc & 0xFFFFFFFF; out[1] = crc >> 32; out[2] = 0;",
+      "replaces": "crc_64_ecma::hot",
+      "semantics": "Reads 2 words of CRC-64 state (low word then high word) and 1 word (4 bytes) of data from the input block. Computes the CRC-64 ECMA over the 4 bytes. Writes the updated 64-bit state to the first 2 words of the output block, and zeroes the 3rd word. The caller must pack the state and data into the 3-word block.",
+      "spike_model": "",
+      "words": 3
+    },
+    {
+      "c_model": "#include <stdint.h>\nvoid crc32_step_model(const uint32_t in[3], uint32_t out[3]) {\n    uint32_t crc = in[0];\n    for (int w = 0; w < 2; w++) {\n        uint32_t data = in[w + 1];\n        for (int i = 0; i < 4; i++) {\n            uint32_t byte = (data >> (i * 8)) & 0xFF;\n            crc = crc ^ byte;\n            for (int b = 0; b < 8; b++) {\n                uint32_t mask = (uint32_t)0 - (crc & 1);\n                crc = (crc >> 1) ^ (0xEDB88320 & mask);\n            }\n        }\n    }\n    out[0] = crc;\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 001 rd 0001011",
+      "funct3": "001",
+      "funct7": "0000000",
+      "invocations": 512,
+      "mac_ops": 0,
+      "marshal_words": 3,
+      "mnemonic": "crc32_step",
+      "name": "CRC-32 Step",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = in[0]; for w in 0..1 { data = in[w+1]; for i in 0..3 { byte = (data >> (i*8)) & 0xFF; crc ^= byte; for b in 0..7 { mask = -(crc & 1); crc = (crc >> 1) ^ (0xEDB88320 & mask); } } } out[0] = crc; out[1] = 0; out[2] = 0;",
+      "replaces": "crc_32::hot",
+      "semantics": "Reads 1 word of CRC-32 state and 2 words (8 bytes) of data from the input block. Computes the CRC-32 over the 8 bytes. Writes the updated 32-bit state to the first word of the output block, and zeroes the remaining words. The caller must pack the state and data into the 3-word block.",
+      "spike_model": "",
+      "words": 3
+    },
+    {
+      "c_model": "#include <stdint.h>\nvoid crc16_step_model(const uint32_t in[3], uint32_t out[3]) {\n    uint32_t crc = in[0] & 0xFFFF;\n    for (int w = 0; w < 2; w++) {\n        uint32_t data = in[w + 1];\n        for (int i = 0; i < 4; i++) {\n            uint32_t byte = (data >> (i * 8)) & 0xFF;\n            crc = crc ^ byte;\n            for (int b = 0; b < 8; b++) {\n                uint32_t mask = (uint32_t)0 - (crc & 1);\n                crc = (crc >> 1) ^ (0xA001 & mask);\n            }\n        }\n    }\n    out[0] = crc;\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 010 rd 0001011",
+      "funct3": "010",
+      "funct7": "0000000",
+      "invocations": 512,
+      "mac_ops": 0,
+      "marshal_words": 3,
+      "mnemonic": "crc16_step",
+      "name": "CRC-16 Step",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "crc = in[0] & 0xFFFF; for w in 0..1 { data = in[w+1]; for i in 0..3 { byte = (data >> (i*8)) & 0xFF; crc ^= byte; for b in 0..7 { mask = -(crc & 1); crc = (crc >> 1) ^ (0xA001 & mask); } } } out[0] = crc; out[1] = 0; out[2] = 0;",
+      "replaces": "crc_16::hot",
+      "semantics": "Reads 1 word of CRC-16 state and 2 words (8 bytes) of data from the input block. Computes the CRC-16 over the 8 bytes. Writes the updated 16-bit state (zero-extended) to the first word of the output block, and zeroes the remaining words. The caller must pack the state and data into the 3-word block.",
+      "spike_model": "",
+      "words": 3
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "CRC_Extensions",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

@@ -1,0 +1,36 @@
+{
+  "critic_rounds": 0,
+  "description": "Accelerates floating-point matrix multiplication with a sequential, constant-time single-element multi-cycle multiply-accumulate instruction. This acts as an inner loop accelerator relying on the host CPU for outer loops and address generation.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n#include <string.h>\n\nstatic uint32_t ftz_u32(uint32_t bits) {\n    uint32_t exp = (bits >> 23) & 0xFF;\n    uint32_t exp_is_zero = (exp - 1) >> 31;\n    uint32_t mask = 0xFFFFFFFF ^ (exp_is_zero * 0x7FFFFFFF);\n    return bits & mask;\n}\n\nstatic float ftz_f32(float x) {\n    uint32_t bits;\n    memcpy(&bits, &x, 4);\n    bits = ftz_u32(bits);\n    memcpy(&x, &bits, 4);\n    return x;\n}\n\nstatic uint32_t canon_nan(float x) {\n    uint32_t bits;\n    memcpy(&bits, &x, 4);\n    uint32_t exp = (bits >> 23) & 0xFF;\n    uint32_t frac = bits & 0x7FFFFF;\n    uint32_t is_nan = (exp == 0xFF) & (frac != 0);\n    uint32_t m = (uint32_t)0 - is_nan;\n    return (0x7FC00000 & m) | (bits & ~m);\n}\n\nvoid fmac_custom_model(const uint32_t in[3], uint32_t out[3]) {\n    float a, b, c;\n    uint32_t tmp;\n\n    tmp = ftz_u32(in[0]); memcpy(&a, &tmp, 4);\n    tmp = ftz_u32(in[1]); memcpy(&b, &tmp, 4);\n    tmp = ftz_u32(in[2]); memcpy(&c, &tmp, 4);\n\n    float p = ftz_f32(a * b);\n    uint32_t p_bits = canon_nan(p);\n    memcpy(&p, &p_bits, 4);\n\n    float s = ftz_f32(c + p);\n    uint32_t s_bits = canon_nan(s);\n\n    out[0] = ftz_u32(s_bits);\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0101011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 191,
+      "mac_ops": 1,
+      "marshal_words": 4,
+      "mnemonic": "fmac_custom",
+      "name": "fmac_custom",
+      "opcode": "custom-1",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "a = ftz(in[0])\nb = ftz(in[1])\nc = ftz(in[2])\np = canon_nan(ftz(a * b))\nres = canon_nan(ftz(c + p))\nout[0] = res\nout[1] = 0\nout[2] = 0\nrd = 0",
+      "replaces": "multiply::loop",
+      "semantics": "The instruction operates on a 3-word input memory block pointed to by rs1 and a 3-word output memory block pointed to by rs2. The input block contains three 32-bit floats: a (matrixA element), b (matrixB element), and c (matrixC accumulator), in that order. It acts as an inner loop accelerator, relying on the host CPU for outer loops and address generation. The instruction computes a single floating-point multiply-accumulate sequentially over multiple cycles to satisfy strict core area constraints: res = c + (a * b). Input subnormals are flushed to zero (FTZ) prior to arithmetic. The hardware implementation is strictly constant-time, taking a fixed number of cycles independent of the operand values, and discards floating-point exceptions. After every floating-point operation (the multiplication and the addition), any NaN result is explicitly canonicalized to the RISC-V canonical NaN (0x7FC00000). The 32-bit float result is written to the first word of the output block. The remaining 2 words of the output block are zero-padded. The instruction writes 0 to the architectural register rd.",
+      "spike_model": "namespace {\n    inline uint32_t float_to_bits(float f) {\n        uint32_t b;\n        std::memcpy(&b, &f, 4);\n        return b;\n    }\n\n    inline float bits_to_float(uint32_t b) {\n        float f;\n        std::memcpy(&f, &b, 4);\n        return f;\n    }\n\n    inline uint32_t nz_mask(uint32_t x) {\n        uint32_t sign = (x | (0u - x)) >> 31;\n        return 0u - sign;\n    }\n\n    inline uint32_t z_mask(uint32_t x) {\n        return ~nz_mask(x);\n    }\n\n    inline uint32_t ftz_bits(uint32_t bits) {\n        uint32_t exp = (bits >> 23) & 0xFF;\n        uint32_t m = z_mask(exp);\n        return (bits & ~m) | ((bits & 0x80000000) & m);\n    }\n\n    inline uint32_t canon_nan_bits(uint32_t bits) {\n        uint32_t exp = (bits >> 23) & 0xFF;\n        uint32_t frac = bits & 0x7FFFFF;\n        uint32_t is_ff_exp_mask = z_mask(exp ^ 0xFF);\n        uint32_t is_frac_nz_mask = nz_mask(frac);\n        uint32_t m = is_ff_exp_mask & is_frac_nz_mask;\n        return (0x7FC00000 & m) | (bits & ~m);\n    }\n}\n\nvoid fmac_custom_iss(const uint32_t in[3], uint32_t out[3]) {\n    uint32_t a_bits = ftz_bits(in[0]);\n    uint32_t b_bits = ftz_bits(in[1]);\n    uint32_t c_bits = ftz_bits(in[2]);\n\n    float a = bits_to_float(a_bits);\n    float b = bits_to_float(b_bits);\n    float c = bits_to_float(c_bits);\n\n    float p_f = a * b;\n    uint32_t p_bits = float_to_bits(p_f);\n    p_bits = ftz_bits(p_bits);\n    p_bits = canon_nan_bits(p_bits);\n\n    float p = bits_to_float(p_bits);\n    float res_f = c + p;\n    uint32_t res_bits = float_to_bits(res_f);\n    res_bits = ftz_bits(res_bits);\n    res_bits = canon_nan_bits(res_bits);\n\n    out[0] = res_bits;\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "words": 3
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "Float Matrix Multiply Extension",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.2"
+}

@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "148,186,977 instructions, 99.9% in the project's own code, 0.00% drift",
+  "gate": "gate0",
+  "passed": true
+}

@@ -1,0 +1,23 @@
+# RED run_1 — matrixmul
+
+- model: `gemini:gemini-3.1-pro-preview` (project `project-160a0199-6b4a-464c-86a`)
+- result: **converged (A1+A2)**
+- A2 rounds: 3
+- Gate 0 (workload): PASS 96,210,136 instructions, 99.9% in the project's own code, 0.00% drift
+    - matrixmul_workload.c: 96,210,136 instructions, 99.9% in the project's own code
+    - drives: multiply, main
+- Gate 1 (re-profile ±5%): PASS runs 96210136 vs 96210136 cycles (0.00% vs ±5%)
+- Gate 2 (C model vs Spike): PASS 1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors
+- Gate 3 (predicted speedup): PASS predicted 2.56x over 99% of cycles (bar 2.00x, priced on the shipped spec)
+- Gate 4 (security): PASS 13 checks over 512 adversarial vectors per model: 0 mechanically confirmed blocking, 0 advisory
+- coverage: 99.22% (80% target)
+- spec review: 0 blocking, 5 total (implementability, benefit, legality)
+    - [major] fmac_custom: The floating-point MAC duplicates core multiplier hardware and consumes significant area for a minimalist core.
+    - [major] fmac_custom: Instruction latency is heavily dominated by moving operands over the memory bus rather than computing the arithmetic.
+    - [major] fmac_custom: The C model and pseudocode flush the intermediate and final arithmetic results to zero, which contradicts the prose that specifies only input subnormals are flushed.
+    - [major] fmac_custom: The instruction replaces a single inner loop statement rather than the whole kernel, incurring heavy marshalling overhead on every iteration.
+- verification edges:
+- PASS link1: coverage 99.22% >= 80%; 1/1 C models built and survived 100,000 vectors under ASan+UBSan
+- PASS link2: 1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors
+- ISASpec: Float Matrix Multiply Extension (1 instructions)
+  - `fmac_custom` (custom-1, 3x32b): The instruction operates on a 3-word input memory block pointed to by rs1 and a 3-word output memory block pointed to by rs2. The input block contains three 32-bit floats: a (matrixA element), b (matrixB element), and c (matrixC accumulator), in that order. It acts as an inner loop accelerator, relying on the host CPU for outer loops and address generation. The instruction computes a single floating-point multiply-accumulate sequentially over multiple cycles to satisfy strict core area constraints: res = c + (a * b). Input subnormals are flushed to zero (FTZ) prior to arithmetic. The hardware implementation is strictly constant-time, taking a fixed number of cycles independent of the operand values, and discards floating-point exceptions. After every floating-point operation (the multiplication and the addition), any NaN result is explicitly canonicalized to the RISC-V canonical NaN (0x7FC00000). The 32-bit float result is written to the first word of the output block. The remaining 2 words of the output block are zero-padded. The instruction writes 0 to the architectural register rd.

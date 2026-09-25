@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "predicted 6.25x over 100% of cycles (bar 2.00x)",
+  "gate": "gate3",
+  "passed": true
+}

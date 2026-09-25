@@ -1,0 +1,49 @@
+{
+  "findings": [
+    {
+      "evidence": "Implementing a sequential FP MAC on the PCPI interface requires instantiating a new 24x24 mantissa multiplier because PCPI coprocessors cannot access the core's internal 32x32 multiplier. Combined with 192 bits of state for the operand buffers (3 words in, 3 words out), this coprocessor adds a very large area footprint to the area-optimized PicoRV32 core.",
+      "finding": "The floating-point MAC duplicates core multiplier hardware and consumes significant area for a minimalist core.",
+      "fix": "Accept the high area penalty if FP precision is strictly required, or redesign the algorithm to use integer/fixed-point arithmetic to leverage the core's existing integer instructions without hardware duplication.",
+      "instruction": "fmac_custom",
+      "reviewer": "implementability",
+      "severity": "major"
+    },
+    {
+      "evidence": "With words=3, each invocation moves 6 operand words over the bus, costing 12 cycles of traffic plus 28 cycles of fixed PCPI issue overhead (40 cycles total). This massive overhead is paid to execute just a single multi-cycle floating-point MAC (mac_ops=1), resulting in extremely low arithmetic throughput per cycle.",
+      "finding": "Instruction latency is heavily dominated by moving operands over the memory bus rather than computing the arithmetic.",
+      "fix": "Increase the amount of arithmetic per operand word moved, for example by computing multiple MACs over a larger contiguous block if the matrix memory layout permits, to amortize the 28-cycle issue overhead.",
+      "instruction": "fmac_custom",
+      "reviewer": "implementability",
+      "severity": "major"
+    },
+    {
+      "evidence": "The C model uses `ftz_f32(a * b)` and `ftz_f32(c + p)`, flushing output subnormals to zero, while the semantics state 'Input subnormals are flushed to zero (FTZ) prior to arithmetic' and do not mention output subnormals. This causes a Gate 2 ambiguity failure.",
+      "finding": "The C model and pseudocode flush the intermediate and final arithmetic results to zero, which contradicts the prose that specifies only input subnormals are flushed.",
+      "fix": "Update the semantics prose to explicitly state that the intermediate product and final result are also flushed to zero, or remove the ftz calls on the arithmetic results in the C model and pseudocode.",
+      "instruction": "fmac_custom",
+      "reviewer": "benefit+legality",
+      "severity": "major"
+    },
+    {
+      "evidence": "With 191 invocations per call and `marshal_words=4`, the CPU spends nearly half the instruction's total latency just marshalling the scalar operands into and out of the memory buffer.",
+      "finding": "The instruction replaces a single inner loop statement rather than the whole kernel, incurring heavy marshalling overhead on every iteration.",
+      "fix": "Consider an instruction that processes a larger tile or a full row/column dot product to amortize the 28-cycle issue overhead and marshalling costs.",
+      "instruction": "fmac_custom",
+      "reviewer": "benefit",
+      "severity": "major"
+    },
+    {
+      "evidence": "Because the RED ABI requires the output block to match the input block's size (3 words), the instruction pads the single 32-bit float result with two 0 words.",
+      "finding": "The instruction writes 2 words of unused zeros to memory on every invocation, wasting memory bandwidth.",
+      "fix": "This is acceptable due to ABI limitations, but highlights the inherent inefficiency of using block memory access for scalar operations.",
+      "instruction": "fmac_custom",
+      "reviewer": "benefit",
+      "severity": "minor"
+    }
+  ],
+  "reviewers": [
+    "implementability",
+    "benefit",
+    "legality"
+  ]
+}

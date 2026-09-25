@@ -1,0 +1,23 @@
+{
+  "app_speedup": 1.7912687941121894,
+  "covered_share": 0.47300408475544875,
+  "detail": "covers 47.3% of profiled cycles; predicted whole-application speedup 1.79x\n  secp256r1.mult: 329 cyc (32 beats, 64 MAC, 2.00 MAC/word) + 413 marshalling vs 11225 cyc of software = 15.13x",
+  "measurement_error": "",
+  "per_instruction": [
+    {
+      "beats": 32,
+      "cycles": 329.2,
+      "invocations": 1,
+      "mac_ops": 64,
+      "marshal_cycles": 412.8,
+      "mnemonic": "secp256r1.mult",
+      "note": "",
+      "replaced_cycles": 11224.69,
+      "replaces": "uECC_vli_mult",
+      "speedup": 15.127614555256065,
+      "unverified": "",
+      "words": 16
+    }
+  ],
+  "unverified": []
+}

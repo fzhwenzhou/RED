@@ -1,0 +1,25 @@
+{
+  "coverage": 0.9974841268520188,
+  "loops": [
+    {
+      "body": "int multiply(Matrix *matrixA, Matrix *matrixB, Matrix *matrixC) {\n\n    // un-equal number of columns and rows yield an error value\n    if (matrixA->columns != matrixB->rows) {\n        return -1;\n    }\n\n    // set the result matrix's rows and columns numbers and initialize its elements to zero\n    setRowsColumns(matrixA->rows, matrixB->columns, matrixC);\n    clearMatrix(matrixC);\n\n    for (int i = 1; i <= matrixC->rows; i++) {\n        for (int j = 1; j <= matrixC->columns; j++) {\n            for (int k = 1; k <= matrixA->columns; k++) {\n                setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);\n            }\n        }\n    }\n\n    return 0;\n}",
+      "calls": 10000,
+      "cycle_share": 0.9974841268520188,
+      "dynamic_cycles": 95460000,
+      "function": "multiply",
+      "ir": "",
+      "loop_id": "multiply::hot",
+      "operand_stats": {},
+      "rank": 1,
+      "source_file": "",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20260924-120615-2d4e1a/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20260924-120615-2d4e1a/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    95700771
+  ],
+  "workload": "matrixmul"
+}

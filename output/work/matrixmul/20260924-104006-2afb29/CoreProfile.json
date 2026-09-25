@@ -1,0 +1,35 @@
+{
+  "area_note": "PicoRV32 is optimized for minimum area. The core's entire state (registers + control) is very small. A 16-word hardware operand buffer is ~512 flops, which represents a massive area increase for a core whose register file is only 1024 flops.",
+  "constraints": [
+    "The PCPI coprocessor interface CANNOT access memory. It has no memory address or data signals.",
+    "A custom PCPI instruction takes exactly two 32-bit register inputs (pcpi_rs1, pcpi_rs2) and returns exactly one 32-bit register output (pcpi_rd).",
+    "To process memory data, the core must execute explicit load instructions to fetch data into registers, then pass those registers to PCPI.",
+    "The PCPI interface is blocking; asserting pcpi_wait stalls the main CPU until pcpi_ready is asserted."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI)",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "32 bits returned per instruction via pcpi_rd, optionally written to the destination register if pcpi_wr is asserted.",
+  "custom_opcode_space": [
+    "Any opcode that is not decoded by the base ISA triggers the PCPI coprocessor interface if WITH_PCPI is enabled (e.g., custom-0 through custom-3, excluding some 0x0B space used for IRQs)."
+  ],
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 5,
+  "cycles_per_word_moved": 1,
+  "evidence": [
+    "picorv32.v: `parameter COMPRESSED_ISA`, `ENABLE_MUL` show base RV32I with optional extensions.",
+    "picorv32.v: `cpu_state_fetch`, `cpu_state_ld_rs1`, `cpu_state_exec` define a multi-cycle state machine.",
+    "picorv32.v: PCPI ports (`pcpi_valid`, `pcpi_insn`, `pcpi_rs1`, `pcpi_rs2`, `pcpi_wr`, `pcpi_rd`) show only register-level data exchange.",
+    "picorv32.v: `instr_trap` falls back to PCPI, meaning any unused opcode goes to the coprocessor."
+  ],
+  "existing_units": [
+    "Multiplier (sequential shift-and-add unless ENABLE_FAST_MUL is set, which uses a DSP array)",
+    "Divider (sequential shift-and-subtract)",
+    "Shifter (sequential or single-cycle depending on BARREL_SHIFTER)"
+  ],
+  "isa": "RV32I (with parameterized support for M, C, and custom IRQs)",
+  "memory_interface": "Native 32-bit valid/ready memory interface (with adapters for AXI4-Lite/Wishbone).",
+  "microarchitecture": "Multi-cycle non-pipelined state machine (Fetch -> Decode/LD_RS1 -> Exec -> Mem).",
+  "name": "PicoRV32",
+  "register_file": "32 x 32-bit registers (optionally 16). Contains 2 read ports (if ENABLE_REGS_DUALPORT=1) and 1 write port."
+}

@@ -1,0 +1,36 @@
+{
+  "critic_rounds": 1,
+  "description": "Accelerates floating-point matrix multiplication with a constant-time 2-element dot product and accumulate instruction.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n#include <string.h>\n\nstatic uint32_t ftz_u32(uint32_t bits) {\n    uint32_t exp = (bits >> 23) & 0xFF;\n    uint32_t exp_is_zero = (exp - 1) >> 31;\n    uint32_t mask = 0xFFFFFFFF ^ (exp_is_zero * 0x7FFFFFFF);\n    return bits & mask;\n}\n\nstatic float ftz_f32(float x) {\n    uint32_t bits;\n    memcpy(&bits, &x, 4);\n    bits = ftz_u32(bits);\n    memcpy(&x, &bits, 4);\n    return x;\n}\n\nvoid fdot2_custom_model(const uint32_t in[5], uint32_t out[5]) {\n    float a0, a1, b0, b1, c;\n    uint32_t tmp;\n\n    tmp = ftz_u32(in[0]); memcpy(&a0, &tmp, 4);\n    tmp = ftz_u32(in[1]); memcpy(&a1, &tmp, 4);\n    tmp = ftz_u32(in[2]); memcpy(&b0, &tmp, 4);\n    tmp = ftz_u32(in[3]); memcpy(&b1, &tmp, 4);\n    tmp = ftz_u32(in[4]); memcpy(&c, &tmp, 4);\n\n    float p0 = ftz_f32(a0 * b0);\n    float p1 = ftz_f32(a1 * b1);\n    float s0 = ftz_f32(c + p0);\n    float res = ftz_f32(s0 + p1);\n\n    memcpy(&out[0], &res, 4);\n    out[0] = ftz_u32(out[0]);\n    out[1] = 0;\n    out[2] = 0;\n    out[3] = 0;\n    out[4] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0101011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 48,
+      "mac_ops": 2,
+      "marshal_words": 5,
+      "mnemonic": "fdot2_custom",
+      "name": "fdot2_custom",
+      "opcode": "custom-1",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "a0 = in[0]\na1 = in[1]\nb0 = in[2]\nb1 = in[3]\nc = in[4]\np0 = ftz(a0 * b0)\np1 = ftz(a1 * b1)\ns0 = ftz(c + p0)\nres = ftz(s0 + p1)\nout[0] = res\nout[1] = 0\nout[2] = 0\nout[3] = 0\nout[4] = 0\nrd = 0",
+      "replaces": "multiply::loop",
+      "semantics": "The instruction operates on an input memory block of 5 words pointed to by rs1, and an output memory block of 5 words pointed to by rs2. The input block contains five 32-bit floats: a0, a1, b0, b1, and c, in that order. The instruction flushes any subnormal input values to zero, and computes the dot product and addition: res = c + (a0 * b0) + (a1 * b1). It performs independent multiplications and additions with intermediate flush-to-zero and standard round-to-nearest rounding (not a fused multiply-add). The 32-bit float result is written to the first word of the output block, with subnormal results flushed to zero. The remaining 4 words of the output block are zero-padded. The instruction writes 0 to the architectural register rd. The hardware implementation is strictly constant-time, taking a fixed number of cycles independent of the operand values, and silently discards all floating-point exceptions.",
+      "spike_model": "",
+      "words": 5
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "Float Matrix Multiply Extension",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "13 checks over 512 adversarial vectors per model: 0 mechanically confirmed blocking, 0 advisory",
+  "gate": "gate4",
+  "passed": true
+}

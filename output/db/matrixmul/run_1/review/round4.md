@@ -1,0 +1,24 @@
+# Spec review
+
+Reviewers: implementability, callability, benefit, legality
+Findings: 4 blocking, 0 major, 0 minor
+
+## [BLOCKING] `imac_custom` — implementability
+**Finding.** The instruction duplicates the core's native 32-bit integer multiplier to compute a single MAC, and its latency is overwhelmingly dominated by operand movement.
+**Evidence.** The core already possesses an integer multiplier. Instantiating a second one in the PCPI coprocessor for a single scalar MAC wastes area. Furthermore, the 1 MAC of arithmetic is completely dwarfed by 40 cycles of execution overhead (28-cycle PCPI issue + 12 cycles to move 3 words in and out, including writing two words of zeros), yielding an extremely inefficient ratio of arithmetic to bus traffic.
+**Suggested fix.** Design an instruction that computes multiple MACs over the operand block (e.g., a dot product) to amortize the operand movement traffic and justify the coprocessor area, ensuring the operations are sequenced to respect the core's minimal area constraints.
+
+## [BLOCKING] `imac_custom` — callability
+**Finding.** The PCPI coprocessor lacks physical access to the core's native multiplier, forcing a redundant instantiation that violates the strict area constraint against duplicating existing functional units.
+**Evidence.** The spec justifies its area by claiming it "uses the core's native 32-bit sequential integer multiplier." However, the PCPI interface receives only register operands (`pcpi_rs1`, `pcpi_rs2`) and has no datapath to route data into the core's internal ALU. Implementing this instruction requires instantiating a second 32-bit multiplier in the PCPI module, explicitly violating the architectural constraint: "functional units already present (do not duplicate): Multiplier".
+**Suggested fix.** Acknowledge that the coprocessor must instantiate its own multiplier. To justify this area without acting as a redundant `MUL` instruction, redesign the extension to compute the entire 2x2 matrix product in one invocation. Explicitly specify the use of a single sequential multiplier in a state machine to resolve the previous reviewer's parallel area concern, amortizing the area cost by eliminating the workload's loop overhead.
+
+## [BLOCKING] `imac_custom` — benefit
+**Finding.** The instruction replaces an inner statement (a single MAC) rather than the whole kernel, which is invalid because a kernel replacement's C model must compute the kernel's full result.
+**Evidence.** The C model computes only `out[0] = in[2] + in[0] * in[1]`, but it claims to replace `multiply::hot`, which performs a complete 2x2 matrix product. Since `multiply::hot` covers 96.6% of cycles, Amdahl's law bounds the maximum whole-application speedup at ~29.4x, so a valid whole-kernel replacement is extremely valuable.
+**Suggested fix.** Fuse the inner statement into a whole-kernel instruction: set `invocations: 1`, set `words: 8` (to pass two 4-word matrices in the input block), compute the full 2x2 matrix multiplication in the C model, and set `mac_ops: 8` to model using the core's sequential integer multiplier without needing parallel hardware.
+
+## [BLOCKING] `imac_custom` — legality
+**Finding.** The instruction cannot functionally replace the `multiply::hot` function because it only performs a single scalar multiply-accumulate.
+**Evidence.** The `replaces` field targets `multiply::hot` (which computes a complete matrix product), but the `c_model` computes only `out[0] = in[2] + in[0] * in[1]`. Substituting a full matrix multiplication function with an instruction that computes only a single element leaves the rest of the matrix uncomputed, breaking the application.
+**Suggested fix.** Redesign the instruction to compute a complete 2x2 integer matrix multiplication. Have it read an 8-word input block (4 words of matrix A and 4 of matrix B) and write the 4-word result to the output block. To satisfy the core's strict area constraints, explicitly state in the semantics that the coprocessor uses a multi-cycle state machine to sequentially reuse a single integer multiplier.

@@ -1,0 +1,38 @@
+{
+  "area_note": "Extremely small, area-optimized core. The core's main state is just the 32-word register file. Adding a 16-word internal buffer in an extension would represent a massive area increase relative to the core size.",
+  "constraints": [
+    "The coprocessor interface (PCPI) cannot access memory. All memory operands must be explicitly loaded into registers by the core.",
+    "A custom instruction can accept at most two 32-bit register inputs per invocation.",
+    "A custom instruction can return at most one 32-bit register output per invocation.",
+    "Large internal buffers and arrays must be avoided; the extension's area footprint must be kept extremely small to match this minimalist core."
+  ],
+  "coprocessor": "Pico Co-Processor Interface (PCPI). Synchronous, stall-based handshake (valid, wait, ready signals).",
+  "coprocessor_issue_overhead": 3,
+  "coprocessor_memory_access": false,
+  "coprocessor_result": "One 32-bit value (pcpi_rd) and a write-enable signal (pcpi_wr).",
+  "custom_opcode_space": [
+    "Any unhandled or illegal opcode is forwarded to PCPI if WITH_PCPI=1.",
+    "custom-1 (0x2B), custom-2 (0x5B), custom-3 (0x7B) are completely free.",
+    "custom-0 (0x0B) is partially occupied by firmware IRQ handling instructions (getq, setq, maskirq)."
+  ],
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 4,
+  "cycles_per_word_moved": 4,
+  "evidence": [
+    "picorv32.v: 'PicoRV32 -- A Small RISC-V (RV32I) Processor Core'",
+    "picorv32.v: PCPI ports (pcpi_insn, pcpi_rs1, pcpi_rs2, pcpi_rd) provide exactly two inputs and one output, with no memory address or data ports.",
+    "picorv32.v: Core is driven by a multi-cycle state machine (cpu_state_fetch, cpu_state_ld_rs1, cpu_state_exec, cpu_state_ldmem) where instructions take multiple cycles to execute.",
+    "picorv32.v: The assign instr_trap logic routes unimplemented instructions to PCPI if WITH_PCPI is enabled.",
+    "custom_ops.S: Uses opcode 0b0001011 (custom-0) for getq, setq, retirq, maskirq, waitirq, timer."
+  ],
+  "existing_units": [
+    "Multiplier (configurable as multi-cycle shift-add or single-cycle array)",
+    "Divider (sequential shift-subtract)",
+    "Shifter (configurable as multi-cycle sequential or single-cycle barrel)"
+  ],
+  "isa": "RV32I with optional M (Multiply/Divide) and C (Compressed) extensions. Internal IRQ instructions use custom-0.",
+  "memory_interface": "Native simple valid/ready/wstrb interface, with provided AXI4-Lite and Wishbone adapters.",
+  "microarchitecture": "Multi-cycle, unpipelined state machine (fetch, decode/register read, execute, memory, writeback).",
+  "name": "PicoRV32",
+  "register_file": "32x32-bit registers. 2 read ports, 1 write port. Can be implemented as dual-port block RAM."
+}

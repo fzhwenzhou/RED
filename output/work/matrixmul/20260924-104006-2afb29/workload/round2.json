@@ -1,0 +1,21 @@
+{
+  "api": [
+    "multiply",
+    "main"
+  ],
+  "detail": "148,186,977 instructions, 99.9% in the project's own code, 0.00% run-to-run drift",
+  "drift": 0.0,
+  "dynamic_ir": 148186977,
+  "entry": "/home/naonao/RED/output/work/matrixmul/20260924-104006-2afb29/workload/r2/_red_workload.c",
+  "exit_code": 0,
+  "name": "",
+  "passes_gate0": true,
+  "project": "/home/naonao/RED/target_project/matrixmul",
+  "project_ir": 148051214,
+  "project_share": 0.99908383987076,
+  "rationale": "",
+  "runs": [
+    148186977,
+    148186977
+  ]
+}

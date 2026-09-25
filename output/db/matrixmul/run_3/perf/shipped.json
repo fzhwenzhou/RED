@@ -1,0 +1,23 @@
+{
+  "app_speedup": 2.55854307112741,
+  "covered_share": 0.9922031499882715,
+  "detail": "covers 99.2% of profiled cycles; predicted whole-application speedup 2.56x\n  fmac_custom: 61 cyc (6 beats, 1 MAC, 0.17 MAC/word, x191 per call) + 103 marshalling vs 425 cyc of software = 2.59x",
+  "measurement_error": "",
+  "per_instruction": [
+    {
+      "beats": 6,
+      "cycles": 61.0,
+      "invocations": 191,
+      "mac_ops": 1,
+      "marshal_cycles": 103.2,
+      "mnemonic": "fmac_custom",
+      "note": "",
+      "replaced_cycles": 425.321780104712,
+      "replaces": "multiply::loop",
+      "speedup": 2.5902666267034835,
+      "unverified": "",
+      "words": 3
+    }
+  ],
+  "unverified": []
+}

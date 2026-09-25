@@ -1,0 +1,29 @@
+{
+  "api": [
+    "crc_64_ecma",
+    "crc_dnp",
+    "crc_ccitt_1d0f",
+    "crc_16",
+    "crc_32",
+    "crc_8",
+    "main",
+    "init_crcdnp_tab",
+    "init_crcccitt_tab",
+    "init_crc16_tab"
+  ],
+  "detail": "260,227,924 instructions, 99.9% in the project's own code, 0.00% run-to-run drift",
+  "drift": 0.0,
+  "dynamic_ir": 260227924,
+  "entry": "/home/naonao/RED/output/work/libcrc/20260924-101157-3cedb4/workload/r1/_red_workload.c",
+  "exit_code": 0,
+  "name": "",
+  "passes_gate0": true,
+  "project": "/home/naonao/RED/target_project/libcrc",
+  "project_ir": 260086044,
+  "project_share": 0.999454785643988,
+  "rationale": "",
+  "runs": [
+    260227924,
+    260227924
+  ]
+}

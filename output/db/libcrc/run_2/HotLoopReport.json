@@ -1,0 +1,77 @@
+{
+  "coverage": 0.9988040051306487,
+  "loops": [
+    {
+      "body": "/* 2 definitions of crc_64_we() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- crc64.c:73 ---- */\n * The function crc_64_we() calculates in one pass the CRC64-WE 64 bit CRC\n * value for a byte string that is passed to the function together with a\n * parameter indicating the length.\n */\n\nuint64_t crc_64_we( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint64_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tcrc = CRC_START_64_WE;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc << 8) ^ crc_tab64[ ((crc >> 56) ^ (uint64_t) *ptr++) & 0x00000000000000FFull ];\n\t}\n\n\treturn crc ^ 0xFFFFFFFFFFFFFFFFull;\n\n}\n\n/* ---- crc64.c:78 ---- */\nuint64_t crc_64_we( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint64_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tcrc = CRC_START_64_WE;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc << 8) ^ crc_tab64[ ((crc >> 56) ^ (uint64_t) *ptr++) & 0x00000000000000FFull ];\n\t}\n\n\treturn crc ^ 0xFFFFFFFFFFFFFFFFull;\n\n}",
+      "calls": 200,
+      "cycle_share": 0.23227920003012462,
+      "dynamic_cycles": 131074200,
+      "function": "crc_64_we",
+      "ir": "",
+      "loop_id": "crc_64_we::hot",
+      "operand_stats": {},
+      "rank": 1,
+      "source_file": "",
+      "trip_count": 0
+    },
+    {
+      "body": "/* 2 definitions of crc_16() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- crc16.c:46 ---- */\n * The function crc_16() calculates the 16 bits CRC16 in one pass for a byte\n * string of which the beginning has been passed to the function. The number of\n * bytes to check is also a parameter. The number of the bytes in the string is\n * limited by the constant SIZE_MAX.\n */\n\nuint16_t crc_16( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint16_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tif ( ! crc_tab16_init ) init_crc16_tab();\n\n\tcrc = CRC_START_16;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab16[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n\t}\n\n\treturn crc;\n\n}\n\n/* ---- crc16.c:52 ---- */\nuint16_t crc_16( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint16_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tif ( ! crc_tab16_init ) init_crc16_tab();\n\n\tcrc = CRC_START_16;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab16[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n\t}\n\n\treturn crc;\n\n}",
+      "calls": 200,
+      "cycle_share": 0.20905238228569867,
+      "dynamic_cycles": 117967402,
+      "function": "crc_16",
+      "ir": "",
+      "loop_id": "crc_16::hot",
+      "operand_stats": {},
+      "rank": 2,
+      "source_file": "",
+      "trip_count": 0
+    },
+    {
+      "body": "/* 2 definitions of crc_ccitt_1d0f() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- crcccitt.c:60 ---- */\n * The function crc_ccitt_1d0f() performs a one-pass calculation of the CCITT\n * CRC for a byte string that has been passed as a parameter. The initial value\n * 0x1d0f is used for the CRC.\n */\n\nuint16_t crc_ccitt_1d0f( const unsigned char *input_str, size_t num_bytes ) {\n\n\treturn crc_ccitt_generic( input_str, num_bytes, CRC_START_CCITT_1D0F );\n\n}\n\n/* ---- crcccitt.c:65 ---- */\nuint16_t crc_ccitt_1d0f( const unsigned char *input_str, size_t num_bytes ) {\n\n\treturn crc_ccitt_generic( input_str, num_bytes, CRC_START_CCITT_1D0F );\n\n}",
+      "calls": 200,
+      "cycle_share": 0.20905238228569867,
+      "dynamic_cycles": 117967402,
+      "function": "crc_ccitt_1d0f",
+      "ir": "",
+      "loop_id": "crc_ccitt_1d0f::hot",
+      "operand_stats": {},
+      "rank": 3,
+      "source_file": "",
+      "trip_count": 0
+    },
+    {
+      "body": "/* 2 definitions of crc_32() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- crc32.c:47 ---- */\n * The function crc_32() calculates in one pass the common 32 bit CRC value for\n * a byte string that is passed to the function together with a parameter\n * indicating the length.\n */\n\nuint32_t crc_32( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint32_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tcrc = CRC_START_32;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n\t}\n\n\treturn (crc ^ 0xFFFFFFFFul);\n\n}\n\n/* ---- crc32.c:52 ---- */\nuint32_t crc_32( const unsigned char *input_str, size_t num_bytes ) {\n\n\tuint32_t crc;\n\tconst unsigned char *ptr;\n\tsize_t a;\n\n\tcrc = CRC_START_32;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n\t}\n\n\treturn (crc ^ 0xFFFFFFFFul);\n\n}",
+      "calls": 200,
+      "cycle_share": 0.20905166989349325,
+      "dynamic_cycles": 117967000,
+      "function": "crc_32",
+      "ir": "",
+      "loop_id": "crc_32::hot",
+      "operand_stats": {},
+      "rank": 4,
+      "source_file": "",
+      "trip_count": 0
+    },
+    {
+      "body": "/* 2 definitions of crc_8() \u2014 the build selects one by macro; match it to the workload's word size. */\n\n/* ---- crc8.c:69 ---- */\n * The function crc_8() calculates the 8 bit wide CRC of an input string of a\n * given length.\n */\n\nuint8_t crc_8( const unsigned char *input_str, size_t num_bytes ) {\n\n\tsize_t a;\n\tuint8_t crc;\n\tconst unsigned char *ptr;\n\n\tcrc = CRC_START_8;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = sht75_crc_table[(*ptr++) ^ crc];\n\t}\n\n\treturn crc;\n\n}\n\n/* ---- crc8.c:73 ---- */\nuint8_t crc_8( const unsigned char *input_str, size_t num_bytes ) {\n\n\tsize_t a;\n\tuint8_t crc;\n\tconst unsigned char *ptr;\n\n\tcrc = CRC_START_8;\n\tptr = input_str;\n\n\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = sht75_crc_table[(*ptr++) ^ crc];\n\t}\n\n\treturn crc;\n\n}",
+      "calls": 200,
+      "cycle_share": 0.13936837063563348,
+      "dynamic_cycles": 78645000,
+      "function": "crc_8",
+      "ir": "",
+      "loop_id": "crc_8::hot",
+      "operand_stats": {},
+      "rank": 5,
+      "source_file": "",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/libcrc/20260924-120042-5c9644/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/libcrc/20260924-120042-5c9644/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    564295899
+  ],
+  "workload": "libcrc"
+}

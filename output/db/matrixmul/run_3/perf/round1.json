@@ -1,0 +1,25 @@
+{
+  "app_speedup": 7.5092700561349295,
+  "covered_share": 0.9922031499882715,
+  "detail": "covers 99.2% of profiled cycles; predicted whole-application speedup 7.51x\n  fdot2_custom: 85 cyc (10 beats, 2 MAC, 0.20 MAC/word, x48 per call) + 129 marshalling vs 1692 cyc of software = 7.91x \u2014 its C model executes 50 instructions, of which 21 are not accounted for by mac_ops=2; charged as 3 sequential logic steps; invocations UNVERIFIED (~191 implied)\n\n**This prediction rests on an unverified declaration.** Gate 3 measures everything else it uses \u2014 the software cost from the profile, the instruction's work from its own C model \u2014 but not this:\n  - invocations=48 is the designer's declaration and RED cannot verify it: one call of multiply executes 9,546 host instructions against this model's 50, which is consistent with roughly 191 invocations, not 48. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+  "measurement_error": "",
+  "per_instruction": [
+    {
+      "beats": 10,
+      "cycles": 84.85002707092582,
+      "invocations": 48,
+      "mac_ops": 2,
+      "marshal_cycles": 129.0,
+      "mnemonic": "fdot2_custom",
+      "note": "its C model executes 50 instructions, of which 21 are not accounted for by mac_ops=2; charged as 3 sequential logic steps; invocations UNVERIFIED (~191 implied)",
+      "replaced_cycles": 1692.4262499999998,
+      "replaces": "multiply::loop",
+      "speedup": 7.914080129803711,
+      "unverified": "invocations=48 is the designer's declaration and RED cannot verify it: one call of multiply executes 9,546 host instructions against this model's 50, which is consistent with roughly 191 invocations, not 48. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+      "words": 5
+    }
+  ],
+  "unverified": [
+    "invocations=48 is the designer's declaration and RED cannot verify it: one call of multiply executes 9,546 host instructions against this model's 50, which is consistent with roughly 191 invocations, not 48. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?"
+  ]
+}

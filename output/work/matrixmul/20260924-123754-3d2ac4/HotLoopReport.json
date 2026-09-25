@@ -1,0 +1,25 @@
+{
+  "coverage": 0.9922031499882715,
+  "loops": [
+    {
+      "body": "    for (int i = 1; i <= matrixC->rows; i++) {\n        for (int j = 1; j <= matrixC->columns; j++) {\n            for (int k = 1; k <= matrixA->columns; k++) {\n                setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);\n            }\n        }\n    }",
+      "calls": 10000,
+      "cycle_share": 0.9922031499882715,
+      "dynamic_cycles": 95460000,
+      "function": "multiply",
+      "ir": "",
+      "loop_id": "multiply::loop",
+      "operand_stats": "Elements are 32-bit float, dimensions are 8-bit unsigned char. Innermost loop has a 1D sequential array access for matrixA, a strided access for matrixB, and an accumulation recurrence on a single element of matrixC. Indexing math includes integer multiplication and additions per iteration.",
+      "rank": 1,
+      "source_file": "matrixmul/matrixmul.h",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20260924-123754-3d2ac4/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20260924-123754-3d2ac4/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    96210136
+  ],
+  "workload": "matrixmul"
+}

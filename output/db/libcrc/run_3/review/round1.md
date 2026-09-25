@@ -1,0 +1,34 @@
+# Spec review
+
+Reviewers: implementability, callability, benefit, legality
+Findings: 0 blocking, 5 major, 1 minor
+
+## [MAJOR] spec-wide — implementability
+**Finding.** Implementing these 32- and 64-step bit-serial CRC loops combinationally to achieve zero latency would require hundreds of XOR gates, consuming a large fraction of this area-optimized core.
+**Evidence.** All instructions declare `mac_ops=0`, requesting single-cycle execution of 32 to 64 inner loop iterations. Unrolling a 64-step CRC logic combinationally creates massive XOR trees.
+**Suggested fix.** Build the CRC step sequentially to save area, and update `mac_ops` to 32 for crc64_ecma_step and 64 for crc32/crc16. The performance gate already proved the resulting ~100 cycle latency remains extremely profitable.
+
+## [MAJOR] `crc64_ecma_step` — implementability
+**Finding.** Latency is dominated by operand traffic rather than its arithmetic.
+**Evidence.** The instruction moves 3 words in and out (40 cycles of bus overhead) but only computes 4 bytes of data (32 bit-serial steps). Moving the operands takes longer than the arithmetic itself.
+**Suggested fix.** Increase the operand block to `words=4` to accept 2 words (8 bytes) of data per invocation, amortizing the 28-cycle fixed bus overhead across more arithmetic.
+
+## [MAJOR] `crc64_ecma_step` — benefit
+**Finding.** The declared 1024 invocations produce a cost of 40,990 cycles per call, giving a ratio of 0.066x against the 2723-cycle software kernel, incorrectly implying the instruction is slower.
+**Evidence.** Using the formula: cost = 28 + 2*(2*3) + 0 = 40 cycles. With 1024 invocations and 3 marshal_words, total cost is 40 * 1024 + 30 = 40,990 cycles. The ratio against 2723 software cycles is 0.066x (below 1.0). However, this instruction replaces an inner statement rather than the whole kernel; the fused version would loop over the input array, passing 4 bytes per call (`for (i=0; i<num_bytes/4; i++) { crc64_ecma_step(in, out); }`). A 2723-cycle software run processes roughly 32 bytes, meaning the true invocation count per call is ~8.
+**Suggested fix.** Reduce `invocations` to 8 to reflect the true number of times the inner loop runs per typical kernel call.
+
+## [MAJOR] `crc32_step` — benefit
+**Finding.** With 512 declared invocations, the instruction cost is 20,510 cycles per call, resulting in a ratio of 0.239x against the 4901-cycle software kernel.
+**Evidence.** Formula cost = 28 + 2*(2*3) + 0 = 40 cycles. Total cost = 40 * 512 + 30 = 20,510 cycles. Ratio vs 4901 cycles = 0.239x (below 1.0). This instruction replaces an inner statement; the fused version processes 8-byte chunks in a loop (`for (i=0; i<num_bytes/8; i++) { crc32_step(in, out); }`). The 4901-cycle software equivalent processes approximately 60 bytes, requiring only ~8 invocations rather than 512.
+**Suggested fix.** Update `invocations` to 8 to correctly model the average bytes processed per call.
+
+## [MAJOR] `crc16_step` — benefit
+**Finding.** The declared 512 invocations inflate the instruction cost to 20,510 cycles per call, giving a ratio of 0.239x compared to the 4901-cycle software kernel.
+**Evidence.** Formula cost = 40 cycles. 40 * 512 + 30 = 20,510 cycles. Ratio against 4901 cycles is 0.239x (below 1.0). It replaces an inner byte-wise loop; the fused version processes 8 bytes per iteration (`for (i=0; i<num_bytes/8; i++) { crc16_step(in, out); }`). The software's 4901 cycles correspond to a buffer of ~60 bytes, which needs about 8 invocations.
+**Suggested fix.** Set `invocations` to 8 to accurately represent the typical kernel call size.
+
+## [MINOR] spec-wide — benefit
+**Finding.** The whole-application speedup is bound by Amdahl's law to approximately 10.3x, confirming the extension is highly viable, though marshal_words are undercounted.
+**Evidence.** The extension covers 35.7% (`crc_64_ecma`), 32.1% (`crc_32`), and 32.1% (`crc_16`) of cycles. With corrected invocations (~8), the per-instruction speedups are ~7.3x, 13.6x, and 13.6x. Amdahl's law: `1 / ((1 - 0.999) + 0.357/7.3 + 0.321/13.6 + 0.321/13.6) ≈ 10.3x`, showing the extension easily reaches a useful speedup. However, `marshal_words` is undercounted: `crc64_ecma_step` writes 3 words and reads 2 (5 total), while the 32/16 versions write 3 words and read 1 (4 total).
+**Suggested fix.** Update `marshal_words` to 5 for CRC-64 and 4 for CRC-32/16. Add the 10.3x Amdahl's law calculation to the design rationale.

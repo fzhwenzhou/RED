@@ -1,0 +1,58 @@
+{
+  "critic_rounds": 1,
+  "description": "Fast modular arithmetic and wide-limb multiplication for secp256r1",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n\nvoid secp256r1_mult_model(const uint32_t in[16], uint32_t out[16]) {\n    uint32_t r0 = 0, r1 = 0, r2 = 0;\n    \n    for (int k = 0; k < 8; ++k) {\n        for (int i = 0; i <= k; ++i) {\n            uint64_t p = (uint64_t)in[i] * in[8 + k - i];\n            uint64_t r01 = ((uint64_t)r1 << 32) | r0;\n            r01 += p;\n            r2 += (r01 < p);\n            r1 = r01 >> 32;\n            r0 = (uint32_t)r01;\n        }\n        out[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }\n    for (int k = 8; k < 15; ++k) {\n        for (int i = (k + 1) - 8; i < 8; ++i) {\n            uint64_t p = (uint64_t)in[i] * in[8 + k - i];\n            uint64_t r01 = ((uint64_t)r1 << 32) | r0;\n            r01 += p;\n            r2 += (r01 < p);\n            r1 = r01 >> 32;\n            r0 = (uint32_t)r01;\n        }\n        out[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }\n    out[15] = r0;\n}",
+      "encoding": "0000001 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000001",
+      "invocations": 1,
+      "mac_ops": 64,
+      "marshal_words": 16,
+      "mnemonic": "secp256r1.mult",
+      "name": "secp256r1.mult",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "out = left * right",
+      "replaces": "uECC_vli_mult::loop1",
+      "semantics": "Performs a 256x256-bit multiplication of two 8-word integers. in[0..7] is the left operand and in[8..15] is the right operand. The 512-bit result is written to out[0..15].",
+      "spike_model": "",
+      "words": 16
+    },
+    {
+      "c_model": "#include <stdint.h>\n\nvoid secp256r1_mmod_model(const uint32_t in[16], uint32_t out[16]) {\n    uint32_t result[8];\n    uint32_t tmp[8];\n    int64_t carry = 0;\n    uint64_t c;\n    const uint32_t p[8] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, \n                           0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF};\n\n    for (int i = 0; i < 8; ++i) result[i] = in[i];\n\n    #define DO_DOUBLE_ADD() do { \\\n        c = 0; \\\n        for(int i = 0; i < 8; ++i) { \\\n            c += (uint64_t)tmp[i] + tmp[i]; \\\n            tmp[i] = (uint32_t)c; \\\n            c >>= 32; \\\n        } \\\n        carry += c; \\\n    } while(0)\n\n    #define DO_ADD() do { \\\n        c = 0; \\\n        for(int i = 0; i < 8; ++i) { \\\n            c += (uint64_t)result[i] + tmp[i]; \\\n            result[i] = (uint32_t)c; \\\n            c >>= 32; \\\n        } \\\n        carry += c; \\\n    } while(0)\n\n    #define DO_SUB() do { \\\n        c = 0; \\\n        for(int i = 0; i < 8; ++i) { \\\n            c = (uint64_t)result[i] - tmp[i] - c; \\\n            result[i] = (uint32_t)c; \\\n            c = (c >> 32) & 1; \\\n        } \\\n        carry -= c; \\\n    } while(0)\n\n    tmp[0]=0; tmp[1]=0; tmp[2]=0; tmp[3]=in[11]; tmp[4]=in[12]; tmp[5]=in[13]; tmp[6]=in[14]; tmp[7]=in[15];\n    DO_DOUBLE_ADD(); DO_ADD();\n\n    tmp[0]=0; tmp[1]=0; tmp[2]=0; tmp[3]=in[12]; tmp[4]=in[13]; tmp[5]=in[14]; tmp[6]=in[15]; tmp[7]=0;\n    DO_DOUBLE_ADD(); DO_ADD();\n\n    tmp[0]=in[8]; tmp[1]=in[9]; tmp[2]=in[10]; tmp[3]=0; tmp[4]=0; tmp[5]=0; tmp[6]=in[14]; tmp[7]=in[15];\n    DO_ADD();\n\n    tmp[0]=in[9]; tmp[1]=in[10]; tmp[2]=in[11]; tmp[3]=in[13]; tmp[4]=in[14]; tmp[5]=in[15]; tmp[6]=in[13]; tmp[7]=in[8];\n    DO_ADD();\n\n    tmp[0]=in[11]; tmp[1]=in[12]; tmp[2]=in[13]; tmp[3]=0; tmp[4]=0; tmp[5]=0; tmp[6]=in[8]; tmp[7]=in[10];\n    DO_SUB();\n\n    tmp[0]=in[12]; tmp[1]=in[13]; tmp[2]=in[14]; tmp[3]=in[15]; tmp[4]=0; tmp[5]=0; tmp[6]=in[9]; tmp[7]=in[11];\n    DO_SUB();\n\n    tmp[0]=in[13]; tmp[1]=in[14]; tmp[2]=in[15]; tmp[3]=in[8]; tmp[4]=in[9]; tmp[5]=in[10]; tmp[6]=0; tmp[7]=in[12];\n    DO_SUB();\n\n    tmp[0]=in[14]; tmp[1]=in[15]; tmp[2]=0; tmp[3]=in[9]; tmp[4]=in[10]; tmp[5]=in[11]; tmp[6]=0; tmp[7]=in[13];\n    DO_SUB();\n\n    for (int j = 0; j < 8; j++) {\n        uint32_t mask = (uint32_t)0 - ((uint64_t)carry >> 63);\n        c = 0;\n        for (int i = 0; i < 8; i++) {\n            c += (uint64_t)result[i] + (p[i] & mask);\n            tmp[i] = (uint32_t)c;\n            c >>= 32;\n        }\n        for (int i = 0; i < 8; i++) result[i] = tmp[i];\n        carry += (c & mask); \n    }\n\n    for (int j = 0; j < 16; j++) {\n        c = 0;\n        for (int i = 0; i < 8; i++) {\n            c = (uint64_t)result[i] - p[i] - c;\n            tmp[i] = (uint32_t)c;\n            c = (c >> 32) & 1;\n        }\n        uint32_t cond = (carry > 0) | ((carry == 0) & (c == 0));\n        uint32_t mask = (uint32_t)0 - cond;\n        for (int i = 0; i < 8; i++) {\n            result[i] = (result[i] & ~mask) | (tmp[i] & mask);\n        }\n        carry -= (c & mask);\n    }\n\n    for (int i = 0; i < 8; ++i) out[i] = result[i];\n    for (int i = 8; i < 16; ++i) out[i] = 0;\n}",
+      "encoding": "0000001 rs2 rs1 000 rd 0101011",
+      "funct3": "000",
+      "funct7": "0000001",
+      "invocations": 1,
+      "mac_ops": 0,
+      "marshal_words": 8,
+      "mnemonic": "secp256r1.mmod",
+      "name": "secp256r1.mmod",
+      "opcode": "custom-1",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "out = in % P256",
+      "replaces": "vli_mmod_fast_secp256r1::region",
+      "semantics": "Performs a 512-bit to 256-bit fast modular reduction for secp256r1. The 512-bit product is read from in[0..15]. The 256-bit reduced result is written to out[0..7] and zero-padded to out[15].",
+      "spike_model": "",
+      "words": 16
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "MicroECC secp256r1 Extension",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

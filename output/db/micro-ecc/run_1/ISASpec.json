@@ -1,0 +1,39 @@
+{
+  "critic_rounds": 3,
+  "description": "Fast wide-limb multiplication for secp256r1",
+  "encodings": [],
+  "gate2_vectors": 100000,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n\nvoid secp256r1_mult_model(const uint32_t in[16], uint32_t out[16]) {\n    uint32_t r0 = 0, r1 = 0, r2 = 0;\n    \n    for (int k = 0; k < 8; ++k) {\n        for (int i = 0; i <= k; ++i) {\n            uint64_t p = (uint64_t)in[i] * in[8 + k - i];\n            uint64_t r01 = ((uint64_t)r1 << 32) | r0;\n            r01 += p;\n            r2 += (r01 < p);\n            r1 = r01 >> 32;\n            r0 = (uint32_t)r01;\n        }\n        out[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }\n    for (int k = 8; k < 15; ++k) {\n        for (int i = (k + 1) - 8; i < 8; ++i) {\n            uint64_t p = (uint64_t)in[i] * in[8 + k - i];\n            uint64_t r01 = ((uint64_t)r1 << 32) | r0;\n            r01 += p;\n            r2 += (r01 < p);\n            r1 = r01 >> 32;\n            r0 = (uint32_t)r01;\n        }\n        out[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }\n    out[15] = r0;\n}",
+      "encoding": "0000001 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000001",
+      "invocations": 1,
+      "mac_ops": 64,
+      "marshal_words": 16,
+      "mnemonic": "secp256r1.mult",
+      "name": "secp256r1.mult",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "out = left * right",
+      "replaces": "uECC_vli_mult",
+      "semantics": "Performs a 256x256-bit multiplication of two 8-word integers. in[0..7] is the left operand and in[8..15] is the right operand. The 512-bit result is written to out[0..15].",
+      "spike_model": "void secp256r1_mult_iss(const uint32_t in[16], uint32_t out[16]) {\n    for (int i = 0; i < 16; ++i) {\n        out[i] = 0;\n    }\n    for (int i = 0; i < 8; ++i) {\n        uint64_t carry = 0;\n        for (int j = 0; j < 8; ++j) {\n            uint64_t prod = (uint64_t)in[i] * in[8 + j] + out[i + j] + carry;\n            out[i + j] = (uint32_t)prod;\n            carry = prod >> 32;\n        }\n        out[i + 8] = (uint32_t)carry;\n    }\n}",
+      "words": 16
+    }
+  ],
+  "link1_vectors": 100000,
+  "name": "MicroECC secp256r1 Extension",
+  "passes_gate2": true,
+  "passes_link1": true,
+  "tests": [
+    "link1: coverage 100.00% >= 80%; 1/1 C models built and survived 100,000 vectors under ASan+UBSan",
+    "gate2: 1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors"
+  ],
+  "version": "1.2"
+}

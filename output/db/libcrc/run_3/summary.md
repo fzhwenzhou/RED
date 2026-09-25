@@ -1,0 +1,26 @@
+# RED run_1 — libcrc
+
+- model: `gemini:gemini-3.1-pro-preview` (project `project-160a0199-6b4a-464c-86a`)
+- result: **converged (A1+A2)**
+- A2 rounds: 1
+- Gate 0 (workload): PASS 917,723,958 instructions, 100.0% in the project's own code, 0.00% drift
+    - libcrc_workload.c: 917,723,958 instructions, 100.0% in the project's own code
+    - drives: crc_64_ecma, crc_16, crc_32, main, init_crc16_tab
+- Gate 1 (re-profile ±5%): PASS runs 917723958 vs 917723958 cycles (0.00% vs ±5%)
+- Gate 2 (C model vs Spike): PASS 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors
+- Gate 3 (predicted speedup): PASS predicted 23.06x over 100% of cycles (bar 2.00x, priced on the shipped spec)
+- Gate 4 (security): PASS 13 checks over 512 adversarial vectors per model: 0 mechanically confirmed blocking, 0 advisory
+- coverage: 99.96% (80% target)
+- spec review: 0 blocking, 6 total (implementability, callability, benefit, legality)
+    - [major] spec: Implementing these 32- and 64-step bit-serial CRC loops combinationally to achieve zero latency would require hundreds of XOR gates, consuming a large fraction of this area-optimized core.
+    - [major] crc64_ecma_step: Latency is dominated by operand traffic rather than its arithmetic.
+    - [major] crc64_ecma_step: The declared 1024 invocations produce a cost of 40,990 cycles per call, giving a ratio of 0.066x against the 2723-cycle software kernel, incorrectly implying the instruction is slower.
+    - [major] crc32_step: With 512 declared invocations, the instruction cost is 20,510 cycles per call, resulting in a ratio of 0.239x against the 4901-cycle software kernel.
+    - [major] crc16_step: The declared 512 invocations inflate the instruction cost to 20,510 cycles per call, giving a ratio of 0.239x compared to the 4901-cycle software kernel.
+- verification edges:
+- PASS link1: coverage 99.96% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan
+- PASS link2: 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors
+- ISASpec: CRC_Extensions (3 instructions)
+  - `crc64_ecma_step` (custom-0, 3x32b): Reads 2 words of CRC-64 state (low word then high word) and 1 word (4 bytes) of data from the input block. Computes the CRC-64 ECMA over the 4 bytes. Writes the updated 64-bit state to the first 2 words of the output block, and zeroes the 3rd word. The caller must pack the state and data into the 3-word block.
+  - `crc32_step` (custom-0, 3x32b): Reads 1 word of CRC-32 state and 2 words (8 bytes) of data from the input block. Computes the CRC-32 over the 8 bytes. Writes the updated 32-bit state to the first word of the output block, and zeroes the remaining words. The caller must pack the state and data into the 3-word block.
+  - `crc16_step` (custom-0, 3x32b): Reads 1 word of CRC-16 state and 2 words (8 bytes) of data from the input block. Computes the CRC-16 over the 8 bytes. Writes the updated 16-bit state (zero-extended) to the first word of the output block, and zeroes the remaining words. The caller must pack the state and data into the 3-word block.

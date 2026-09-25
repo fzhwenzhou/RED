@@ -1,0 +1,2 @@
+
+Removed secp256r1.mmod because it violates the area constraint of the core (requires too much logic and sequential steps) and causes a stack buffer overflow by writing 16 words to the caller's 8-word result buffer (symmetric `words=16` ABI vs 8-word expected output). Kept secp256r1.mult as it has high arithmetic intensity (64 mac ops / 32 memory movements) and its 16-word format has shipped successfully in converged runs before.

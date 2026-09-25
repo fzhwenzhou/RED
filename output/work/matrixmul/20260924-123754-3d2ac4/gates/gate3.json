@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "predicted 2.56x over 99% of cycles (bar 2.00x, priced on the shipped spec)",
+  "gate": "gate3",
+  "passed": true
+}

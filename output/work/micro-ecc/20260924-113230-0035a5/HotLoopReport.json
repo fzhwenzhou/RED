@@ -1,0 +1,64 @@
+{
+  "coverage": 1.0,
+  "loops": [
+    {
+      "body": "    for (k = 0; k < num_words; ++k) {\n        for (i = 0; i <= k; ++i) {\n            muladd(left[i], right[k - i], &r0, &r1, &r2);\n        }\n        result[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }",
+      "calls": 3694592,
+      "cycle_share": 0.47300408475544875,
+      "dynamic_cycles": 4873166848,
+      "function": "uECC_vli_mult",
+      "ir": "",
+      "loop_id": "uECC_vli_mult::loop1",
+      "operand_stats": "Nested loop over num_words (8). Executes 36 trips of 32x32->64 multiply-add operations, accumulating across 3 words (r0, r1, r2) effectively doing a 96-bit accumulation.",
+      "rank": 1,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 36
+    },
+    {
+      "body": "    for (k = num_words; k < num_words * 2 - 1; ++k) {\n        for (i = (k + 1) - num_words; i < num_words; ++i) {\n            muladd(left[i], right[k - i], &r0, &r1, &r2);\n        }\n        result[k] = r0;\n        r0 = r1;\n        r1 = r2;\n        r2 = 0;\n    }",
+      "calls": 3694592,
+      "cycle_share": 0.47300408475544875,
+      "dynamic_cycles": 4873166848,
+      "function": "uECC_vli_mult",
+      "ir": "",
+      "loop_id": "uECC_vli_mult::loop2",
+      "operand_stats": "Nested loop for the second half of the multiplication diamond. Executes 28 trips of the same 96-bit accumulating muladd.",
+      "rank": 2,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 28
+    },
+    {
+      "body": "    uint32_t tmp[num_words_secp256r1];\n    int carry;\n    \n    /* t */\n    uECC_vli_set(result, product, num_words_secp256r1);\n    \n    /* s1 */\n    tmp[0] = tmp[1] = tmp[2] = 0;\n    tmp[3] = product[11];\n    tmp[4] = product[12];\n    tmp[5] = product[13];\n    tmp[6] = product[14];\n    tmp[7] = product[15];\n    carry = uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    /* ... repeated sequences of product slicing and uECC_vli_add / uECC_vli_sub ... */",
+      "calls": 3694592,
+      "cycle_share": 0.4318233879012858,
+      "dynamic_cycles": 4448899039,
+      "function": "vli_mmod_fast_secp256r1",
+      "ir": "",
+      "loop_id": "vli_mmod_fast_secp256r1::region",
+      "operand_stats": "Large block composed of multiple inline multi-precision additions (uECC_vli_add) and subtractions (uECC_vli_sub) acting on 256-bit (8x32-bit) words.",
+      "rank": 3,
+      "source_file": "micro-ecc/curve-specific.inc",
+      "trip_count": 1
+    },
+    {
+      "body": "    uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);\n    if (l_borrow) {\n        /* In this case, result == -diff == (max int) - diff. Since -x % d == d - x,\n           we can get the correct result from result + mod (with overflow). */\n        uECC_vli_add(result, result, mod, num_words);\n    }",
+      "calls": 3939328,
+      "cycle_share": 0.06175528958193203,
+      "dynamic_cycles": 636239389,
+      "function": "uECC_vli_modSub",
+      "ir": "",
+      "loop_id": "uECC_vli_modSub::region",
+      "operand_stats": "Performs one 256-bit subtraction and optionally one 256-bit addition. Dominated by the inlined uECC_vli_sub/add loops processing 8-word arrays.",
+      "rank": 4,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 1
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/micro-ecc/20260924-113230-0035a5/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/micro-ecc/20260924-113230-0035a5/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    10302589354
+  ],
+  "workload": "micro-ecc"
+}

@@ -1,0 +1,21 @@
+{
+  "api": [
+    "multiply",
+    "main"
+  ],
+  "detail": "it executes only 38,356,433 instructions, and a workload needs at least 50,000,000 \u2014 you are 1.3x short. **Multiply the work by at least 3x**: raise the iteration count, the buffer size or the problem dimension, whichever scales the kernel rather than the setup. Overshooting is free; the profile just needs to be dominated by the kernel.",
+  "drift": 0.0,
+  "dynamic_ir": 38356433,
+  "entry": "/home/naonao/RED/output/work/matrixmul/20260924-104006-2afb29/workload/r1/_red_workload.c",
+  "exit_code": 0,
+  "name": "",
+  "passes_gate0": false,
+  "project": "/home/naonao/RED/target_project/matrixmul",
+  "project_ir": 38221217,
+  "project_share": 0.9964747504023641,
+  "rationale": "",
+  "runs": [
+    38356433,
+    38356433
+  ]
+}

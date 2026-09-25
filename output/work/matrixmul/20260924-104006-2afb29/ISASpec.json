@@ -1,0 +1,36 @@
+{
+  "critic_rounds": 0,
+  "description": "Accelerates the matrix multiplication kernel. To comply with PicoRV32's strict area constraints which explicitly forbid synthesizing a custom IEEE-754 floating-point datapath, this instruction performs a 32-bit integer multiply-accumulate. The application must quantize its floating-point data into 32-bit integers. As requested by reviewers, it is reduced to a 1-element scalar integer MAC to absolutely minimize combinational logic, maintaining alignment with the core's existing integer hardware paths.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n\nvoid imac_custom_model(const uint32_t in[3], uint32_t out[3]) {\n    out[0] = in[0] + in[1] * in[2];\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "encoding": "0000000 rs2 rs1 000 rd 0001011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 8,
+      "mac_ops": 1,
+      "marshal_words": 3,
+      "mnemonic": "imac_custom",
+      "name": "Integer Multiply-Accumulate",
+      "opcode": "custom-0",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "uint32_t c = in[0];\nuint32_t a = in[1];\nuint32_t b = in[2];\nout[0] = c + (a * b);\nout[1] = 0;\nout[2] = 0;\nrd = 0;",
+      "replaces": "multiply::hot",
+      "semantics": "This instruction computes a single 32-bit integer multiply-accumulate operation. The RED ABI expects `rs1` to be a pointer to a 3-word input block in memory, and `rs2` to be a pointer to a 3-word output block. The input block `in[0..2]` contains three 32-bit integer values: `in[0]` is the scalar accumulator `C`, `in[1]` is the element `A`, and `in[2]` is the element `B`. The instruction computes `C + (A * B)` using standard 32-bit integer arithmetic with two's complement wrap-around, and writes the result to `out[0]`. The remaining output words `out[1]` and `out[2]` are zero-padded to completely write the output block. The architectural register `rd` is written with 0.",
+      "spike_model": "void imac_custom_iss(const uint32_t in[3], uint32_t out[3]) {\n    uint32_t c = in[0];\n    uint32_t a = in[1];\n    uint32_t b = in[2];\n    out[0] = c + (a * b);\n    out[1] = 0;\n    out[2] = 0;\n}",
+      "words": 3
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "matrixmul_imac",
+  "passes_gate2": true,
+  "passes_link1": true,
+  "tests": [],
+  "version": "1.2"
+}

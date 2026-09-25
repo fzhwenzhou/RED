@@ -1,0 +1,20 @@
+{
+  "checks_run": [
+    "encoding.collision",
+    "encoding.fields",
+    "encoding.opcode",
+    "latency.interrupt_bound",
+    "memory.bounds",
+    "memory.input_mutation",
+    "memory.output_residue",
+    "model.forbidden_call",
+    "model.impure",
+    "model.includes",
+    "timing.data_dependent",
+    "timing.secret_branch",
+    "timing.taint_scan"
+  ],
+  "checks_skipped": [],
+  "findings": [],
+  "vectors": 512
+}

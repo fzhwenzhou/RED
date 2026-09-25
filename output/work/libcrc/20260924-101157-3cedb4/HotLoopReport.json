@@ -1,0 +1,90 @@
+{
+  "coverage": 0.9992604253707338,
+  "loops": [
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc << 8) ^ crc_tab64[ ((crc >> 56) ^ (uint64_t) *ptr++) & 0x00000000000000FFull ];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.19215652011941345,
+      "dynamic_cycles": 50004500,
+      "function": "crc_64_ecma",
+      "ir": "",
+      "loop_id": "crc_64_ecma::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 64-bit XOR, 64-bit shift",
+      "rank": 1,
+      "source_file": "libcrc/src/crc64.c",
+      "trip_count": 0
+    },
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tabdnp[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.17295605479202072,
+      "dynamic_cycles": 45008002,
+      "function": "crc_dnp",
+      "ir": "",
+      "loop_id": "crc_dnp::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 16-bit XOR, 16-bit shift",
+      "rank": 2,
+      "source_file": "libcrc/src/crcdnp.c",
+      "trip_count": 0
+    },
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc << 8) ^ crc_tabccitt[ ((crc >> 8) ^ (uint16_t) *ptr++) & 0x00FF ];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.17295029061519307,
+      "dynamic_cycles": 45006502,
+      "function": "crc_ccitt_1d0f",
+      "ir": "",
+      "loop_id": "crc_ccitt_1d0f::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 16-bit XOR, 16-bit shift",
+      "rank": 3,
+      "source_file": "libcrc/src/crcccitt.c",
+      "trip_count": 0
+    },
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab16[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.17295029061519307,
+      "dynamic_cycles": 45006502,
+      "function": "crc_16",
+      "ir": "",
+      "loop_id": "crc_16::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 16-bit XOR, 16-bit shift",
+      "rank": 4,
+      "source_file": "libcrc/src/crc16.c",
+      "trip_count": 0
+    },
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.17294644014507218,
+      "dynamic_cycles": 45005500,
+      "function": "crc_32",
+      "ir": "",
+      "loop_id": "crc_32::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 32-bit XOR, 32-bit shift",
+      "rank": 5,
+      "source_file": "libcrc/src/crc32.c",
+      "trip_count": 0
+    },
+    {
+      "body": "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = sht75_crc_table[(*ptr++) ^ crc];\n\t}",
+      "calls": 500,
+      "cycle_share": 0.11530082908384127,
+      "dynamic_cycles": 30004500,
+      "function": "crc_8",
+      "ir": "",
+      "loop_id": "crc_8::for (a=0; a<num_bytes; a++)",
+      "operand_stats": "8-bit table lookup, 8-bit XOR",
+      "rank": 6,
+      "source_file": "libcrc/src/crc8.c",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/libcrc/20260924-101157-3cedb4/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/libcrc/20260924-101157-3cedb4/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    260227964
+  ],
+  "workload": "libcrc"
+}
