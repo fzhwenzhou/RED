@@ -5,6 +5,12 @@ core**, profiles the project, mines its hot loops, and designs a custom RISC-V
 instruction extension for them. Its deliverable is a typed, executable
 **`ISASpec`**.
 
+If the project ships no representative workload — most do not; they ship unit
+tests — an agent reads the repository and writes one, and a gate decides by
+running it whether what it wrote is a workload at all. Three projects are
+bundled (`micro-ecc`, `libcrc`, `matrixmul`) and
+`bash scripts/run_projects.sh` iterates over all of them.
+
 The loop's agents, gates and feedback edges are documented with flow charts in
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
@@ -21,11 +27,13 @@ artifact those downstream nodes would consume.
 
 | Stage | What it does | Status |
 |-------|--------------|--------|
+| **AW — Workload synthesis** | When no harness is supplied, a sub-agent reads the repository and writes one: a C file driving the library's real work. | **Implemented** |
+| **Gate 0 — is it a workload?** | The harness is built and run twice under callgrind. It must execute ≥50 M instructions, ≥60% of them in functions *the binary itself defines* (from the symbol table, not from the agent's description), with <2% run-to-run drift. A repository's own unit test executes ~10⁵ — profiling that mines the dynamic loader. | **Implemented** |
 | **A1 — Kernel mining** | Build + profile the project's own workload harness (callgrind), rank hot loops to ≥80% cycle coverage. Agentic ranking over a mechanical profile. | **Implemented** |
 | **Gate 1** | Two independent profile runs must agree within ±5%. | **Implemented** |
 | **A0 — Core analysis** | A separate agent reads the target core's RTL and writes a typed `CoreProfile`: ISA, microarchitecture, what the coprocessor interface can reach, units that already exist, per-core cycle costs. Runs concurrently with A1. | **Implemented** |
 | **A2 — ISA synthesis** | S2a pattern analyzer → S2b instruction designer → S2c spec critic, emitting the `ISASpec`. Designs against the `CoreProfile`, not an abstract RISC-V. | **Implemented** |
-| **Gate 3 — performance** | Costs every instruction against the target's *measured* platform model and rejects an extension predicted to deliver less than 2× whole-application speedup, handing the designer the arithmetic (≤3 redesign rounds). | **Implemented** |
+| **Gate 3 — performance** | Costs every instruction against the target's *measured* platform model, handing the designer the arithmetic when it falls short (≤4 redesign rounds). The bar is **not fixed at 2×**: Amdahl caps an extension at `1/(1-coverage)`, so a design covering 47% of an application is held to a reachable bar rather than an impossible one, and the bar relaxes each redesign round to a 1.15× floor. Re-priced on the spec that actually ships, because the review can revise a design after the gate last ran. | **Implemented** |
 | **Gate 4 — security** | Runs each C model under ASan+UBSan on adversarial operand values in exactly-sized allocations, against two differently poisoned output blocks (an unwritten output word is a residue leak), and counts the instructions the model itself executes for several operand values (a difference is a timing side channel). Decodes the encoding bits, and taint-scans the model for secret-dependent control flow. A **security sub-agent** probes each model with operand values chosen from what the arithmetic *means*. Only mechanically confirmed findings can fail the gate (≤2 revision rounds). | **Implemented** |
 | **Spec review** | Four sub-agents examine the spec *concurrently* — implementability, callability, benefit, legality. Each sees its own findings from the previous round and must adjudicate them, so the review converges instead of redrawing; blocking findings go back to the designer (≤4 rounds). | **Implemented** |
 | **link 1** | Coverage holds, and every instruction's C reference model compiles and survives a 100,000-vector stress run under ASan+UBSan. | **Implemented (partial — see LIMITATIONS)** |
@@ -96,7 +104,25 @@ Read this before quoting any result.
    operand value that actually breaks the model when executed. That keeps
    hallucinated vulnerabilities out of the gate — and it means a real
    vulnerability it can describe but not trigger will not stop the spec either.
-9. **The instruction ABI is fixed by RED**, not chosen per instruction: an
+9. **Gate 3's accuracy is bounded by two declarations it cannot measure.**
+   Where they are sound the model is good: on the one design that has been both
+   predicted and built, it predicts **1.81× against a measured 1.67×** (8%
+   error). Where they are not, it is wrong by an order of magnitude. `mac_ops`
+   is profiled from the C model and `replaces` is matched against the frozen
+   report, but `invocations` (how many times the instruction runs per kernel
+   call) and `marshal_words` (what the caller pays to lay operands out) are
+   taken on the designer's word. The obvious estimator for `invocations` is
+   *biased* — the model and the kernel are different implementations of the same
+   work, so the ratio of their instruction counts reads 31 for a true 128 and
+   147 for a true 4 — so the gate reports the inconsistency, refuses a
+   declaration more than 10× out, and does not substitute a number it cannot
+   stand behind.
+10. **A workload AW wrote is a workload AW chose.** Gate 0 establishes that a
+   synthesized harness does enough work, in the project's own code,
+   reproducibly. It cannot establish that the work is *representative* of how
+   anyone actually uses the library. Results on a synthesized workload
+   characterise RED on that kernel, not on the repository's own tests.
+11. **The instruction ABI is fixed by RED**, not chosen per instruction: an
    R-type in a custom opcode slot with `rs1` = input block address, `rs2` =
    output block address, `rd` = 0. That is what lets any designed instruction be
    harnessed mechanically, but it means RED currently designs memory-operand
@@ -113,15 +139,23 @@ red/
   nodes.py        mechanical edges: A1 profiling, Gate 1, link 1, Gate 2, link 2
   iss.py          Gate 2: Spike extension codegen, rv32 harness, the diff
   iss_selftest.py proves Gate 2 both passes agreeing models and fails others
-  loop.py         the orchestration driver (A1 + Gate 1 → A2 + link 1 → Gate 2)
-  prompts/        agent charters (mine.md, system.md, iss.md, debug.md)
-target_project/   one example project (micro-ecc)  — an INPUT, not hard-coded
-target_cpu/       one example core (PicoRV32)      — an INPUT, not hard-coded
-cluster.yaml      GCP cluster definition (llm, database, profile + local head)
+  cost.py         Gate 3: the platform cost model and the speedup prediction
+  security.py     Gate 4: the mechanical security checks (sanitizers, ctgrind…)
+  workload.py     Gate 0: does a candidate harness measure anything?
+  review.py       the four review sub-agents and their adjudication
   graph.py        the persistent Neo4j knowledge graph (writes + agent queries)
   callgrind.py    reads callgrind's own output format (costs and call counts)
-scripts/          red_env.sh (cluster lifecycle), setup_spike.sh (Gate 2
-                  toolchain), setup_neo4j.sh (knowledge graph), gcp_util.py
+  loop.py         the orchestration driver (AW → A1 → A2 → Gate 3/4 → review → Gate 2)
+  prompts/        agent charters (workload.md, mine.md, core.md, system.md,
+                  redesign.md, secure.md, security.md, revise.md, iss.md,
+                  debug.md, review/)
+target_project/   the projects to design for (micro-ecc, libcrc, matrixmul)
+                  — INPUTS, not hard-coded
+target_cpu/       one example core (PicoRV32)      — an INPUT, not hard-coded
+cluster.yaml      GCP cluster definition (llm, database, profile + local head)
+scripts/          red_env.sh (cluster lifecycle), run_projects.sh (every
+                  project in turn), setup_spike.sh (Gate 2 toolchain),
+                  setup_neo4j.sh (knowledge graph), gcp_util.py
 ARCHITECTURE.md   the agent loop: agents, gates, feedback edges, flow charts
 SPIKE_SETUP.md    installing Spike for Gate 2 (what, where, why, verifying)
 NEO4J_SETUP.md    the knowledge graph: install, model, what the agents ask it
@@ -161,13 +195,21 @@ arithmetic 32-bit, matching the rv32 target the extension is designed for.
 See **[run_instructions.md](run_instructions.md)** for the full guide.
 
 ```bash
-python tests/test_env.py          # verify the environment (19 checks)
+python tests/test_env.py          # verify the environment (91 checks)
 python -m red.loop --local        # mechanical smoke test: A1 + Gate 1, no LLM
-python -m red.loop --local-llm    # full A1+A2 on this machine, real Gemini
+python -m red.loop --local-llm    # full loop on this machine, real Gemini
 bash scripts/red_env.sh up        # bring the GCP cluster up
-python -m red.loop                # full A1+A2 on the CHIA cluster
+python -m red.loop                # one project on the CHIA cluster
+bash scripts/run_projects.sh      # every project under target_project/, in turn
+bash scripts/run_projects.sh libcrc   # just this one
 bash scripts/red_env.sh down      # tear down, verify nothing is billing
 ```
+
+`run_projects.sh` holds the per-project inputs that cannot be guessed from the
+sources — the harness (leave it empty and AW writes one), the cflags that define
+the workload's configuration, and `--exclude` for directories belonging to a
+*different* program in the same repository, like libcrc's `precalc/` table
+generator. A project with no entry runs fully automatically.
 
 Artifacts land in `output/db/<workload>/run_<N>/`: `profile.json`,
 `HotLoopReport.json`, `ISASpec.draft.json`, `ISASpec.json` (the deliverable),
@@ -180,9 +222,17 @@ than the baseline at +74% area. The gates all asked *"does this instruction mean
 what its spec says?"*; none asked what it costs. `red/cost.py` is that question,
 and its constants are measured on the RTL in `eval/`, not assumed:
 
-    instruction cycles = 28 + 2 x (2 x words) + 1 x mac_ops
-    (28 = PCPI + FSM overhead, 2 = cycles per 32-bit word moved — both fitted
-     to the measured 48-cycle mac96 and 92-cycle add256)
+    instruction cycles = 28 + 2 x (2 x words) + 1 x mac_ops + 1 x logic_steps
+    caller pays          12.9 x marshal_words, each way
+    (28 = PCPI + FSM overhead and 2 = cycles per 32-bit word moved, fitted to
+     the measured 48-cycle mac96 and 92-cycle add256; 12.9 fitted to the 413 of
+     656 cycles the measured micro-ecc call spends marshalling a 16-word block)
+
+`logic_steps` is work the declared `mac_ops` cannot account for, charged at the
+rate hardware runs it. Pricing everything as multiplies was a real defect:
+libcrc's models perform 256 sequential bit steps per block and the synthesizable
+RTL takes one cycle each, measuring 297–301 cycles where the multiply-rate model
+predicted ~112.
 
 Operand traffic is fixed by `words` and paid on every invocation, so the
 quantity that decides everything is **arithmetic per operand word moved**:
@@ -201,24 +251,35 @@ instruction is also charged for the part of its kernel it does *not* replace,
 and `replaces` must name a mined loop exactly — both were loopholes that paid an
 instruction for work it never did.
 
-Gate 3 is intended to reject the first two and tell the designer why: replace
-whole kernels, drive `invocations` to 1, minimize `marshal_words`, and cover
-enough of the profile for Amdahl to matter. The renewed RTL evaluation exposed
-a remaining attribution bug: two loops from the same multiply function were
-summed as independent coverage, so a whole-multiply design predicted at 11.60x
-actually measured 1.675x. See `eval/RESULTS.md`.
+Gate 3 rejects the first two and tells the designer why: replace whole kernels,
+count `invocations` from the data volume, minimize `marshal_words`, and cover
+enough of the profile for Amdahl to matter.
+
+The RTL evaluation then scored the gate itself, and it was over-predicting all
+three shipped extensions by 6.3×–7.0×. Four causes were separated and three
+fixed — coverage counted twice (two regions of one function each claimed its
+full share, summing to 143%), bit-serial work priced as multiplies, and a gate
+that never re-ran on what shipped. The fourth, an unverifiable `invocations`, is
+now reported rather than guessed. On the one design that has been both predicted
+and built the model is now accurate to **8%** (1.81× predicted, 1.67× measured),
+where it previously said 11.60×. Run
+`./.venv/bin/python eval/scripts/reprice.py` after any change to `red/cost.py`;
+the evidence is in `eval/RESULTS.md`.
 
 ## Loop performance
 
-Measured on one machine (`--local-llm`, `gemini-3.1-pro-preview`), a full run
-with the review stage takes **~15.6 min**, against ~25 min for the previous
-pipeline that did strictly less. Where it went:
+On the cluster (`gemini-3.1-pro-preview`), the three bundled projects converge
+in **16–41 minutes** each. The mechanical front end is 1–3 minutes of that;
+agent turns dominate, and which edge a run exercises decides the rest. Where the
+time went:
 
 | change | effect |
 |---|---|
 | ten tool servers collapsed to two (`DesignerTool`, `IssTool`) | each ChiaTool is its own Ray actor that rescans the port range as it binds; a server per artifact cost minutes before the first agent turn |
 | the two Gate-1 profile runs dispatch before either is resolved | the second profile is free in wall-clock terms |
-| four reviewers dispatch concurrently, with no tool servers | one model round trip instead of four |
+| four reviewers dispatch concurrently, with no tool servers | one model round trip instead of four — though the llm node advertised `llm: 1` for most of this project's life, so every turn *including the reviewers* serialized behind it. It advertises 4 now; the node makes HTTPS calls and waits, it does not compute |
+| a throttled turn is retried with backoff, not counted as a failure | two consecutive `RateLimitError`s used to trip the "backend is down" guard and abandon synthesis; three runs in one batch died that way |
+| `measure_ops` caches on a hash of the C model | re-pricing every review round compiles and runs each model under callgrind; on a 12-instruction spec that was 48 passes where 12 suffice, and it OOM-killed a tool server on the 5.7 GB head |
 | Gate 2's per-instruction differential tests run on a thread pool | subprocess-bound work overlaps; `RED_GATE2_PARALLEL` (default 4) |
 | self-critique rounds cut from 8 to 3 | the dedicated reviewers do that job better than the designer re-reading itself |
 
@@ -237,11 +298,17 @@ RTL; matrixmul uses an explicit four-operation behavioral floating-point model,
 so its cycle result is useful for architectural evaluation but has no valid area
 claim yet.
 
-The measurements also expose large prediction gaps: Gate 3 predicted 11.60x,
-92.10x, and 14.71x respectively. The measured results identify overlapping-loop
-attribution, incomplete invocation counts, and underpriced bit-serial work as
-remaining cost-model problems. Full evidence and reproduction commands are in
-**[eval/RESULTS.md](eval/RESULTS.md)**.
+Correctness is checked, not assumed: **2,060 differential vectors with 0
+mismatches** (412 / 412 / 1,236), each set run twice — once with distinct input
+and output blocks, once with them aliased, because that is how the application
+calls them — and every end-to-end run must print `RESULT: PASS`, exit zero, and
+produce a signature identical to the baseline binary.
+
+These measurements are also what scored RED's own performance gate, which had
+been over-predicting all three by 6.3×–7.0× (11.60×, 14.71×, 92.10×). That is
+fixed as far as the evidence reaches; see *Designing for speed* above and
+**[eval/RESULTS.md](eval/RESULTS.md)** for the full argument, the reproduction
+commands, and what remains unverifiable.
 
 This is the answer the design's A3-A5 nodes exist to produce, and the reason a
 `speedup < target -> re-mine` edge is in the proposal.

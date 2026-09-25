@@ -52,7 +52,7 @@ directory is outside `output/`, so clearing run artifacts does not erase it.
 `red_env.sh up` starts it for you from then on. A run without it still works;
 it just starts from zero. See `NEO4J_SETUP.md`.
 
-Verify the environment — 61 checks covering imports, the toolchain, artifact
+Verify the environment — 91 checks covering imports, the toolchain, artifact
 round-trips, every mechanical gate (including that link 1 *rejects* a bad C
 model), the durable store, the sealed MCP tools, and the knowledge graph:
 
@@ -200,6 +200,64 @@ gcloud compute instances list --project <YOUR_PROJECT>
 
 ---
 
+## 3.5 Running every project
+
+`scripts/run_projects.sh` iterates over every directory under
+`target_project/`:
+
+```bash
+bash scripts/run_projects.sh                 # all of them, once each
+bash scripts/run_projects.sh libcrc          # just these
+RED_RUNS=3 bash scripts/run_projects.sh      # three runs of each
+```
+
+It holds the three per-project inputs that cannot be guessed from the sources:
+
+| input | what it is |
+|---|---|
+| `harness` | the TU holding the workload's `main`. **Leave it empty** and AW writes one (below). Set it only when the repository already ships a representative workload, as micro-ecc does. |
+| `cflags` | flags that define the workload's configuration |
+| `exclude` | path fragments whose `.c` files belong to a *different program* in the same repository — libcrc's `precalc/` is a table generator with its own `main`, and linking it fails. They stay readable by the agents; they are just not linked. |
+
+**Ordering matters for projects that generate part of their own source.**
+libcrc's `src/crc32.c` includes `../tab/gentab32.inc`, produced by the project's
+own build. The profile node compiles the project from *its* copy of the tree,
+which is rsynced only by a fresh `red_env.sh up` — and the generated files are
+gitignored, so they are not in the working-dir package either. Generate them
+**before** bringing the cluster up, or every build on the worker fails on an
+include the head resolves perfectly well. The script runs the generator and
+warns if the cluster is already up.
+
+## 3.6 AW and Gate 0 — manufacturing a workload
+
+RED's stated input is "a project + representative workloads" and repositories
+routinely ship only the first half. The difference is not a matter of degree:
+
+```
+micro-ecc  test/test_ecdh.c   10,302,000,000 instructions   43% in one kernel
+libcrc     test/testall.c            272,664 instructions   hottest: 0x10db4
+matrixmul  test.c                    125,089 instructions   one 2x2 multiply
+```
+
+The bottom two are unit tests; profiling them mines the dynamic loader. So when
+no harness is supplied, an agent reads the repository and writes one, and Gate 0
+decides by **running it**: ≥`RED_WORKLOAD_MIN_IR` (50 M) instructions,
+≥`RED_WORKLOAD_MIN_SHARE` (60%) of them in functions the binary itself defines,
+<`RED_WORKLOAD_DETERMINISM` (2%) run-to-run drift, exits 0 twice.
+
+The project-share condition is the one an agent cannot argue with: it comes from
+`nm --defined-only` on the built binary intersected with what callgrind saw
+execute. A harness looping around `printf` measured 14,193,444 instructions at
+**9.0%** project share and was rejected; the same library over a 64 KiB buffer
+measured 255,822,904 at **99.9%** and passed.
+
+Failures come back as the measurement, including *by what factor* the harness
+fell short and which project functions it actually reached — the most useful
+line on the page when the agent thinks it is stressing something it is not.
+`RED_WORKLOAD_ROUNDS` (4) rounds, then the run stops rather than mining libc.
+
+Artifacts: `output/db/<workload>/run_<N>/workload/round<N>.{json,md}`.
+
 ## 4. Reading the results
 
 Everything lands in `output/db/<workload>/run_<N>/` (git-ignored). On a cluster
@@ -338,9 +396,26 @@ Written to `output/db/<workload>/run_<N>/CoreProfile.json`.
 ## 4e. Gate 3 — the performance gate
 
 Gate 3 costs every instruction against the target's measured platform model and
-rejects an extension predicted to deliver less than `RED_SPEEDUP_TARGET`
-(default 2×), handing the designer the arithmetic for up to `RED_PERF_ROUNDS`
-redesign rounds.
+hands the designer the arithmetic when it falls short, for up to
+`RED_PERF_ROUNDS` (default 4) redesign rounds.
+
+**The bar is not a fixed 2×.** Amdahl caps any extension at `1/(1-coverage)`, so
+a design covering 47.3% of an application cannot exceed 1.90× however perfect
+the silicon — and demanding `RED_SPEEDUP_TARGET` of it demands something
+arithmetic forbids. The bar in force is
+
+    max(RED_SPEEDUP_FLOOR, min(RED_SPEEDUP_TARGET, ceiling x RED_SPEEDUP_ATTAINMENT)
+        x RED_SPEEDUP_RELAX^(round-1))
+
+which is 2.00 → 1.32 → 1.15 for a workload with headroom, and 1.42 → 1.15 for
+one capped at 1.90×. Every verdict states the bar it applied and why it moved.
+The floor (1.15×) exists because below it a prediction is inside the model's own
+error, measured at ~8% against RTL.
+
+Gate 3 is also **re-priced on the spec that actually ships**. It runs before
+Gate 4 and the review, and a review revision can change the design after it last
+ran: one run reported 11.60× for a design whose shipped form priced at 1.85× and
+measured 1.67× on RTL.
 
 `mac_ops` sets an instruction's price, so Gate 3 **measures it rather than
 trusting it**: each `c_model` is compiled and run once under callgrind, and the
@@ -357,7 +432,18 @@ covers 97.9% of profiled cycles; predicted whole-application speedup 0.91x
 Priced on the declaration that spec would have scored ~30× and shipped; priced
 on what it does, it is a **slowdown**, and it went back to the designer.
 
-Verdicts land in `output/db/<workload>/run_<N>/perf/round<N>.{json,md}`.
+`invocations` — how many times the instruction runs per kernel call — is the one
+cost field RED cannot derive, and it was wrong by one to two orders of magnitude
+in two of three shipped specs. The ratio of kernel to model instruction counts
+is a *biased* estimator (the two sides are different implementations), so the
+gate reports the inconsistency instead of substituting it, and `write_spec`
+refuses a declaration more than 10× out.
+
+Verdicts land in `output/db/<workload>/run_<N>/perf/round<N>.{json,md}`, and the
+shipped re-price in `perf/shipped.{json,md}`.
+
+To score the gate against cycle-accurate RTL:
+`./.venv/bin/python eval/scripts/reprice.py`.
 
 ## 4f. Gate 4 — the security gate
 
@@ -456,7 +542,14 @@ block, i.e. eight times the arithmetic for the same data movement — and replac
 needs no carry-out. Both survived Gate 2 against an independently written Spike
 model. Blocking findings fell from 10 to 4.
 
-### Five consecutive runs
+### Five consecutive runs — *historical, before Gate 3 and Gate 4 existed*
+
+These five predate the performance gate, the security gate, review adjudication
+and the knowledge graph. They are kept because they are the evidence that the
+review's feedback edge works at all; **they are not the current convergence
+rate.** For that, see [eval/RESULTS.md](eval/RESULTS.md) and § 4a — the three
+bundled projects currently converge in 16–41 minutes each with zero blocking
+findings.
 
 | run | wall clock | blocking findings, round 1 -> 2 | Gate 2 | outcome |
 |---|---|---|---|---|
@@ -492,16 +585,27 @@ The loop stops at a verified ISASpec. To find out whether that spec actually
 accelerates the application and what it costs in silicon:
 
 ```bash
-bash eval/scripts/area.sh              # area: baseline core vs core + accelerator
-bash eval/scripts/run_eval.sh quick    # verify the RTL + per-operation costs (~1 min)
-bash eval/scripts/run_eval.sh          # + the two full-ECDH RTL runs (~8 min)
+bash eval/scripts/run_all.sh quick   # all three projects, skipping the full ECDH
+bash eval/scripts/run_all.sh         # everything, including the ~3 min ECDH runs
+bash eval/scripts/area_all.sh        # synthesis area, where the datapath allows
+./.venv/bin/python eval/scripts/reprice.py   # score Gate 3 against the RTL
 ```
 
-This builds the extension as PicoRV32 RTL, patches micro-ecc to use it, and runs
-one complete ECDH key exchange both ways on cycle-accurate RTL, checking the
-shared secrets still agree. See [eval/README.md](eval/README.md) for the harness
-and [eval/RESULTS.md](eval/RESULTS.md) for the measured outcome — which for the
-current spec is a 2% *slowdown* at +74% area, with the reasons measured.
+Each project's ISASpec is built as PicoRV32 RTL, the application is patched to
+use it, and the workload runs both ways on cycle-accurate RTL with the result
+signature checked against the baseline binary. The measured outcome:
+
+| project | baseline | extended | speedup | area |
+|---|---:|---:|---:|---|
+| micro-ecc | 298,502,758 | 178,231,186 | **1.6748×** | +76.6% LUT4 |
+| matrixmul | 1,040,318 | 71,392 | **14.5719×** | behavioural model |
+| libcrc | 852,200 | 405,322 | **2.1025×** | +18.0% LUT4 |
+
+2,060 differential vectors, 0 mismatches. An earlier micro-ecc spec measured a
+2% *slowdown* at +74% area, and Gate 3 exists because of that measurement;
+`eval/scripts/reprice.py` exists because the gate then over-predicted these
+three by 6.3×–7.0×. See [eval/README.md](eval/README.md) for the harness and
+[eval/RESULTS.md](eval/RESULTS.md) for the evidence.
 
 ---
 

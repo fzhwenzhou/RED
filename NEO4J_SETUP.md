@@ -94,13 +94,22 @@ loops would merge them — an accepted trade for a mechanical key.)
 ## What the agents do with it
 
 The A2 charter tells the designer to consult the graph **before** designing, via
-six tools on its existing server:
+seven tools on its existing server:
 
+- `graph_winning_shape(function)` — **the one to read first.** Only the
+  instructions that actually *shipped* in a converged run, with their
+  `work_per_word` and the speedup the gate credited. `prior_designs` lists
+  everything ever tried, failures included, and leaves the designer to infer
+  which rows are the lesson; this one *is* the lesson.
 - `graph_prior_designs(function)` — every instruction earlier runs built for that
   kernel: `words`, `mac_ops`, `invocations`, `work_per_word`, the speedup the
-  performance gate predicted, and whether that run converged.
+  performance gate predicted, and whether that run converged. Excludes the
+  asking run's own drafts — it used to return them, which is a designer's guess
+  handed back as evidence in a table labelled "what earlier runs learned".
 - `graph_prior_findings(function)` — the blocking and major objections reviewers
-  already raised about instructions for it.
+  already raised about instructions for it, **each with what became of the run
+  that heard it**. `run_converged = true` means that design shipped anyway; a
+  finding whose run died with it outstanding is the one to design around.
 - `graph_prior_security(function)` — security defects a machine already
   established against designs for this workload. Cheap to avoid at design time,
   expensive at Gate 4.
