@@ -1,0 +1,6 @@
+{
+  "counterexample": null,
+  "detail": "1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors",
+  "gate": "gate2",
+  "passed": true
+}

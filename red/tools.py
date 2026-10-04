@@ -3,21 +3,28 @@
 The destination paths are baked in at construction — the agents only ever see
 the payload, never a path they could redirect.
 
-**Two tool servers, not ten.** Every ChiaTool is a separate Ray actor, and each
-actor rescans the tool port range from its base port when it binds, so a tool
-per artifact cost minutes of startup before the first agent turn. The methods
-are grouped onto the two servers whose separation actually matters:
+**One server per agent that needs a different surface, not one per artifact.**
+The split is by *what an agent is allowed to see*, because that is the only
+boundary that does any work:
 
 ``DesignerTool``   the A1 mining / A2 synthesis agent's whole surface —
                    sources, profile, HotLoopReport, ISASpec, status, notes,
-                   finish. Its ``write_spec`` drops any ``spike_model``.
+                   the knowledge graph, finish. Its ``write_spec`` drops any
+                   ``spike_model``.
 ``IssTool``        the ISS implementer's surface — the spec with the reference
                    C models **withheld**, and a ``write_spec`` that accepts
                    only ``spike_model``.
+``WorkloadTool``   AW's surface — the project's sources, and one C file out.
+``SecurityTool``   the security reviewer's surface — read the spec, and *run*
+                   the instruction on operand values it chooses.
 
-That boundary is what makes Gate 2 mean anything: the two executable models are
-written by agents that cannot see each other's work. Everything else was just
-extra processes.
+That first boundary is what makes Gate 2 mean anything: the two executable
+models are written by agents that cannot see each other's work. It is enforced
+twice — the server only exposes those methods, and the backend allows the turn
+only those tools (`--strict-mcp-config`, see :mod:`red.backend`).
+
+Each server is a uvicorn app on a loopback port in a thread of this process
+(:mod:`red.localtool`).
 
 Both validate every write against the artifact schema before accepting, so a
 malformed artifact is rejected back to the agent rather than reaching a gate.
@@ -29,7 +36,7 @@ import json
 import os
 import re
 
-from chia.base.tools.ChiaTool import ChiaTool
+from red.localtool import LocalTool
 
 from red import graph, iss, state_def
 from red.constants import REPO_ROOT, find_sources
@@ -40,9 +47,11 @@ class _SourceMixin:
 
     Paths are resolved against ``source_roots`` -- the absolute project and core
     directories the driver passes in -- and NOT against a repo root computed
-    from this module's own location. A ChiaTool is a Ray actor that can be
-    scheduled on any node, where ``red`` may be installed somewhere unrelated to
-    the sources; deriving paths from the install location made ``list_sources``
+    from this module's own location. ``red`` may be installed somewhere
+    unrelated to the sources it is pointed at -- a venv, a different checkout,
+    a copy on another machine -- and deriving paths from the install location
+    (which is what RED did when every tool was a cluster actor) made
+    ``list_sources``
     emit things like ``../../../../../../home/naonao/RED/target_project/...``
     and made ``read_source`` reject every one of them. Both agents then designed
     blind: 28-32 failed reads per run, every run, with the designer guessing
@@ -634,7 +643,7 @@ class _GraphMixin:
 
 class DesignerTool(_SourceMixin, _ProfileMixin, _CoreMixin, _ReportMixin,
                    _SpecMixin, _StatusMixin, _KnowledgeMixin, _GraphMixin,
-                   _FinishMixin, ChiaTool):
+                   _FinishMixin, LocalTool):
     """Everything the mining and synthesis agents touch, on one server."""
 
     METHODS = ("list_sources", "read_source", "read_profile", "read_core",
@@ -663,7 +672,7 @@ class DesignerTool(_SourceMixin, _ProfileMixin, _CoreMixin, _ReportMixin,
         super().__post_init__()
 
 
-class IssTool(_IssSpecMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
+class IssTool(_IssSpecMixin, _StatusMixin, _KnowledgeMixin, LocalTool):
     """The ISS implementer's surface: the spec without the C models, the last
     verdict, and the shared notes."""
 
@@ -680,7 +689,7 @@ class IssTool(_IssSpecMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
             self.mcp.add_tool(getattr(self, m), name=f"{name}_{m}")
         super().__post_init__()
 
-class WorkloadTool(_SourceMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
+class WorkloadTool(_SourceMixin, _StatusMixin, _KnowledgeMixin, LocalTool):
     """The workload author's surface: read the repository, write one C file.
 
     It is the only agent in RED that writes something RED then *runs as the
@@ -731,7 +740,7 @@ class WorkloadTool(_SourceMixin, _StatusMixin, _KnowledgeMixin, ChiaTool):
                 "it is a workload.")
 
 
-class SecurityTool(_CoreMixin, _KnowledgeMixin, ChiaTool):
+class SecurityTool(_CoreMixin, _KnowledgeMixin, LocalTool):
     """The security sub-agent's surface — and the reason this repo does not
     simply ask a model whether the design looks safe.
 
@@ -877,39 +886,3 @@ class SecurityTool(_CoreMixin, _KnowledgeMixin, ChiaTool):
             self._append_finding(f)
         return (f"Recorded {len(found)} finding(s). The mechanical checks decide "
                 "the gate; yours reach the designer as advice.")
-
-
-class RelayTool:
-    """A relay-aware stand-in for a :class:`ChiaTool`, passed to the LLM backend.
-
-    The backends build each tool's MCP endpoint as
-    ``http://{tool.hostname}:{tool.port}/{tool.name}/mcp`` from the attributes of
-    the tool object they are handed. RED's tools are pinned to ``head_local``, so
-    that hostname is the head's own address — which a tunnelled cloud worker
-    cannot dial: CHIA reverse-forwards the head's tool ports onto the worker's
-    ``CHIA_TOOL_RELAY_HOST`` (same port numbers) instead. CHIA ships
-    :func:`chia.base.tools.ChiaTool.resolve_tool_url` for exactly this rewrite,
-    but no model backend calls it, so on a tunnelled cluster every agent turn
-    dies inside the MCP task group with an unreachable endpoint.
-
-    This proxy carries the tool's identity and resolves the host **lazily, on
-    whichever node reads it** — the relay environment variables only exist on the
-    worker. On a single machine (no relay vars) it returns the address unchanged,
-    so ``--local-llm`` behaves exactly as before.
-    """
-
-    __slots__ = ("name", "port", "node_id", "_hostname")
-
-    def __init__(self, tool: ChiaTool):
-        self.name = tool.name
-        self.port = getattr(tool, "port", 8000)
-        self.node_id = getattr(tool, "node_id", None)
-        self._hostname = tool.hostname
-
-    @property
-    def hostname(self) -> str:
-        advertise = os.environ.get("CHIA_TOOL_ADVERTISE_HOST")
-        relay = os.environ.get("CHIA_TOOL_RELAY_HOST")
-        if advertise and relay and self._hostname == advertise:
-            return relay
-        return self._hostname

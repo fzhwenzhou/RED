@@ -1,22 +1,22 @@
 {
-  "app_speedup": 6.264822576291572,
-  "covered_share": 0.9662785846954888,
-  "detail": "covers 96.6% of profiled cycles; predicted whole-application speedup 6.26x\n  fdot2_custom: 92 cyc (10 beats, 2 MAC, 0.20 MAC/word, x48 per call) + 129 marshalling vs 1692 cyc of software = 7.67x \u2014 its C model executes 227 instructions, of which 198 are not accounted for by mac_ops=2; charged as 40 sequential logic steps",
+  "app_speedup": 1.1324913899261717,
+  "covered_share": 0.9954101325391475,
+  "detail": "covers 99.5% of profiled cycles; predicted whole-application speedup 1.13x\n  fdot10.s: 166 cyc (42 beats, 10 MAC, 0.24 MAC/word, x3,000,000 per call) + 542 marshalling vs 802 cyc of software = 1.13x",
   "measurement_error": "",
   "per_instruction": [
     {
-      "beats": 10,
-      "cycles": 91.5125,
-      "invocations": 48,
-      "mac_ops": 2,
-      "marshal_cycles": 129.0,
-      "mnemonic": "fdot2_custom",
-      "note": "its C model executes 227 instructions, of which 198 are not accounted for by mac_ops=2; charged as 40 sequential logic steps",
-      "replaced_cycles": 1692.4262499999998,
-      "replaces": "multiply::hot",
-      "speedup": 7.674967405475879,
+      "beats": 42,
+      "cycles": 166.0,
+      "invocations": 3000000,
+      "mac_ops": 10,
+      "marshal_cycles": 541.8000000000001,
+      "mnemonic": "fdot10.s",
+      "note": "",
+      "replaced_cycles": 802.06740639,
+      "replaces": "multiply::ijk_mac",
+      "speedup": 1.1331836767307149,
       "unverified": "",
-      "words": 5
+      "words": 21
     }
   ],
   "unverified": []

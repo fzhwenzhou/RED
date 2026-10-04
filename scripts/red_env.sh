@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================================
-# red_env.sh — one-stop environment manager for the RED cluster.
+# red_env.sh — environment manager for RED.
 #
-#   bash scripts/red_env.sh setup    # one-time: local head prep + GCP auth + up
-#   bash scripts/red_env.sh up       # (re)bring-up the cluster (idempotent)
-#   bash scripts/red_env.sh down     # tear everything down, verify nothing bills
-#   bash scripts/red_env.sh status   # ray + GCP state at a glance
+#   bash scripts/red_env.sh setup    # one-time: venv, packages, graph, self-test
+#   bash scripts/red_env.sh check    # is this machine ready to run the loop?
+#   bash scripts/red_env.sh status   # graph + toolchain + backend at a glance
+#   bash scripts/red_env.sh stop     # stop the knowledge graph (optional)
 #
-# The head is THIS machine (WSL). Workers are GCP spot/preemptible VMs defined
-# in cluster.yaml. Everything here is idempotent — safe to re-run any command.
+# RED runs entirely on this machine. There is no cluster to bring up and
+# nothing that bills while it is idle: the agent turns are subprocesses of the
+# `claude` CLI, the tools are in-process MCP servers on loopback, and the only
+# long-lived piece is the Neo4j knowledge graph, which is RED's memory across
+# runs and is deliberately left running.
 #
 # Layout it relies on:
-#   $HOME/RED           this repo (venv at .venv/, config at cluster.yaml)
-#   $HOME/chia          CHIA checkout (installed editable into the venv)
-#   ~/.ssh/id_ed25519   SSH keypair shared with the GCP workers
-#   GCP project         RED_GCP_PROJECT (default: project-160a0199-6b4a-464c-86a)
+#   $HOME/RED           this repo (venv at .venv/)
+#   claude              the Claude Code CLI, on PATH and already authenticated
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-CHIA_DIR="${RED_CHIA_DIR:-$HOME/chia}"
 VENV="${RED_VENV:-$REPO_ROOT/.venv}"
-CLUSTER_YAML="${RED_CLUSTER_YAML:-$REPO_ROOT/cluster.yaml}"
-export RED_GCP_PROJECT="${RED_GCP_PROJECT:-project-160a0199-6b4a-464c-86a}"
-SSH_KEY="${RED_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+CLAUDE_BIN="${RED_CLAUDE_BIN:-claude}"
 
 # ---------------------------------------------------------------------------
 # logging
@@ -38,96 +36,10 @@ warn() { echo "  ${Y}warning:${N} $*" >&2; }
 die()  { echo "  ${R}error:${N} $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 py()   { "$VENV/bin/python" "$@"; }
-gcp()  { py "$SCRIPT_DIR/gcp_util.py" "$@"; }
-
-# ---------------------------------------------------------------------------
-# Cluster environment — resolved fresh every run (WSL IP changes on reboot).
-#   HEAD_IP        this machine's own IP (NOT the public egress IP — CHIA
-#                  brings the head up over SSH to this address, and the NAT/
-#                  router refuses inbound :22 on the public one)
-#   GCP_COMPUTE_SA default compute SA, attached to the llm node so Vertex AI
-#                  works via the metadata server (no gcloud login on the node)
-# ---------------------------------------------------------------------------
-export_cluster_env() {
-    export HEAD_IP="${HEAD_IP:-$(hostname -I | awk '{print $1}')}"
-    export USER="${USER:-$(whoami)}"
-    if [ -z "${GCP_COMPUTE_SA:-}" ]; then
-        GCP_COMPUTE_SA="$(gcp default-sa 2>/dev/null)" || warn "could not resolve default compute SA (ADC set up?)"
-        export GCP_COMPUTE_SA
-    fi
-    say "HEAD_IP=$HEAD_IP  USER=$USER  project=$RED_GCP_PROJECT"
-}
-
-# ---------------------------------------------------------------------------
-# known_hosts hygiene
-#
-# GCP recycles external IPs within a project, so an address that was the
-# database node last time comes back as the llm node with a different host key.
-# ssh then refuses the connection ("Host key verification failed"), chia's
-# `echo ok` setup probe times out, and the bring-up fails on that node -- or
-# worse, a reverse tunnel dies mid-run and the driver blocks on a resource that
-# has silently left the cluster. Purging the cluster's addresses before we use
-# them and again as we tear them down keeps a recycled IP from carrying a dead
-# key into the next run.
-# ---------------------------------------------------------------------------
-purge_known_hosts() {
-    # `|| true`: with no instances grep finds nothing and exits 1, which under
-    # `set -e` would abort the whole bring-up before it started.
-    local ips; ips="$(gcp list 2>/dev/null \
-        | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | sort -u || true)"
-    [ -z "$ips" ] && return 0
-    local n=0
-    for ip in $ips; do
-        if ssh-keygen -R "$ip" >/dev/null 2>&1; then n=$((n + 1)); fi
-    done
-    [ "$n" -gt 0 ] && ok "purged known_hosts for $n cluster address(es)"
-    return 0
-}
 
 # ===========================================================================
 # setup steps (idempotent)
 # ===========================================================================
-
-step_ssh_key() {
-    say "SSH keypair"
-    if [ ! -f "$SSH_KEY" ]; then
-        ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -q
-        ok "generated $SSH_KEY"
-    else
-        ok "$SSH_KEY exists"
-    fi
-    # The head must be able to SSH to itself (CHIA brings the head up over SSH).
-    touch "$HOME/.ssh/authorized_keys"
-    if ! grep -qf "$SSH_KEY.pub" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-        cat "$SSH_KEY.pub" >> "$HOME/.ssh/authorized_keys"
-        chmod 600 "$HOME/.ssh/authorized_keys"
-        ok "authorized own pubkey"
-    else
-        ok "pubkey already authorized"
-    fi
-}
-
-step_sshd() {
-    say "SSH server on the head (WSL)"
-    if ! have sshd && ! dpkg -s openssh-server >/dev/null 2>&1; then
-        sudo apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
-        ok "openssh-server installed"
-    else
-        ok "openssh-server present"
-    fi
-    if ! pgrep -x sshd >/dev/null; then
-        sudo systemctl enable --now ssh
-        ok "sshd started"
-    else
-        ok "sshd running"
-    fi
-    export HEAD_IP="${HEAD_IP:-$(hostname -I | awk '{print $1}')}"
-    timeout 10 ssh -o StrictHostKeyChecking=no -o BatchMode=yes -i "$SSH_KEY" \
-        "$USER@$HEAD_IP" true 2>/dev/null \
-        && ok "self-SSH to $HEAD_IP works" \
-        || die "self-SSH to $HEAD_IP failed — check sshd and authorized_keys"
-}
 
 step_venv() {
     say "Python venv + packages"
@@ -136,43 +48,74 @@ step_venv() {
         python3 -m venv "$VENV"
         ok "created $VENV"
     fi
-    py -c "import chia" 2>/dev/null || { py -m pip install -q -e "$CHIA_DIR"; ok "installed chia (editable)"; }
-    py -c "import red"  2>/dev/null || { py -m pip install -q -e "$REPO_ROOT"; ok "installed red (editable)"; }
+    py -c "import red" 2>/dev/null \
+        || { py -m pip install -q -e "$REPO_ROOT"; ok "installed red (editable)"; }
+    py -c "import neo4j" 2>/dev/null \
+        || { py -m pip install -q "neo4j>=5.0"; ok "installed neo4j driver"; }
     py - <<'EOF' || die "venv sanity check failed"
-import chia, red, ray, google.auth
-from google.cloud import compute_v1
+import red, mcp, uvicorn
 EOF
-    ok "venv imports: chia, red, ray, google-cloud-compute"
+    ok "venv imports: red, mcp, uvicorn"
 }
 
-step_gcp_auth() {
-    say "GCP Application Default Credentials (head)"
-    local adc="$HOME/.config/gcloud/application_default_credentials.json"
-    if [ ! -f "$adc" ]; then
-        have gcloud || die "gcloud CLI not found — install the Google Cloud SDK first"
-        warn "no ADC found — starting interactive login (browser)..."
-        gcloud auth application-default login
+# ---------------------------------------------------------------------------
+# The agent backend.
+#
+# Every A1/A2/review/security/workload turn is `claude -p` with a generated
+# MCP config and an explicit --allowedTools list (red/backend.py). The CLI
+# carries its own authentication, so there is nothing for RED to configure --
+# but if it is missing or unauthenticated, every turn fails identically and
+# the loop degrades to its mechanical path, which is a confusing way to find
+# out. So check it here, once, where the message can say what to do.
+# ---------------------------------------------------------------------------
+step_backend() {
+    say "Agent backend (Claude Code CLI)"
+    have "$CLAUDE_BIN" || die "'$CLAUDE_BIN' not on PATH — install the Claude Code CLI, or run with --mechanical"
+    ok "$CLAUDE_BIN $("$CLAUDE_BIN" --version 2>/dev/null | head -1)"
+    local probe
+    probe="$(echo 'reply with the single word: ready' \
+             | timeout 120 "$CLAUDE_BIN" -p --output-format text 2>&1)" \
+        && ok "a turn round-trips: $(echo "$probe" | head -1 | cut -c1-60)" \
+        || warn "the CLI did not answer a probe turn — authenticate it ($CLAUDE_BIN), then re-run"
+}
+
+step_toolchain() {
+    say "Toolchain"
+    py - <<'EOF'
+from red.constants import EXPECTED_TOOLS
+import shutil
+missing = []
+for group, tools in EXPECTED_TOOLS.items():
+    have = [t for t in tools if shutil.which(t)]
+    gone = [t for t in tools if not shutil.which(t)]
+    missing += gone
+    mark = "ok" if not gone else "  "
+    print(f"  {mark} {group:8s} {' '.join(have)}" + (f"   MISSING: {' '.join(gone)}" if gone else ""))
+if missing:
+    print("     (a missing tool degrades the stage that needs it to a typed")
+    print("      'not available' result; spike comes from scripts/setup_spike.sh)")
+EOF
+    # Gate 4's constant-time evidence is memcheck under the ctgrind technique,
+    # and memcheck refuses to start at all without glibc debuginfo. The gate
+    # reports that honestly as NOT CHECKED rather than passing on it -- which
+    # is correct, and also easy to miss at the bottom of a run summary. Say it
+    # here instead, where it is one apt away from being fixed.
+    if command -v valgrind >/dev/null 2>&1; then
+        if valgrind --tool=memcheck --error-exitcode=0 /bin/true >/dev/null 2>&1; then
+            ok "memcheck runs — Gate 4's constant-time check is live"
+        else
+            warn "memcheck cannot start, so Gate 4 will report its secret-branch"
+            warn "check as NOT CHECKED. Fix: sudo apt-get install -y libc6-dbg"
+        fi
     fi
-    ok "ADC present"
-    # Silence the 'no quota project' warning and bill API usage correctly.
-    gcloud auth application-default set-quota-project "$RED_GCP_PROJECT" >/dev/null 2>&1 \
-        && ok "quota project set" || warn "set-quota-project failed (non-fatal)"
-    say "GCP APIs (compute, aiplatform)"
-    gcp ensure-apis || die "could not enable required GCP APIs"
-}
-
-step_tests() {
-    say "Environment self-test"
-    (cd "$REPO_ROOT" && py tests/test_env.py) && ok "tests/test_env.py passed" \
-        || die "tests/test_env.py failed — fix before bringing the cluster up"
 }
 
 # ---------------------------------------------------------------------------
 # Knowledge graph (Neo4j) — see scripts/setup_neo4j.sh
 #
-# It runs on the head and its data outlives every cluster, so bring-up only has
-# to make sure it is up; teardown deliberately leaves it running, because the
-# graph is what the NEXT run reads.
+# Its data outlives every run, so setup only has to make sure it is up. It is
+# optional: without it RED still runs, it just starts every run with no memory
+# of the previous ones.
 # ---------------------------------------------------------------------------
 graph_up() {
     local s="$SCRIPT_DIR/setup_neo4j.sh"
@@ -183,132 +126,71 @@ graph_up() {
         return 0
     fi
     if bash "$s" start >/dev/null 2>&1; then
-        ok "knowledge graph up ($("$VENV/bin/python" -m red.graph --stats 2>/dev/null \
-             | sed 's/^ *//' || echo 'bolt://127.0.0.1:7687'))"
+        ok "knowledge graph up ($(py -m red.graph --stats 2>/dev/null \
+             | sed 's/^ *//' | head -1 || echo 'bolt://127.0.0.1:7687'))"
     else
         warn "knowledge graph did not start — the run will proceed without history"
     fi
 }
 
-# ===========================================================================
-# cluster commands
-# ===========================================================================
-
-cmd_up() {
-    export_cluster_env
-    purge_known_hosts
-    graph_up
-    [ -f "$HOME/.config/gcloud/application_default_credentials.json" ] \
-        || die "no ADC — run: bash $0 setup"
-    gcp ensure-apis >/dev/null || die "required GCP APIs not enabled"
-    # The llm node authenticates to Vertex as the default compute SA (metadata
-    # ADC). That SA ships with NO project roles on fresh projects — grant the
-    # predict role or every LLM turn 403s with aiplatform.endpoints.predict
-    # denied.
-    gcp ensure-iam >/dev/null || die "could not grant aiplatform.user to the default compute SA"
-
-    # The llm node gets its Vertex credentials from its attached service
-    # account, which is only settable at instance creation. If a stale llm
-    # instance is running without one, say so loudly instead of failing
-    # mysteriously inside red.loop later.
-    local llm_sa; llm_sa="$(gcp llm-sa)"
-    if [ "$llm_sa" = "NONE" ]; then
-        warn "running llm node has NO service account — Vertex calls will fail."
-        warn "recreate it:  bash $0 down && bash $0 up"
-    fi
-
-    # `chia up` provisions; against instances that already exist it fails with a
-    # 409 rather than reusing them. `chia up --add` is the idempotent path: it
-    # discovers what is already there, provisions only what is missing, and
-    # joins everything to the running head. Use it whenever this cluster already
-    # has instances.
-    local existing; existing="$(gcp count)"
-    local head_live=no
-    "$VENV/bin/ray" status >/dev/null 2>&1 && head_live=yes
-    if [ "${existing:-0}" -gt 0 ] && [ "$head_live" = yes ]; then
-        say "chia up --add ($existing existing instance(s), head is live)"
-        (cd "$REPO_ROOT" && "$VENV/bin/chia" up --add -y "$CLUSTER_YAML")
-    elif [ "${existing:-0}" -gt 0 ]; then
-        # Instances exist but the head's ray is not running. `--add` needs a
-        # live head to join them to, so it cannot recover this state — and
-        # leaving the instances up would bill for nodes nothing can reach.
-        # This happens after a `down` that terminated the head's ray while a
-        # bring-up left instances behind (a setup step timing out on SSH, say).
-        warn "$existing orphaned instance(s) with no live head — terminating them first"
-        (cd "$REPO_ROOT" && "$VENV/bin/chia" down -y "$CLUSTER_YAML") || true
-        gcp force-clean
-        say "chia up (fresh)"
-        (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
-    else
-        say "chia up"
-        (cd "$REPO_ROOT" && "$VENV/bin/chia" up -y "$CLUSTER_YAML")
-    fi
-
-    say "ray status"
-    "$VENV/bin/ray" status | sed -n '1,12p'
-    # 4 nodes: head_local (this machine) + the llm/database/profile GCP VMs.
-    local active; active="$("$VENV/bin/ray" status | grep -c '^ 1 node_' || true)"
-    [ "$active" -ge 4 ] && ok "cluster up: $active nodes" \
-        || warn "only $active nodes active (expected 4) — check the log above"
-
-    [ "$(gcp llm-sa)" != "NONE" ] && [ "$(gcp llm-sa)" != "ABSENT" ] \
-        && ok "llm node service account attached (Vertex ADC via metadata)"
-    echo
-    ok "cluster ready — run the loop with:  python -m red.loop"
+step_tests() {
+    say "Environment self-test"
+    (cd "$REPO_ROOT" && py tests/test_env.py) && ok "tests/test_env.py passed" \
+        || die "tests/test_env.py failed — fix before running the loop"
 }
 
-cmd_down() {
-    export_cluster_env
-    purge_known_hosts
-    say "chia down"
-    (cd "$REPO_ROOT" && "$VENV/bin/chia" down -y "$CLUSTER_YAML") \
-        || warn "chia down reported errors — force-cleaning leftovers directly"
-    # Safety net: `chia down` can fail midway (e.g. a preempted spot node
-    # breaks its config expansion) and leave instances billing. Delete any
-    # remaining cluster resources directly via the compute API.
-    say "force-clean any leftovers"
-    gcp force-clean
-    "$VENV/bin/ray" stop >/dev/null 2>&1 || true
-    say "verifying nothing is left billing"
-    gcp verify-clean || die "leftover resources above — delete them in the console or re-run down"
-    ok "cluster down, local ray stopped, nothing billing"
-    # The graph is intentionally left running: it is RED's memory across runs,
-    # and stopping it here would make `down` look like it had deleted history.
-    say "knowledge graph"
-    "$VENV/bin/python" -m red.graph --stats 2>/dev/null \
-        || echo "  (not running — start it with: bash $SCRIPT_DIR/setup_neo4j.sh start)"
+# ===========================================================================
+# commands
+# ===========================================================================
+
+cmd_setup() {
+    step_venv
+    step_backend
+    step_toolchain
+    graph_up
+    step_tests
+    echo
+    ok "setup complete — run the loop with:  python -m red.loop"
+}
+
+cmd_check() {
+    step_backend
+    step_toolchain
+    graph_up
+    echo
+    ok "ready — run the loop with:  python -m red.loop"
 }
 
 cmd_status() {
-    export_cluster_env
-    say "ray (local head)"
-    "$VENV/bin/ray" status 2>/dev/null | sed -n '1,12p' || warn "no local ray cluster"
+    say "Agent backend"
+    have "$CLAUDE_BIN" \
+        && ok "$CLAUDE_BIN $("$CLAUDE_BIN" --version 2>/dev/null | head -1)" \
+        || warn "'$CLAUDE_BIN' not on PATH"
     echo
-    say "GCP project $RED_GCP_PROJECT"
-    gcp list
+    step_toolchain
     echo
-    say "knowledge graph"
-    "$VENV/bin/python" -m red.graph --stats 2>/dev/null \
+    say "Knowledge graph"
+    py -m red.graph --stats 2>/dev/null \
         || echo "  (not running — bash $SCRIPT_DIR/setup_neo4j.sh start)"
-}
-
-cmd_setup() {
-    step_ssh_key
-    step_sshd
-    step_venv
-    step_gcp_auth
-    step_tests
-    cmd_up
     echo
-    ok "setup complete. Daily use:  bash $0 up / down / status"
+    say "Runs on disk"
+    local db="${RED_DB_ROOT:-$REPO_ROOT/output/db}"
+    [ -d "$db" ] \
+        && echo "  $(find "$db" -maxdepth 2 -name 'run_*' -type d | wc -l) run(s) under $db" \
+        || echo "  none yet ($db)"
 }
 
-# ===========================================================================
+cmd_stop() {
+    say "Stopping the knowledge graph"
+    bash "$SCRIPT_DIR/setup_neo4j.sh" stop \
+        && ok "stopped (its data is kept; 'setup_neo4j.sh start' brings it back)" \
+        || warn "it was not running"
+}
 
 case "${1:-}" in
-    setup)        cmd_setup ;;
-    up)           cmd_up ;;
-    down|clean)   cmd_down ;;
-    status)       cmd_status ;;
-    *) sed -n '2,16p' "$0"; exit "${1:+1}" ;;
+    setup)   cmd_setup ;;
+    check)   cmd_check ;;
+    status)  cmd_status ;;
+    stop)    cmd_stop ;;
+    *) sed -n '2,19p' "$0"; exit "${1:+1}" ;;
 esac

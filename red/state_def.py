@@ -13,8 +13,9 @@ design:
 * ``GateResult`` — the verdict of one programmatic evaluation edge (Gate 1,
   Gate 2, link 1, link 2); a failure carries a counterexample.
 
-These are persisted verbatim in CHIA's store (``red.db_node``) for audit and
-reuse, mirroring the ``HotLoopReport``/``ISASpec`` contract in the RED design.
+These are persisted verbatim in the durable store (``red.db_node``) for audit
+and reuse: every one is written the moment it is produced, so a run killed
+halfway still leaves the record of what it had decided.
 """
 
 from __future__ import annotations

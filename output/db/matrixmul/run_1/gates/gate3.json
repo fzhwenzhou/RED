@@ -1,6 +1,6 @@
 {
   "counterexample": null,
-  "detail": "predicted 6.26x over 97% of cycles (bar 2.00x)",
+  "detail": "predicted 7.79x over 100% of cycles (bar 1.32x; relaxed for redesign round 2, priced on the shipped spec)",
   "gate": "gate3",
   "passed": true
 }

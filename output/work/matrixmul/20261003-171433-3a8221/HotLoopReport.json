@@ -1,0 +1,38 @@
+{
+  "coverage": 1.0,
+  "loops": [
+    {
+      "body": "for (int i = 1; i <= matrixC->rows; i++) {\n        for (int j = 1; j <= matrixC->columns; j++) {\n            for (int k = 1; k <= matrixA->columns; k++) {\n                setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);\n            }\n        }\n    }",
+      "calls": 1,
+      "cycle_share": 0.9954101325391475,
+      "dynamic_cycles": 282749967,
+      "function": "multiply",
+      "ir": "",
+      "loop_id": "multiply::ijk_mac",
+      "operand_stats": "Triple-nested naive GEMM over single-precision float (32-bit IEEE-754) elements stored row-major in a fixed float[100] array (MAX_ELEMENTS) inside a struct with unsigned char (8-bit) rows/columns. Innermost body is a float multiply-accumulate: C[i][j] += A[i][k] * B[k][j]. getElement/setElement are inlined (no separate call counts in the profile; all cycles land in multiply). Each inner iteration recomputes three 1-based indices (row-1)*columns+(column-1) -> an 8-bit*8-bit integer multiply-add per access, then a 4-byte scaled address. Memory pattern: A walked unit-stride along k (row), B walked with stride = B.columns*4 bytes along k (column), C[i][j] loaded and stored every k iteration (loop-carried accumulator recurrence through memory, since matrixC aliasing with A/B is not excluded). Candidate patterns: fused float MAC (fmadd.s), fused 2D index computation (idx = (r-1)*cols+(c-1) with base+scale), strided load, keeping the C accumulator in a register. Dimensions bounded by 100 elements, so k trip count <= 100 per (i,j). Exact trip count unknown from sources (harness-driven).",
+      "rank": 1,
+      "source_file": "matrixmul/matrixmul.h",
+      "trip_count": 0
+    },
+    {
+      "body": "for (int i = 0; i < MAX_ELEMENTS; i++) {\n        matrix->elements[i] = 0;\n    }",
+      "calls": 1,
+      "cycle_share": 0.9954101325391475,
+      "dynamic_cycles": 282749967,
+      "function": "multiply",
+      "ir": "",
+      "loop_id": "multiply::clearMatrix_zero",
+      "operand_stats": "Inlined clearMatrix inside multiply: fixed 100-iteration unit-stride store of 32-bit float zero to C.elements; no loads, no recurrence. Negligible share relative to the MAC nest; included only for completeness of multiply's cycles.",
+      "rank": 2,
+      "source_file": "matrixmul/matrixmul.h",
+      "trip_count": 100
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20261003-171433-3a8221/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20261003-171433-3a8221/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    284053736
+  ],
+  "workload": "matrixmul"
+}

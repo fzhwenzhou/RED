@@ -1,36 +1,36 @@
 {
   "critic_rounds": 1,
-  "description": "Accelerates the floating-point matrix multiplication kernel using a 2-element dot-product instruction.",
+  "description": "One custom-0 instruction, FDOT10.S. It computes up to 10 chained single-precision multiply-accumulate steps of the matrixmul GEMM k-loop (C[i][j] += A[i][k]*B[k][j]) in a single instruction. Each step is rounded exactly like the application's own non-fused code, so results are bit-identical. The workload multiplies 10x10 matrices 30,000 times. One FDOT10.S produces a whole C[i][j], so there are 100 invocations per multiply and 3,000,000 per profiled kernel call. PicoRV32 RV32IM has no FPU, so every float MUL and ADD is a soft-float routine costing hundreds of cycles. Replacing 10 MACs (20 soft-float calls plus index arithmetic and C loads and stores) with one 21-word streaming instruction gives about 0.24 MAC per operand word moved. The kernel is 99.5% of cycles, so the Amdahl ceiling is about 218x.",
   "encodings": [],
   "gate2_vectors": 0,
   "instructions": [
     {
-      "c_model": "#include <stdint.h>\n#include <string.h>\n\nstatic inline uint32_t nan_canon(uint32_t u) {\n    uint32_t exp = (u >> 23) & 0xFFu;\n    uint32_t frac = u & 0x7FFFFFu;\n    uint32_t sign = u & 0x80000000u;\n    \n    uint32_t exp_nz = (exp | (0u - exp)) >> 31;\n    uint32_t exp_zero_mask = (exp_nz ^ 1u) * 0xFFFFFFFFu;\n    \n    uint32_t frac_nz = (frac | (0u - frac)) >> 31;\n    uint32_t frac_nz_mask = frac_nz * 0xFFFFFFFFu;\n    \n    uint32_t subnormal_mask = exp_zero_mask & frac_nz_mask;\n    \n    uint32_t exp_not_ff = exp ^ 0xFFu;\n    uint32_t exp_not_ff_nz = (exp_not_ff | (0u - exp_not_ff)) >> 31;\n    uint32_t exp_ff_mask = (exp_not_ff_nz ^ 1u) * 0xFFFFFFFFu;\n    \n    uint32_t nan_mask = exp_ff_mask & frac_nz_mask;\n    \n    uint32_t flushed = (u & ~subnormal_mask) | (sign & subnormal_mask);\n    uint32_t res = (flushed & ~nan_mask) | (0x7FC00000u & nan_mask);\n    \n    return res;\n}\n\nstatic inline float ftz(float f) {\n    uint32_t u;\n    memcpy(&u, &f, 4);\n    u = nan_canon(u);\n    float res;\n    memcpy(&res, &u, 4);\n    return res;\n}\n\nvoid fdot2_custom_model(const uint32_t in[5], uint32_t out[5]) {\n    float c, a0, a1, b0, b1;\n    \n    memcpy(&c,  &in[0], 4);\n    memcpy(&a0, &in[1], 4);\n    memcpy(&a1, &in[2], 4);\n    memcpy(&b0, &in[3], 4);\n    memcpy(&b1, &in[4], 4);\n    \n    c = ftz(c);\n    a0 = ftz(a0);\n    a1 = ftz(a1);\n    b0 = ftz(b0);\n    b1 = ftz(b1);\n    \n    float p0 = ftz(a0 * b0);\n    float sum1 = ftz(c + p0);\n    \n    float p1 = ftz(a1 * b1);\n    float sum2 = ftz(sum1 + p1);\n    \n    uint32_t res_u;\n    memcpy(&res_u, &sum2, 4);\n    res_u = nan_canon(res_u);\n    \n    out[0] = res_u;\n    out[1] = 0;\n    out[2] = 0;\n    out[3] = 0;\n    out[4] = 0;\n}",
-      "encoding": "0000110 rs2 rs1 000 rd 0001011",
+      "c_model": "#include <stdint.h>\n#include <string.h>\n\n/* mnemonic \"fdot10.s\" -> fdot10_s_model.\n * in[2k]=A[i][k], in[2k+1]=B[k][j] for k=0..9 ; in[20]=starting accumulator c.\n * out[0] = canon(((c + a0*b0) + a1*b1) + ... + a9*b9), every op a separately\n * rounded binary32 RNE operation; out[1..20] = 0. */\nstatic float f32_from_bits(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }\nstatic uint32_t f32_to_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }\n\nvoid fdot10_s_model(const uint32_t in[21], uint32_t out[21]) {\n    float acc = f32_from_bits(in[20]);\n    int k;\n    for (k = 0; k < 10; k++) {\n        float a = f32_from_bits(in[2 * k]);\n        float b = f32_from_bits(in[2 * k + 1]);\n        /* separate statements: product and sum rounded on their own (no contraction) */\n        float p = a * b;\n        acc = acc + p;\n    }\n    {\n        uint32_t r = f32_to_bits(acc);\n        uint32_t is_nan = (uint32_t)((r & 0x7FFFFFFFu) > 0x7F800000u);\n        uint32_t m = (uint32_t)0 - is_nan;\n        out[0] = (0x7FC00000u & m) | (r & ~m);\n    }\n    for (k = 1; k < 21; k++) out[k] = 0;\n}\n",
+      "encoding": "0000000 rs2 rs1 000 rd 0001011",
       "funct3": "000",
-      "funct7": "0000110",
-      "invocations": 48,
-      "mac_ops": 2,
-      "marshal_words": 5,
-      "mnemonic": "fdot2_custom",
-      "name": "Float Dot Product 2",
+      "funct7": "0000000",
+      "invocations": 3000000,
+      "mac_ops": 10,
+      "marshal_words": 21,
+      "mnemonic": "fdot10.s",
+      "name": "Float 10-term dot-product-accumulate",
       "opcode": "custom-0",
       "operands": [
         "rd",
         "rs1",
         "rs2"
       ],
-      "pseudocode": "float c = as_float(in[0]);\nfloat a0 = as_float(in[1]);\nfloat a1 = as_float(in[2]);\nfloat b0 = as_float(in[3]);\nfloat b1 = as_float(in[4]);\n\n// Flush subnormals\nif (is_subnormal(c)) c = 0.0f;\nif (is_subnormal(a0)) a0 = 0.0f;\nif (is_subnormal(a1)) a1 = 0.0f;\nif (is_subnormal(b0)) b0 = 0.0f;\nif (is_subnormal(b1)) b1 = 0.0f;\n\nfloat p0 = a0 * b0;\nif (is_subnormal(p0)) p0 = 0.0f;\nfloat sum1 = c + p0;\nif (is_subnormal(sum1)) sum1 = 0.0f;\n\nfloat p1 = a1 * b1;\nif (is_subnormal(p1)) p1 = 0.0f;\nfloat sum2 = sum1 + p1;\nif (is_subnormal(sum2)) sum2 = 0.0f;\n\nif (is_nan(sum2)) sum2 = canon_nan();\n\nout[0] = as_uint32(sum2);\nout[1] = 0;\nout[2] = 0;\nout[3] = 0;\nout[4] = 0;\n\nrd = 0;",
-      "replaces": "multiply::hot",
-      "semantics": "This instruction computes a 2-element single-precision floating point dot product. The RED ABI expects `rs1` to be a pointer to a 5-word input block in memory, and `rs2` to be a pointer to a 5-word output block. The input block `in[0..4]` contains five 32-bit floating-point values: `in[0]` is the scalar accumulator `C`. `in[1]` and `in[2]` are elements from vector A. `in[3]` and `in[4]` are elements from vector B. The instruction computes `C = C + (A0 * B0) + (A1 * B1)` using standard round-to-nearest-even semantics, accumulating sequentially (`(C + A0*B0) + A1*B1`). To guarantee strictly constant-time hardware execution without an FPU, it explicitly flushes subnormal inputs and intermediate/output values to zero, canonizes NaNs, and silently discards all floating-point exceptions without modifying the FCSR. The computed single-precision float is written to `out[0]`. The remaining output words `out[1]` through `out[4]` are zero-padded. The architectural register `rd` is written with 0.",
+      "pseudocode": "acc_0 = in[20]\nfor k in 0..9:                       // fixed trip count 10\n    a_k = in[2*k]\n    b_k = in[2*k + 1]\n    p_k = f32_mul_rne(a_k, b_k)\n    acc_{k+1} = f32_add_rne(acc_k, p_k)\nt = acc_10\nis_nan = ((t & 0x7FFFFFFF) > 0x7F800000) ? 1 : 0\nm = 0 - is_nan                       // all-ones if NaN else 0 (mask select)\nres = (0x7FC00000 & m) | (t & ~m)\nout[0] = res\nfor w in 1..20: out[w] = 0\nrd = res",
+      "replaces": "multiply::ijk_mac",
+      "semantics": "Operand block ABI: rs1 holds the word-aligned address of a 21-word input block in[0..20]. rs2 holds the word-aligned address of a 21-word output block out[0..20]. All words are IEEE-754 binary32 bit patterns. Packing, interleaved so the hardware can stream pairs: for k = 0..9, in[2k] = a_k = A[i][k] and in[2k+1] = b_k = B[k][j]. in[20] = c, the starting accumulator: +0.0 (0x00000000) for a fresh C element, or the previous partial sum when an inner dimension longer than 10 is chained over several invocations. Computation: acc_0 = c, then for k = 0,1,...,9 in that order: p_k = a_k * b_k and acc_{k+1} = acc_k + p_k. Every multiply and every add is a separate IEEE-754 binary32 operation rounded to nearest, ties to even. Nothing is fused and there is no wider intermediate precision. This is exactly the order and rounding of the application's loop `C = C + A*B` over k, so the result is bit-identical to the software. Subnormals are fully supported as inputs and results: no flush-to-zero and no denormals-are-zero. NaN: if acc_10 is any NaN (exponent all ones and fraction nonzero), the result is the canonical quiet NaN 0x7FC00000. Otherwise the result is acc_10's exact bit pattern, including signed zero and infinities. So inf*0 or (+inf)+(-inf) anywhere in the chain yields 0x7FC00000. Rounding mode is fixed at RNE, no fcsr is read or written (the core has no F extension), and all FP exception flags are discarded. Shorter inner dimensions (K < 10): the caller sets the unused pairs to a_k = b_k = +0.0. Each padding step then adds p_k = +0 to the accumulator, which leaves it unchanged unless it is -0, which becomes +0. A chain that starts from c = +0 (clearMatrix) can never hold -0, so padding is exact for the application. Outputs: out[0] = result, and out[1] through out[20] are each written with 0x00000000. The result is also written to rd (pcpi_wr=1, pcpi_rd=result), so the caller stores it straight to C[i][j]. If rd = x0 the register write is dropped as usual. Timing: latency is fixed and independent of operand values. The hardware streams the 20 interleaved words a pair at a time (2 words of operand state, not a 21-word buffer). For each pair it does a 24x24 unsigned mantissa multiply (the core's fast_mul is not reachable from PCPI, and this is a float significand multiplier, not a duplicate 32x32 integer MUL), then a fixed-width align/add/normalize/round with no early exit on zero, subnormal, infinity or NaN. Every pair takes the same number of cycles. It then writes the 21 output words. pcpi_wait is raised the cycle after pcpi_valid (within the 16-cycle timeout). pcpi_ready is pulsed for one cycle, and the unit waits for !pcpi_valid (S_WAIT) before accepting another instruction.",
       "spike_model": "",
-      "words": 5
+      "words": 21
     }
   ],
   "link1_vectors": 0,
-  "name": "matrixmul_fdot",
+  "name": "MatrixMul Float Dot Extension",
   "passes_gate2": false,
   "passes_link1": false,
   "tests": [],
-  "version": "1.0"
+  "version": "2.0"
 }

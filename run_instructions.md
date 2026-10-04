@@ -3,37 +3,41 @@
 RED mines an application's hot loops (A1) and designs a custom RISC-V
 instruction extension for them (A2). The output is `ISASpec.json`.
 
-There are three ways to run it, in increasing order of cost:
+Everything runs on **one machine**. There is nothing to provision, nothing to
+tear down, and nothing that bills while RED is idle. Two ways to run it:
 
-| Mode | Command | LLM | GCP VMs | Use it for |
-|------|---------|-----|---------|------------|
-| Mechanical smoke test | `python -m red.loop --local` | none | none | Checking A1 + Gate 1 work at all |
-| Single-machine full loop | `python -m red.loop --local-llm` | Gemini (API only) | none | Iterating on A2 + Gate 2 cheaply |
-| Cluster run | `python -m red.loop` | Gemini on the `llm` node | 3 | The real distributed CHIA loop |
+| Mode | Command | Agent turns | Use it for |
+|------|---------|-------------|------------|
+| Mechanical | `python -m red.loop --mechanical` | none | Checking the profile + Gate 1 work at all, for free |
+| Full loop | `python -m red.loop` | `claude -p`, up to 4 at a time | The real thing: AW → A1/A0 → A2 → Gate 3/4 → review → Gate 2 |
 
 ---
 
 ## 0. Prerequisites (one time)
 
-You need: this repo, a CHIA checkout at `~/chia`, Python 3.12, a GCP project
-with billing, and the `gcloud` CLI.
+You need: this repo, Python 3.10+, a C toolchain with valgrind, and the
+[Claude Code](https://claude.com/claude-code) CLI on your PATH, already
+authenticated. No cloud account, no API key in the environment — RED shells out
+to `claude`, which carries its own credentials.
 
 ```bash
 sudo apt-get install -y build-essential valgrind        # A1 profiling
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ~/chia          # CHIA framework
-pip install -e .               # RED
-gcloud auth application-default login
-gcloud auth application-default set-quota-project <YOUR_PROJECT>
+pip install -e .               # RED (two dependencies: mcp, uvicorn)
+claude --version               # the agent backend; must already be logged in
 ```
 
-Point RED at your own project/model if they differ from the defaults
-(`red/constants.py`):
+One command does all of it and checks the result:
 
 ```bash
-export RED_GCP_PROJECT=<YOUR_PROJECT>
-export RED_GCP_LOCATION=global            # preview models are served globally
-export RED_LLM_MODEL=gemini-3.1-pro-preview
+bash scripts/red_env.sh setup
+```
+
+Pin the model if you want a specific one; otherwise RED uses whatever your
+Claude Code install is configured for:
+
+```bash
+python -m red.loop --model <model-id>     # or: export RED_AGENT_MODEL=<model-id>
 ```
 
 Install the two native dependencies RED brings its own copies of. Both are
@@ -47,12 +51,12 @@ bash scripts/setup_neo4j.sh start
 
 The graph is where RED remembers earlier runs — what was designed for each hot
 loop, what it was predicted to be worth, and what the reviewers refused — and
-the designer reads it before designing. It lives on the head, and its data
-directory is outside `output/`, so clearing run artifacts does not erase it.
-`red_env.sh up` starts it for you from then on. A run without it still works;
-it just starts from zero. See `NEO4J_SETUP.md`.
+the designer reads it before designing. Its data directory is outside
+`output/`, so clearing run artifacts does not erase it, and `red_env.sh`
+deliberately never stops it. A run without it still works; it just starts from
+zero. See `NEO4J_SETUP.md`.
 
-Verify the environment — 91 checks covering imports, the toolchain, artifact
+Verify the environment — 92 checks covering imports, the toolchain, artifact
 round-trips, every mechanical gate (including that link 1 *rejects* a bad C
 model), the durable store, the sealed MCP tools, and the knowledge graph:
 
@@ -68,99 +72,19 @@ static estimate — the test fails loudly if so.
 ## 1. Mechanical smoke test (free, ~90 s)
 
 ```bash
-python -m red.loop --local
+python -m red.loop --mechanical
 ```
 
 Builds the workload harness, profiles it twice under callgrind, runs Gate 1,
 and writes a `HotLoopReport`. No LLM, so A2 stops with "no ISASpec produced" —
 that is the expected outcome for this mode. Expect Gate 1 to pass at ~0.00%
-drift and coverage around 99%.
+drift and coverage around 99%. Run this after changing anything mechanical:
+it exercises the profile, Gate 1 and the typed artifacts with no agent spend
+at all.
 
 ---
 
-## 2. Single-machine full loop (Gemini API cost only, ~5–15 min)
-
-```bash
-python -m red.loop --local-llm
-```
-
-Runs the complete A1 + A2 loop — mining, synthesis, link 1, the ISS
-implementer and Gate 2 — on one machine with the real Gemini backend:
-Ray starts locally advertising every cluster resource tag, the seven sealed MCP
-tool servers come up on localhost, and the agents drive them. This exercises
-exactly the same code path as the cluster run — only the placement differs.
-Use it to iterate on prompts without paying for VMs.
-
----
-
-## 3. Cluster run
-
-### 3.0 Paths in `cluster.yaml`
-
-`file_mounts` rsyncs two directories to every worker at the **same absolute
-path** they have on the head:
-
-```yaml
-file_mounts:
-    /home/naonao/RED:  /home/naonao/RED/     # this repo
-    /home/naonao/chia: /home/naonao/chia/    # the head's CHIA checkout
-```
-
-Both are absolute and username-specific — change them if your home directory
-differs. Mounting CHIA matters: chia's default worker setup clones *upstream*
-chia, which may pin a different Ray than your local checkout, and a head/worker
-Ray skew makes `ray start` fail on the worker with
-`FileNotFoundError: [Errno 2] No such file or directory: ''`. Each worker
-reinstalls both mounts (`pip install -e $HOME/chia && pip install -e $HOME/RED`)
-so head and workers run one CHIA and one Ray.
-
-### 3.1 Bring the cluster up
-
-```bash
-bash scripts/red_env.sh setup     # first time: sshd, venv, GCP auth+APIs+IAM, self-test, up
-bash scripts/red_env.sh up        # thereafter
-```
-
-`setup` is idempotent and asks for input only where unavoidable: your sudo
-password (to install `openssh-server` on the head) and one browser login if ADC
-is missing. It then:
-
-- generates an SSH keypair if needed and authorizes the head to SSH to itself
-  (CHIA brings the head up over SSH);
-- creates `.venv`, installs `chia` + `red` editable;
-- enables the Compute + Vertex AI APIs and grants the default compute service
-  account `roles/aiplatform.user` — without that role every LLM turn 403s;
-- resolves `HEAD_IP` fresh (WSL changes it on every reboot);
-- runs `chia up`, which provisions **3 GCP VMs** (`llm`, `database`, `profile`)
-  and joins them to the local Ray head.
-
-The `llm` node is created with the default compute service account attached, so
-Gemini authenticates through the GCE metadata server — no `gcloud` login on any
-worker.
-
-CHIA will warn that your GCP network has a world-open `default-allow-ssh` rule
-(tcp:22 from `0.0.0.0/0`). That rule is GCP's default-network default, not
-something RED or CHIA adds; CHIA's own firewall rule is narrowed to your egress
-IP. Set `CHIA_GCP_LOCKDOWN_DEFAULT_SSH=1` before `up` if you want CHIA to delete
-the world-open rule.
-
-**Keep the terminal you run `up` in.** CHIA starts the workers' reverse SSH
-tunnels as plain child processes (`subprocess.Popen`, same process group), so
-closing that shell — or letting a job-control cleanup reap the group — kills the
-tunnels, the workers silently leave the cluster, and the next run hangs forever
-on `Pending Demands: {'database': 0.9}`. For an unattended bring-up, detach it:
-
-```bash
-setsid bash scripts/red_env.sh up < /dev/null > up.log 2>&1 &
-```
-
-Check state at any time:
-
-```bash
-bash scripts/red_env.sh status    # ray nodes + GCP instances/disks/addresses
-```
-
-### 3.2 Run the loop
+## 2. The full loop
 
 ```bash
 python -m red.loop
@@ -172,35 +96,45 @@ Options (all optional — the defaults are the bundled micro-ecc example):
 --project PATH     application project directory
 --core PATH        processor core directory (context for the encoding space)
 --workload NAME    workload label
---harness FILE     project-relative .c holding the workload's main()
+--harness FILE     project-relative .c holding the workload's main().
+                   Pass "" and AW writes one (§3.6).
 --cflags "..."     compile flags that pin the workload
+--exclude "a,b"    path fragments whose .c files belong to a DIFFERENT program
+--model ID         model for the agent turns
+--mechanical       no agent turns at all (§1)
 ```
 
-### 3.3 Tear down — always do this
+**Note the `--harness` default is the bundled micro-ecc test.** Running a
+*different* project without overriding it hands that project a harness path it
+does not have: the build fails, A1 falls back to a static estimate, and AW
+never runs because a harness was nominally supplied. Pass `--harness ""`, or
+use `scripts/run_projects.sh` (§3.5), which does it for you.
 
-```bash
-bash scripts/red_env.sh down
-```
+### How a turn actually runs
 
-Runs `chia down`, force-deletes any cluster-labeled leftovers directly through
-the Compute API (in case `chia down` dies midway), stops local Ray, and then
-**verifies** 0 instances, 0 disks and 0 static addresses remain. It exits
-non-zero if anything is still billing.
+Each agentic stage is one `claude -p` subprocess (`red/backend.py`). Before it
+starts, RED writes a temporary MCP config naming only the tool servers that
+stage may use, and passes `--strict-mcp-config` with an explicit
+`--allowedTools` list. The servers themselves are uvicorn apps on loopback
+ports inside the driver process (`red/localtool.py`), each exposing only the
+methods its agent is allowed to call.
 
-It leaves the knowledge graph running, on purpose — that is the head's local
-Neo4j, it costs nothing on GCP, and it is what the next run reads. `down` prints
-its census so you can see the run was recorded. To stop it anyway:
-`bash scripts/setup_neo4j.sh stop` (the data is kept).
+That boundary is enforced twice on purpose — the server has no method for what
+the agent must not do, *and* the turn is not permitted to call it. It is what
+makes Gate 2 mean anything: the ISS implementer's config does not contain a
+server that would show it the reference C models.
 
-Confirm independently with:
+Knobs: `RED_AGENT_PARALLEL` (4) concurrent turns, `RED_AGENT_MAX_TURNS` (40)
+tool-use turns inside one stage, `RED_AGENT_TIMEOUT` (1800 s) before a wedged
+turn is cut off and reported as a failed turn.
 
-```bash
-gcloud compute instances list --project <YOUR_PROJECT>
-```
+A turn that fails is a *result*, never an exception: the loop's repair edges
+are written to act on it, and a backend that is down should not look like a
+design that is wrong.
 
 ---
 
-## 3.5 Running every project
+## 3. Running every project
 
 `scripts/run_projects.sh` iterates over every directory under
 `target_project/`:
@@ -219,16 +153,14 @@ It holds the three per-project inputs that cannot be guessed from the sources:
 | `cflags` | flags that define the workload's configuration |
 | `exclude` | path fragments whose `.c` files belong to a *different program* in the same repository — libcrc's `precalc/` is a table generator with its own `main`, and linking it fails. They stay readable by the agents; they are just not linked. |
 
-**Ordering matters for projects that generate part of their own source.**
-libcrc's `src/crc32.c` includes `../tab/gentab32.inc`, produced by the project's
-own build. The profile node compiles the project from *its* copy of the tree,
-which is rsynced only by a fresh `red_env.sh up` — and the generated files are
-gitignored, so they are not in the working-dir package either. Generate them
-**before** bringing the cluster up, or every build on the worker fails on an
-include the head resolves perfectly well. The script runs the generator and
-warns if the cluster is already up.
+**Projects that generate part of their own source need that done first.**
+libcrc's `src/crc32.c` includes `../tab/gentab32.inc`, produced by the
+project's own build and gitignored as build output. RED compiles the sources
+itself — that is how it instruments them — so for RED those generated files are
+*sources*. The script runs the generator before profiling and says so if it
+could not.
 
-## 3.6 AW and Gate 0 — manufacturing a workload
+## 3.1 AW and Gate 0 — manufacturing a workload
 
 RED's stated input is "a project + representative workloads" and repositories
 routinely ship only the first half. The difference is not a matter of degree:
@@ -260,11 +192,10 @@ Artifacts: `output/db/<workload>/run_<N>/workload/round<N>.{json,md}`.
 
 ## 4. Reading the results
 
-Everything lands in `output/db/<workload>/run_<N>/` (git-ignored). On a cluster
-run the store physically lives on the `database` VM, so the driver tars the run
-and unpacks it on the head when the loop finishes — the artifacts survive
-`red_env.sh down`. If that fetch fails the driver says so and names the path on
-the node.
+Everything lands in `output/db/<workload>/run_<N>/` (git-ignored), written as
+each artifact is produced rather than at the end, so a run you kill halfway
+still leaves the record of what it had decided. Point `RED_DB_ROOT` somewhere
+outside the repo to keep a batch's record when you clear `output/`.
 
 | File | What it is |
 |------|-----------|
@@ -276,12 +207,11 @@ the node.
 | `gates/gate2.json`, `gates/chain.json` | The verification edges' verdicts |
 | `summary.md` | Human-readable run summary |
 
-`output/work/<workload>/<run-id>/` holds the driver-side scratch: the LLM
+`output/work/<workload>/<run-id>/` holds the driver-side scratch: the agent
 transcripts under `llm_logs/`, link 1's generated C harnesses under `link1/`,
-and the Ray profiler trace. On a cluster run the built workload harness and
-`callgrind.out` live on the **profile node** under the same path (A1 runs
-there); only the resulting `profile.json` comes back to the head. In
-`--local`/`--local-llm` runs everything is on one machine.
+the built workload harness, and `callgrind.out`. This is what you read while a
+run is in flight; it is also what gets deleted between batches, which is why
+everything that matters is mirrored into the durable store as it is produced.
 
 The loop exits 0 only when Gate 1, link 1 **and** Gate 2 all pass. Gate 2
 passing means two independently written models of each instruction agreed on
@@ -322,8 +252,7 @@ model and agent-facing queries in `NEO4J_SETUP.md`.
 
 ## 4a. What a good run looks like
 
-Run end to end against `gemini-3.1-pro-preview` on the micro-ecc
-ECDH-secp256r1 workload, single machine (`--local-llm`):
+Run end to end on the micro-ecc ECDH-secp256r1 workload:
 
 ```
 - result: **converged (A1+A2)**
@@ -567,11 +496,12 @@ to `add256`/`sub256`/`mul256` and was told so again — which is why the reviewe
 are a loop rather than a one-shot check.
 
 Run 3 exposed a real robustness bug and is left in the table rather than
-re-rolled: the Vertex backend *raises* on a reply that hits `max_output_tokens`
-instead of reporting it, and that exception tore down a 17-minute run.
-`_dispatch_llm` now converts a raised turn into a failed turn, which every caller
-already handles, and `RED_LLM_MAX_TOKENS` (default 32000) makes truncation far
-less likely. Run 4 proved the fix: it hit a `RateLimitError` mid-revision,
+re-rolled: the backend of the day *raised* on a reply that hit the output-token
+limit instead of reporting it, and that exception tore down a 17-minute run.
+Dispatch now converts a raised turn into a failed turn, which every caller
+already handles — the rule the current backend keeps by construction
+(`red/backend.py` returns a `QueryResult` with `success=False` and never raises
+for an agent failure). Run 4 proved the fix: it hit a rate limit mid-revision,
 logged it, and carried on to a clean Gate 2.
 
 That the runs still report **NOT converged** is the honest verdict: the
@@ -615,17 +545,14 @@ three by 6.3×–7.0×. See [eval/README.md](eval/README.md) for the harness and
 |---------|-------------|
 | `test_a1_profile_workload` fails with `profile_method='static-asm'` | `valgrind`/`callgrind_annotate` missing → `sudo apt-get install valgrind` |
 | Gate 1 fails with "no dynamic cycle counts" | The harness did not build; check `build_log` in `profile.json` and your `--cflags` |
-| Every LLM turn fails with 403 | The compute SA lacks `roles/aiplatform.user` → `python scripts/gcp_util.py ensure-iam` |
-| Model 404s | A preview model needs `RED_GCP_LOCATION=global` |
-| `A2: no ISASpec produced` in `--local`/`--local-llm` | Expected in `--local`. In `--local-llm`, check `output/work/.../llm_logs/` for the transcript |
+| Every agent turn fails instantly | `claude` is not on PATH or not authenticated. Check with `bash scripts/red_env.sh check`; the transcripts in `output/work/.../llm_logs/` carry the CLI's own stderr |
+| `A2: no ISASpec produced` | Expected with `--mechanical`. Otherwise read `output/work/.../llm_logs/transcript.log` — the turn either failed or wrote a spec the schema rejected, and both are recorded there |
+| A turn is cut off after 30 min | `RED_AGENT_TIMEOUT`. The run continues: a wedged turn is reported as a failed turn, not a hang |
+| Agent turns are slow and serialized | `RED_AGENT_PARALLEL` (default 4) bounds concurrent turns. A turn is a subprocess that mostly waits, so raising it costs little CPU |
+| Tool servers fail to bind | A previous run left a driver process alive holding its ports: `pkill -f 'python -m red.loop'`. Ports are asked of the kernel, not scanned, so a clean machine never collides |
+| The run says the knowledge graph is unavailable | Harmless — RED runs without memory of earlier runs. `bash scripts/setup_neo4j.sh start` |
+| Gate 4 reports `NOT CHECKED — timing.secret_branch` | memcheck cannot start without glibc debuginfo: `sudo apt-get install -y libc6-dbg`. The gate is behaving correctly — a check it could not run is never reported as passed — but that run has no taint evidence |
 | link 1 fails with a sanitizer report | Working as intended — the agent's C model has a real bug; the counterexample is in `gates/chain.json` |
 | Gate 2 says "needs a patched-Spike toolchain" | `bash scripts/setup_spike.sh`; check with its `check` subcommand |
 | Gate 2 fails with "spike extension does not compile" | The ISS agent's C++ is bad; the compiler diagnostic is in the counterexample, and the repair edge feeds it back automatically |
 | Gate 2 reports an encoding collision | Two instructions claim the same (opcode, funct3, funct7); the counterexample names them |
-| Tool servers fail to bind | A stale run holds ports 8000+; `ray stop` and retry |
-| `rsync: command not found` during bring-up | The worker image has no rsync and CHIA needs it to sync the repo. `cluster.yaml` installs it in each `gcp_nodes.*.setup_commands` (which run before the sync); if you add a node type, copy that block into it |
-| Every agent turn fails with `LLM turn FAILED (returncode=-1)` / `unhandled errors in a TaskGroup` | The llm node could not reach the head's MCP tools. RED wraps them in `RelayTool` (red/tools.py) so the URL resolves to `CHIA_TOOL_RELAY_HOST` on the worker — CHIA's own backends never apply that rewrite. Check the head tool ports are inside `tunnel_defaults.head_tool_port_max` and forwarded: on the worker, `ss -lnt \| grep 127.200.0.1` should list them |
-| The loop hangs; `ray status` shows `Pending Demands: {'database': 0.9}` | The workers' SSH tunnels died (usually the shell that ran `up` was closed). Check with `pgrep -f 'ssh.*-R'`; re-establish with `bash scripts/red_env.sh up` |
-| Worker `ray start` dies with `No such file or directory: ''` | Head/worker Ray version skew. Confirm with `python -c "import ray;print(ray.__version__)"` on both; the `file_mounts` CHIA mount plus the worker reinstall is what keeps them equal |
-| `409 ... instance already exists` on `up` | Instances from a previous run are still there. `red_env.sh up` detects this and switches to `chia up --add`; a stuck cluster can always be reset with `red_env.sh down` |
-| `chia up` reports fewer than 4 nodes | Check `HEAD_IP` is the LAN address (not the public egress IP) and that self-SSH works |

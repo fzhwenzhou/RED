@@ -1,39 +1,53 @@
 {
-  "app_speedup": 5.081610965917155,
-  "covered_share": 0.9048274726567346,
-  "detail": "covers 90.5% of profiled cycles; predicted whole-application speedup 5.08x\n  secp256r1.mult: 329 cyc (32 beats, 64 MAC, 2.00 MAC/word) + 413 marshalling vs 11225 cyc of software = 15.13x\n  secp256r1.mmod: 1463 cyc (32 beats, 0 MAC, 0.00 MAC/word) + 206 marshalling vs 10247 cyc of software = 6.14x \u2014 its C model executes 6,045 instructions, of which 6,045 are not accounted for by mac_ops=0; charged as 1209 sequential logic steps; invocations UNVERIFIED (~0 implied)\n\n**This prediction rests on an unverified declaration.** Gate 3 measures everything else it uses \u2014 the software cost from the profile, the instruction's work from its own C model \u2014 but not this:\n  - invocations=1 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 1,204 host instructions against this model's 6,045, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+  "app_speedup": 1.8784886292318448,
+  "covered_share": 0.9718252163675268,
+  "detail": "covers 97.2% of profiled cycles; predicted whole-application speedup 1.88x\n  secp256r1.mult: 297 cyc (32 beats, 64 MAC, 2.00 MAC/word) + 413 marshalling vs 8748 cyc of software = 12.32x \u2014 its C model executes 1,723 instructions, of which 781 are not accounted for by mac_ops=64; charged as 108 sequential logic steps\n  secp256r1.mmod: 196 cyc (32 beats, 0 MAC, 0.00 MAC/word, x2 per call) + 206 marshalling vs 4374 cyc of software = 10.86x \u2014 its C model executes 514 instructions, of which 514 are not accounted for by mac_ops=0; charged as 71 sequential logic steps; invocations UNVERIFIED (~16 implied); claims to replace 4084 host instructions per invocation but its C model executes only 514 \u2014 credited on what it computes, not on what it names\n  secp256r1.modsub: 158 cyc (32 beats, 0 MAC, 0.00 MAC/word) + 619 marshalling vs 1204 cyc of software = 1.55x \u2014 its C model executes 241 instructions, of which 241 are not accounted for by mac_ops=0; charged as 33 sequential logic steps\n\n**This prediction rests on an unverified declaration.** Gate 3 measures everything else it uses \u2014 the software cost from the profile, the instruction's work from its own C model \u2014 but not this:\n  - invocations=2 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model's 514, which is consistent with roughly 16 invocations, not 2. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
   "measurement_error": "",
   "per_instruction": [
     {
       "beats": 32,
-      "cycles": 329.2,
+      "cycles": 297.2490525175961,
       "invocations": 1,
       "mac_ops": 64,
       "marshal_cycles": 412.8,
       "mnemonic": "secp256r1.mult",
-      "note": "",
-      "replaced_cycles": 11224.69,
-      "replaces": "uECC_vli_mult::loop1",
-      "speedup": 15.127614555256065,
+      "note": "its C model executes 1,723 instructions, of which 781 are not accounted for by mac_ops=64; charged as 108 sequential logic steps",
+      "replaced_cycles": 8748.28,
+      "replaces": "uECC_vli_mult::comba_muladd",
+      "speedup": 12.320669915665023,
       "unverified": "",
       "words": 16
     },
     {
       "beats": 32,
-      "cycles": 1463.0,
-      "invocations": 1,
+      "cycles": 196.24201407688145,
+      "invocations": 2,
       "mac_ops": 0,
       "marshal_cycles": 206.4,
       "mnemonic": "secp256r1.mmod",
-      "note": "its C model executes 6,045 instructions, of which 6,045 are not accounted for by mac_ops=0; charged as 1209 sequential logic steps; invocations UNVERIFIED (~0 implied)",
-      "replaced_cycles": 10247.445677869166,
-      "replaces": "vli_mmod_fast_secp256r1::region",
-      "speedup": 6.138400430016272,
-      "unverified": "invocations=1 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 1,204 host instructions against this model's 6,045, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+      "note": "its C model executes 514 instructions, of which 514 are not accounted for by mac_ops=0; charged as 71 sequential logic steps; invocations UNVERIFIED (~16 implied); claims to replace 4084 host instructions per invocation but its C model executes only 514 \u2014 credited on what it computes, not on what it names",
+      "replaced_cycles": 4374.14,
+      "replaces": "vli_mmod_fast_secp256r1::nist_fast_reduction",
+      "speedup": 10.863595568953198,
+      "unverified": "invocations=2 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model's 514, which is consistent with roughly 16 invocations, not 2. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+      "words": 16
+    },
+    {
+      "beats": 32,
+      "cycles": 158.4033567948024,
+      "invocations": 1,
+      "mac_ops": 0,
+      "marshal_cycles": 619.2,
+      "mnemonic": "secp256r1.modsub",
+      "note": "its C model executes 241 instructions, of which 241 are not accounted for by mac_ops=0; charged as 33 sequential logic steps",
+      "replaced_cycles": 1204.2949422160327,
+      "replaces": "uECC_vli_modSub::sub_borrow_then_add_mod",
+      "speedup": 1.5487265219378774,
+      "unverified": "",
       "words": 16
     }
   ],
   "unverified": [
-    "invocations=1 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 1,204 host instructions against this model's 6,045, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?"
+    "invocations=2 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model's 514, which is consistent with roughly 16 invocations, not 2. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?"
   ]
 }

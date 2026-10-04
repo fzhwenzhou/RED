@@ -1,37 +1,60 @@
 {
-  "area_note": "Extremely small size-optimized core. The entire core register file is 1024 flops. A custom 16-word operand buffer (512 flops) is massive relative to this core and would increase its size by a significant fraction.",
+  "area_note": "This is a deliberately tiny core. Its architectural state is the 31x32 = 992-bit register file (picorv32_regs or cpuregs; may map to LUTRAM or BRAM) plus a few hundred flops of control and datapath: reg_pc, reg_next_pc, reg_op1, reg_op2, reg_out, reg_sh, mem_addr, mem_wdata, mem_rdata_q, decoded fields, and 2x64-bit counters. The fast multiplier adds about 130 flops plus one 33x33 multiply (a DSP). The divider adds about 160 flops (dividend 32, divisor 63, quotient 32, mask 32). A 16-word operand buffer (512 flops) is about half the whole register file and comparable to all of the core's non-regfile flops. That is HUGE for this core. A 32x32 or wider array multiplier duplicates the existing fast_mul and pays twice.",
   "constraints": [
-    "The PCPI coprocessor interface has no memory access capability.",
-    "All operands required by a custom instruction must be loaded from memory into core registers explicitly by standard load instructions before invocation.",
-    "A custom instruction can consume at most two 32-bit source registers (pcpi_rs1, pcpi_rs2) and produce at most one 32-bit result (pcpi_rd).",
-    "Given the core's minimal footprint, large internal memory buffers or excessive combinatorial logic in the coprocessor should be avoided."
+    "Bare PCPI cannot touch memory. It only gets rs1, rs2 and the instruction word, and returns one 32-bit rd. Memory access exists only through red_core.v's bus mux (busy -> accelerator owns the bus, CPU mem_ready forced to 0).",
+    "There is ONE memory bus and it is not pipelined, at about 2 cycles per 32-bit word. Bus-mastering accelerators get no bandwidth advantage over CPU lw/sw except avoiding the about 3-cycle fetch/decode cost per instruction.",
+    "There is one register write per instruction, and it is 32 bits. Results of 64 bits or wider need multiple instructions or a store to memory.",
+    "There are at most 2 register source operands per instruction (dual read port, read in cpu_state_ld_rs1).",
+    "PCPI timeout: with CATCH_ILLINSN=1, the unit must assert pcpi_wait or pcpi_ready within about 16 cycles of pcpi_valid (4-bit pcpi_timeout_counter), or the core traps as an illegal instruction. Long operations must raise pcpi_wait.",
+    "pcpi_ready from any PCPI unit is ORed together (pcpi_int_ready). The custom unit must ignore instructions it does not own, especially OP funct7=0000001 (mul/div).",
+    "The CPU is fully stalled while a custom instruction runs. There is no overlap with base instructions.",
+    "Multiplication already exists as a fast single-issue 33x33 multiply. Do not re-implement a plain 32x32 multiplier. Division is slow (about 32 cycles), and shifts are slow (up to about 14 cycles).",
+    "custom-0 is currently taken by red_accel in the ENABLE_ACCEL=1 core.",
+    "Misaligned word access traps (CATCH_MISALIGN=1) for the CPU. An accelerator bus master must issue word-aligned addresses itself."
   ],
-  "coprocessor": "Pico Co-Processor Interface (PCPI). Exposes ports pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2. The coprocessor receives the instruction and up to two register values. It DOES NOT have memory address or data ports and therefore cannot address memory by itself.",
-  "coprocessor_issue_overhead": 3,
-  "coprocessor_memory_access": false,
-  "coprocessor_result": "32 bits returned per instruction via pcpi_rd, enabled by pcpi_wr, and signaling completion via pcpi_ready.",
+  "coprocessor": "PCPI (pcpi_valid, pcpi_insn[31:0], pcpi_rs1, pcpi_rs2 in; pcpi_wr, pcpi_rd[31:0], pcpi_wait, pcpi_ready out). Any instruction the core does not decode (instr_trap) is offered on PCPI from cpu_state_ld_rs1, with both operands read through the dual-port register file. pcpi_rs1 is reg_op1 and pcpi_rs2 is reg_op2 (picorv32.v:191-192). The core waits in ld_rs1 until pcpi_int_ready. Raw PCPI carries only two register values and the instruction word. It has NO memory port. In this repo, red_core.v adds a 1-bit bus mux: when red_accel raises `busy`, it takes mem_valid/addr/wdata/wstrb and the CPU's mem_ready is forced to 0. That works only because the CPU is stalled in ld_rs1 waiting on pcpi_wait/pcpi_ready. So memory access exists only through this wrapper's mux, and only while the custom instruction is in flight.",
+  "coprocessor_issue_overhead": 2,
+  "coprocessor_memory_access": true,
+  "coprocessor_result": "At most one 32-bit value per instruction. The core latches pcpi_rd into reg_out and writes it to rd only if pcpi_wr=1 in the same cycle as pcpi_ready. There is no second destination, no flags and no CSR side channel. Wider results must be written to memory through the red_core bus mux, or split across several instructions.",
   "custom_opcode_space": [
-    "Any opcode not natively decoded by the core will trigger instr_trap and be forwarded to the PCPI (e.g., standard custom0-3 spaces)."
+    "custom-0 0001011: free in the core because ENABLE_IRQ=0 disables picorv32's own getq/setq/retirq/maskirq/waitirq/timer, which live on custom-0. red_accel.v currently decodes it, so a new design replaces red_accel or must share it by funct3/funct7.",
+    "custom-1 0101011: free.",
+    "custom-2/rv128 1011011: free.",
+    "custom-3/rv128 1111011: free.",
+    "Do NOT use OP 0110011 with funct7=0000001. pcpi_fast_mul and pcpi_div claim it, and the internal pcpi_int_* mux would collide."
   ],
-  "cycles_per_alu_op": 4,
-  "cycles_per_load": 6,
-  "cycles_per_word_moved": 6,
+  "cycles_per_alu_op": 3,
+  "cycles_per_load": 5,
+  "cycles_per_word_moved": 2,
   "evidence": [
-    "picorv32 module parameters (ENABLE_MUL, COMPRESSED_ISA, ENABLE_DIV) establish the ISA support.",
-    "cpu_state FSM in picorv32.v proves the multi-cycle microarchitecture.",
-    "PCPI ports (pcpi_valid, pcpi_rs1, pcpi_rs2, pcpi_rd, pcpi_wr, pcpi_wait, pcpi_ready) entirely lack memory bus signals, proving the coprocessor cannot address memory.",
-    "instr_trap logic explicitly forwards unrecognized instructions to the PCPI if WITH_PCPI is enabled.",
-    "picorv32_regs definition shows the physical layout of the register file (max 2 read ports, 1 write port)."
+    "eval/rtl/red_core.v:48-58 sets the picorv32 parameters: ENABLE_COUNTERS=1, ENABLE_MUL=0, ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=ENABLE_ACCEL, ENABLE_IRQ=0, COMPRESSED_ISA=0.",
+    "picorv32.v:62-88 parameter defaults: ENABLE_REGS_16_31=1, ENABLE_REGS_DUALPORT=1, BARREL_SHIFTER=0, TWO_STAGE_SHIFT=1, TWO_CYCLE_ALU=0, CATCH_ILLINSN=1, CATCH_MISALIGN=1.",
+    "picorv32.v:110-117 PCPI ports: no address or data memory signals. picorv32.v:191-192 assign pcpi_rs1=reg_op1 and pcpi_rs2=reg_op2.",
+    "picorv32.v:169 WITH_PCPI; picorv32.v:326-343 pcpi_int_wait and pcpi_int_ready OR all PCPI sources and mux pcpi_int_rd.",
+    "picorv32.v:1585-1613 cpu_state_ld_rs1: on instr_trap it sets pcpi_valid<=1, waits for pcpi_int_ready, then sets reg_out<=pcpi_int_rd and latched_store<=pcpi_int_wr, and goes to fetch.",
+    "picorv32.v:1215-1229 and 1423-1429: the 4-bit pcpi_timeout_counter traps if no pcpi_wait arrives.",
+    "picorv32.v:1172-1179 cpu_state one-hot FSM, showing a multi-cycle, non-pipelined core.",
+    "picorv32.v:565-637 mem_state FSM: a single valid/ready transaction at a time, with instruction and data on the same bus.",
+    "picorv32.v:1835-1850 cpu_state_shift: reg_sh-4 / reg_sh-1 per cycle (iterative shifter).",
+    "picorv32.v:679-685 instr_trap: everything not in the base decode, including custom-0..3, goes to PCPI.",
+    "picorv32.v:2318-2410 picorv32_pcpi_fast_mul: matches opcode 0110011 funct7 0000001, does `rd <= rs1*rs2`, and pcpi_ready=active[1].",
+    "picorv32.v:2420-2510 picorv32_pcpi_div: quotient_msk>>1 per cycle, a sequential 32-step divide with pcpi_wait.",
+    "picorv32.v:2174-2190 picorv32_regs: 2 read ports and 1 write port.",
+    "eval/rtl/red_core.v:15-16 and 95-101: a 1-bit bus mux on acc_busy; cpu_mem_ready=0 while the accelerator owns the bus.",
+    "eval/rtl/red_accel.v:18 decodes OPCODE_CUSTOM0, and lines 59/81 show it drives mem_addr from pcpi_rs1 itself (a bus master).",
+    "eval/rtl/red_soc_tb.v:46-68: mem_ready<=1 the cycle after mem_valid && !mem_ready, so about 2 cycles per transfer."
   ],
   "existing_units": [
-    "picorv32_pcpi_mul (iterative multi-cycle shift-add multiplier)",
-    "picorv32_pcpi_fast_mul (DSP/array multiplier with 3-4 cycle latency)",
-    "picorv32_pcpi_div (iterative multi-cycle shift-subtract divider)",
-    "Barrel shifter (enabled via BARREL_SHIFTER, otherwise iterative shift)"
+    "Fast multiplier picorv32_pcpi_fast_mul (ENABLE_FAST_MUL=1): a single 33x33 signed `*` (synthesizes to a DSP or array multiplier), registered with pcpi_ready about 2 cycles after pcpi_valid. It handles MUL/MULH/MULHSU/MULHU and is on the internal PCPI mux.",
+    "Divider picorv32_pcpi_div (ENABLE_DIV=1): sequential restoring shift-subtract, 1 quotient bit per cycle (quotient_msk>>1), so about 32+ cycles per DIV/DIVU/REM/REMU. It uses pcpi_wait.",
+    "No barrel shifter (BARREL_SHIFTER=0). Shifts run iteratively in cpu_state_shift, 4 bits per step and then 1 bit (TWO_STAGE_SHIFT=1).",
+    "A single 32-bit ALU adder/comparator (alu_out), with no separate comparator (TWO_CYCLE_COMPARE=0).",
+    "64-bit cycle and instret counters (ENABLE_COUNTERS64=1).",
+    "red_accel.v (custom-0, OPCODE_CUSTOM0): an existing accelerator in the ENABLE_ACCEL=1 build. It is a bus master through red_core's mux."
   ],
-  "isa": "RV32I with configurable options for M (ENABLE_MUL, ENABLE_FAST_MUL, ENABLE_DIV) and C (COMPRESSED_ISA) extensions.",
-  "memory_interface": "Native 32-bit valid/ready multi-cycle handshake (mem_valid, mem_ready, mem_addr, mem_wdata, mem_wstrb, mem_rdata). Optional AXI4-Lite adapter (picorv32_axi_adapter) provided.",
-  "microarchitecture": "Multi-cycle FSM. Core transitions through cpu_state_fetch, cpu_state_ld_rs1, cpu_state_ld_rs2, cpu_state_exec, cpu_state_ldmem, cpu_state_stmem. Assuming single-cycle memory, ALU ops take ~3-4 cycles and loads ~5-6 cycles.",
-  "name": "PicoRV32",
-  "register_file": "16 or 32 32-bit registers (ENABLE_REGS_16_31). Has 2 read ports and 1 write port when ENABLE_REGS_DUALPORT is true, otherwise 1 read port."
+  "isa": "RV32IM plus Zicntr-style rdcycle/rdinstret, with no C, no IRQ and no E. red_core.v sets ENABLE_FAST_MUL=1 (MUL/MULH/MULHSU/MULHU), ENABLE_DIV=1 (DIV/DIVU/REM/REMU), ENABLE_MUL=0, COMPRESSED_ISA=0, ENABLE_IRQ=0 and ENABLE_COUNTERS=1. The rest are defaults: ENABLE_REGS_16_31=1 (32 GPRs), CATCH_ILLINSN=1, CATCH_MISALIGN=1, BARREL_SHIFTER=0, TWO_STAGE_SHIFT=1, TWO_CYCLE_ALU=0. ENABLE_PCPI is 1 only in the accelerated core.",
+  "memory_interface": "A native PicoRV32 valid/ready bus: mem_valid, mem_instr, mem_addr[31:0], mem_wdata[31:0], mem_wstrb[3:0], mem_rdata[31:0], mem_ready. It handles one 32-bit transfer at a time, with no bursts and no outstanding requests. Instruction fetch and data use the same bus (mem_instr distinguishes them). The memory FSM in picorv32.v:565-637 has state 0 idle, 1 read, 2 write and 3 prefetch-hold. The testbench red_soc_tb.v raises mem_ready one cycle after it sees mem_valid, so each transfer costs about 2 cycles. red_core muxes the accelerator onto the same single bus, so the accelerator and the CPU never overlap.",
+  "microarchitecture": "Multi-cycle and not pipelined. A single FSM (cpu_state_fetch/ld_rs1/ld_rs2/exec/shift/stmem/ldmem/trap) runs one instruction at a time, and every instruction re-enters fetch through the memory FSM. With ENABLE_REGS_DUALPORT=1, a reg-reg or reg-imm ALU op takes about 3 cycles (fetch, ld_rs1, exec). Loads and stores take about 5 (fetch, ld_rs1, ldmem/stmem with a bus transfer). Shifts take 4 to 14 because they are iterative: 4 bits per cycle, then 1 bit per cycle. Taken branches take about 5. Software is therefore slow: an instruction that replaces N base instructions saves roughly 3N cycles or more.",
+  "name": "PicoRV32 as instantiated by eval/rtl/red_core.v (ENABLE_ACCEL=1 adds red_accel on PCPI)",
+  "register_file": "32 x 32-bit GPRs (x0 hardwired to 0), cpuregs[] in picorv32.v. ENABLE_REGS_DUALPORT=1 gives 2 read ports (cpuregs_rs1 and cpuregs_rs2, both read in ld_rs1) and 1 write port (latched_rd). So a custom instruction gets at most 2 register source operands plus the immediate or funct bits in pcpi_insn, and writes at most 1 destination."
 }

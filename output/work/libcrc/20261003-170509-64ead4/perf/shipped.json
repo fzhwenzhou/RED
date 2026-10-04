@@ -1,0 +1,25 @@
+{
+  "app_speedup": 3.669482826587455,
+  "covered_share": 0.9983270729463847,
+  "detail": "covers 99.8% of profiled cycles; predicted whole-application speedup 3.67x\n  crc32.step64b: 569 cyc (34 beats, 0 MAC, 0.00 MAC/word, x524 per call) + 464 marshalling vs 3811 cyc of software = 3.69x \u2014 its C model executes 3,163 instructions, of which 3,163 are not accounted for by mac_ops=0; charged as 438 sequential logic steps; invocations UNVERIFIED (~74 implied)\n\n**This prediction rests on an unverified declaration.** Gate 3 measures everything else it uses \u2014 the software cost from the profile, the instruction's work from its own C model \u2014 but not this:\n  - invocations=524 is the designer's declaration and RED cannot verify it: one call of crc_32 executes 234,634 host instructions against this model's 3,163, which is consistent with roughly 74 invocations, not 524. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+  "measurement_error": "",
+  "per_instruction": [
+    {
+      "beats": 34,
+      "cycles": 569.4017325392529,
+      "invocations": 524,
+      "mac_ops": 0,
+      "marshal_cycles": 464.40000000000003,
+      "mnemonic": "crc32.step64b",
+      "note": "its C model executes 3,163 instructions, of which 3,163 are not accounted for by mac_ops=0; charged as 438 sequential logic steps; invocations UNVERIFIED (~74 implied)",
+      "replaced_cycles": 3810.5636259541984,
+      "replaces": "crc_32::byte_loop",
+      "speedup": 3.6859714063300943,
+      "unverified": "invocations=524 is the designer's declaration and RED cannot verify it: one call of crc_32 executes 234,634 host instructions against this model's 3,163, which is consistent with roughly 74 invocations, not 524. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?",
+      "words": 17
+    }
+  ],
+  "unverified": [
+    "invocations=524 is the designer's declaration and RED cannot verify it: one call of crc_32 executes 234,634 host instructions against this model's 3,163, which is consistent with roughly 74 invocations, not 524. That ratio is itself only indicative \u2014 the two sides are different implementations \u2014 but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?"
+  ]
+}

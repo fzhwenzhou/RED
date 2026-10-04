@@ -273,8 +273,8 @@ def measure_ops(spec: state_def.ISASpec, work_dir: str) -> dict:
         # compiles the model and runs it under callgrind. Re-pricing each review
         # round (which is what keeps a revision from giving the design away)
         # multiplied that by the round count, and on a twelve-instruction libcrc
-        # spec it ran 48 callgrind passes on the head where 12 would do. The
-        # head has 5.7 GB and Ray's memory monitor killed a tool server mid-run.
+        # spec it ran 48 callgrind passes where 12 would do, and the machine
+        # ran out of memory and lost a tool server mid-run.
         key = hashlib.sha1(
             (ins.mnemonic + "\0" + (ins.c_model or "")).encode()).hexdigest()
         if key in _OPS_CACHE:

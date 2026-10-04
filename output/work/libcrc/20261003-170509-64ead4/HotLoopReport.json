@@ -1,0 +1,25 @@
+{
+  "coverage": 0.9983270729463847,
+  "loops": [
+    {
+      "body": "if ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n\t}",
+      "calls": 1200,
+      "cycle_share": 0.9983270729463847,
+      "dynamic_cycles": 281560800,
+      "function": "crc_32",
+      "ir": "",
+      "loop_id": "crc_32::byte_loop",
+      "operand_stats": "Reflected CRC-32 (IEEE 802.3, poly 0xEDB88320, CRC_START_32=0xFFFFFFFF, final XOR 0xFFFFFFFF), byte-at-a-time table-driven. Per iteration: 1 unsigned byte load (lbu) from a sequential, unit-stride input stream (*ptr++); 32-bit crc state; index = (crc ^ byte) & 0xFF (8-bit index); 1 table load of a 32-bit word from the 256-entry x 4-byte (1 KiB) read-only crc_tab32 (data-dependent, random-access gather); crc>>8 logical shift; 1 XOR combine. Strict loop-carried recurrence through crc (each table index depends on the previous crc), so the chain is load-use latency bound: xor -> andi -> slli/add (address) -> lw -> srli/xor. No other memory writes. Called 1200 times per profile run; trip count = num_bytes, set by harness (not visible in sources). Candidate for a fused CRC32 step instruction (byte or word granularity, e.g. carry-less multiply / Zbc clmul-style or dedicated crc32.b/crc32.w) eliminating the table lookup.",
+      "rank": 1,
+      "source_file": "libcrc/src/crc32.c",
+      "trip_count": 0
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/libcrc/20261003-170509-64ead4/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/libcrc/20261003-170509-64ead4/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    282032620
+  ],
+  "workload": "libcrc"
+}

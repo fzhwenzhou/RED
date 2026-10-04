@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 import tempfile
 
@@ -174,8 +175,14 @@ def test_general_purpose_constants() -> None:
     srcs = [rel for rel, _ in constants.find_sources(EXAMPLE_PROJECT, exts=(".c",))]
     _require("uECC.c" in " ".join(srcs) or any(s.endswith("uECC.c") for s in srcs),
              "uECC.c discoverable via find_sources (not a hard-coded list)")
-    _require(constants.LLM_BACKEND == "gemini", "LLM backend must be Gemini")
-    _require(constants.GCP_PROJECT, "GCP project id must be set")
+    _require(constants.CLAUDE_BIN, "the agent backend binary must be named")
+    _require(shutil.which(constants.CLAUDE_BIN),
+             f"{constants.CLAUDE_BIN!r} must be on PATH — RED runs its agent "
+             "turns through the Claude Code CLI")
+    # Nothing about where the work runs: there is one machine.
+    for gone in ("GCP_PROJECT", "LLM_BACKEND", "RES_LLM", "STAGE_POLL_SECONDS"):
+        _require(not hasattr(constants, gone),
+                 f"{gone} is a cluster/Vertex vestige and should be gone")
 
 
 def test_toolchain() -> None:
@@ -194,22 +201,51 @@ def test_toolchain() -> None:
 
 
 def test_scripts() -> None:
-    """The cluster lifecycle scripts exist and parse: scripts/red_env.sh is the
-    entry point (setup/up/down/status) and scripts/gcp_util.py its GCP helper."""
+    """The scripts that stand the environment up exist and parse, and none of
+    them still reaches for a cluster.
+
+    RED ran on a cloud cluster once, and the shape of that is easy to leave
+    behind by accident: a `ray status` check, a bring-up ordering note, a
+    teardown that must happen or the instances bill. All of it is wrong now --
+    there is one machine, nothing is provisioned, and nothing bills while RED
+    is idle. A leftover reference does not crash anything, which is why it
+    needs a test: it would just quietly tell the next reader to run a command
+    that no longer exists."""
     import subprocess
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sh = os.path.join(root, "scripts", "red_env.sh")
-    util = os.path.join(root, "scripts", "gcp_util.py")
+    scripts = os.path.join(root, "scripts")
+
+    sh = os.path.join(scripts, "red_env.sh")
     _require(os.path.isfile(sh) and os.access(sh, os.X_OK),
              "scripts/red_env.sh present + executable")
-    _require(subprocess.run(["bash", "-n", sh]).returncode == 0,
-             "red_env.sh passes bash -n")
-    _require(subprocess.run([sys.executable, "-m", "py_compile", util]).returncode == 0,
-             "gcp_util.py compiles")
-    # The llm node must carry a service account so Vertex ADC needs no login.
-    y = open(os.path.join(root, "cluster.yaml")).read()
-    _require("service_accounts:" in y and "cloud-platform" in y,
-             "cluster.yaml attaches a service account to the llm node")
+    for name in ("red_env.sh", "run_projects.sh", "setup_neo4j.sh",
+                 "setup_spike.sh"):
+        path = os.path.join(scripts, name)
+        _require(os.path.isfile(path), f"scripts/{name} present")
+        _require(subprocess.run(["bash", "-n", path]).returncode == 0,
+                 f"{name} passes bash -n")
+
+    _require(not os.path.exists(os.path.join(root, "cluster.yaml")),
+             "cluster.yaml is gone — there is no cluster to describe")
+    _require(not os.path.exists(os.path.join(scripts, "gcp_util.py")),
+             "scripts/gcp_util.py is gone — nothing provisions instances")
+
+    stale = {"ray ": "the loop does not use Ray",
+             "chia ": "the loop does not use CHIA",
+             "gcloud": "nothing authenticates to GCP",
+             "red_env.sh up": "red_env.sh has no 'up'",
+             "red_env.sh down": "red_env.sh has no 'down'"}
+    for name in os.listdir(scripts):
+        if not name.endswith(".sh"):
+            continue
+        body = open(os.path.join(scripts, name)).read()
+        for needle, why in stale.items():
+            _require(needle not in body,
+                     f"scripts/{name} still mentions {needle!r}: {why}")
+
+    _results.append(("scripts", True,
+                     "4 scripts parse; no cluster bring-up, teardown or "
+                     "provisioning left to get wrong"))
 
 
 def test_state_roundtrip() -> None:
@@ -412,8 +448,6 @@ def test_spec_validation_encoding_fields() -> None:
 def test_spec_tool_normalizes_nested_encoding() -> None:
     """write_spec lifts a nested encoding into the schema instead of bouncing a
     draft that is right in substance but differently shaped."""
-    import ray
-    ray.init(ignore_reinit_error=True)
     spec = _spec()
     ins = spec.instructions[0]
     payload = json.loads(state_def.to_json(spec))
@@ -476,9 +510,6 @@ def test_db_store() -> None:
 
 
 def test_sealed_tools() -> None:
-    import ray
-    ray.init(ignore_reinit_error=True)
-
     report_path = os.path.join(_TMP_DB, "HotLoopReport.json")
     spec_path = os.path.join(_TMP_DB, "ISASpec.json")
     profile_path = os.path.join(_TMP_DB, "profile.json")
@@ -1113,70 +1144,42 @@ def test_ir_per_op_is_calibrated_not_assumed() -> None:
                      f"declaration stands"))
 
 
-def test_lost_worker_fails_fast_instead_of_hanging() -> None:
-    """A ray.get() on a task whose resource has left the cluster waits forever.
+def test_a_wedged_agent_turn_fails_instead_of_hanging() -> None:
+    """A turn that never returns must not take the run with it.
 
-    That cost a nine-hour hang: the workers' reverse SSH tunnels dropped, the
-    `llm` resource vanished from the scheduler, and the driver blocked on one
-    unschedulable turn while the GCP instances billed. A bare timeout would be
-    the wrong fix — callgrind over the whole ECDH exchange legitimately runs for
-    ~20 minutes — so the wait polls and asks whether the resource still exists.
+    The distributed version of this hazard was a task whose Ray resource had
+    left the cluster: the driver sat on one unschedulable turn for nine hours
+    while the cloud instances billed. There is no scheduler now — a turn is a
+    subprocess — but the hazard is the same shape, so the bound is too: the
+    subprocess gets a deadline, and exceeding it is a failed turn the loop's
+    repair edges can act on, not a hang.
     """
-    import contextlib
-    import io
+    from red import backend
 
-    import ray
-    from ray.exceptions import GetTimeoutError
-    from red import loop as red_loop
+    script = os.path.join(_TMP_DB, "sleepy-claude")
+    with open(script, "w") as f:
+        f.write("#!/bin/sh\nsleep 60\n")
+    os.chmod(script, 0o755)
 
-    real_get, real_res = red_loop.get, ray.cluster_resources
-    real_poll, real_max = red_loop.STAGE_POLL_SECONDS, red_loop.STAGE_MAX_SECONDS
-    calls = {"n": 0}
-
-    def _never(ref, timeout=None):
-        calls["n"] += 1
-        raise GetTimeoutError("not yet")
-
+    saved = backend.CLAUDE_BIN
     try:
-        red_loop.get = _never
-        red_loop.STAGE_POLL_SECONDS = 1.0
-        red_loop.STAGE_MAX_SECONDS = 2.0
-
-        # resource gone -> immediate, actionable failure
-        ray.cluster_resources = lambda: {"head_local": 8}
-        try:
-            red_loop._await(object(), "A1 profile", "profile")
-            _require(False, "a vanished resource must raise, not hang")
-        except RuntimeError as e:
-            _require("no longer in the cluster" in str(e),
-                     f"the error must name the cause (got {str(e)[:80]!r})")
-            _require("red_env.sh up" in str(e),
-                     "and tell the operator how to recover")
-        _require(calls["n"] == 1,
-                 f"it must not keep polling a resource that is gone "
-                 f"(polled {calls['n']}x)")
-
-        # resource present -> keep waiting, up to the backstop
-        calls["n"] = 0
-        ray.cluster_resources = lambda: {"profile": 1}
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                red_loop._await(object(), "A1 profile", "profile")
-            _require(False, "the backstop must eventually fire")
-        except RuntimeError as e:
-            _require("still unfinished" in str(e),
-                     f"a live-but-wedged task hits the cap (got {str(e)[:80]!r})")
-        _require(calls["n"] > 1,
-                 "a slow stage on a live resource must be waited on, not failed")
-
-        # and None passes straight through (the --local smoke path)
-        _require(red_loop._await(None, "x", "profile") is None,
-                 "a None ref must resolve to None")
+        backend.CLAUDE_BIN = script
+        llm = backend.ClaudeCodeLLM(timeout_seconds=2)
+        started = time.monotonic()
+        res = llm.prompt("anything")
+        waited = time.monotonic() - started
     finally:
-        red_loop.get, ray.cluster_resources = real_get, real_res
-        red_loop.STAGE_POLL_SECONDS, red_loop.STAGE_MAX_SECONDS = real_poll, real_max
-    _results.append(("lost worker fails fast", True,
-                     "vanished resource raises at once; slow stage keeps waiting"))
+        backend.CLAUDE_BIN = saved
+
+    _require(waited < 30,
+             f"a wedged turn must be cut off promptly, waited {waited:.0f}s")
+    _require(res is not None and not res.success,
+             "and must come back as a failed turn, not an exception")
+    _require("did not finish" in (res.stderr or ""),
+             f"saying what happened: {res.stderr!r}")
+    _results.append(("wedged turn", True,
+                     f"a turn past its deadline fails in {waited:.1f}s instead "
+                     "of hanging the run"))
 
 
 def test_source_tool_resolves_what_agents_actually_ask_for() -> None:

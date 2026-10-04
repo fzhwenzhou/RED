@@ -1,0 +1,201 @@
+# callgrind format
+version: 1
+creator: callgrind-3.27.0
+pid: 161126
+cmd:  /home/naonao/RED/output/work/micro-ecc/20261003-172753-914922/security/final/secp256r1_mmod_sec_ct f14e6cdc4fef0b9626c2c679eea3fcd1a65e69fa22eedc20bcd283ffb39869a3f0e2a228c0cab27a0b361b1555ea58c513cbb66681051ba4297994bb7cf79f37 ct
+part: 1
+
+
+desc: I1 cache: 
+desc: D1 cache: 
+desc: LL cache: 
+
+desc: Timerange: Basic block 0 - 30152
+desc: Trigger: Program termination
+
+positions: line
+events: Ir
+summary: 3727
+
+
+ob=(1) /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+fl=(1) ???
+fn=(0) 0x000000000001aa40
+cfn=(2) 0x00000000000165f0
+calls=1 0 
+0 3727
+
+fn=(2824) 0x0000000000004bb0
+cob=(5) /home/naonao/RED/output/work/micro-ecc/20261003-172753-914922/security/final/secp256r1_mmod_sec_ct
+cfi=(5) ???
+cfn=(2938) (below main)
+calls=1 0 
+0 3727
+
+fn=(2)
+cfn=(2824)
+calls=1 0 
+0 3727
+
+ob=(2) /usr/lib/aarch64-linux-gnu/libc.so.6
+fl=(2) ???
+fn=(2944) __cxa_atexit
+cfn=(2946) 0x000000000003ea24
+calls=1 0 
+0 3727
+
+fn=(3032) strtoul
+cfn=(3034) 0x000000000004c430
+calls=1 0 
+0 3727
+
+fn=(3033) strtoul'2
+cfn=(3035) 0x000000000004c430'2
+calls=15 0 
+0 55905
+
+fn=(2946)
+cfn=(2943) (below main)'2
+calls=1 0 
+0 3727
+
+fn=(2998) 0x0000000000028450
+cob=(5)
+cfi=(6) /home/naonao/RED/output/work/micro-ecc/20261003-172753-914922/security/final/secp256r1_mmod_sec_ct.c
+cfn=(3012) main
+calls=1 167 
+0 3727
+
+fn=(2942) (below main)
+cfn=(2944)
+calls=1 0 
+0 3727
+
+fn=(2943)
+cfn=(2998)
+calls=1 0 
+0 3727
+cfn=(2943)
+calls=1 0 
+0 3727
+
+fn=(3034)
+fi=(6)
+cfn=(3033)
+calls=1 0 
+180 3727
+fe=(2)
+
+fn=(3035)
+fi=(6)
+cfn=(3033)
+calls=14 0 
+180 52178
+fi=(6)
+cob=(5)
+cfi=(6)
+cfn=(3096) secp256r1_mmod_model
+calls=1 27 
+186 3727
+fe=(2)
+
+ob=(5)
+fl=(5)
+fn=(2938)
+cob=(2)
+cfi=(2)
+cfn=(2942)
+calls=1 0 
+0 3727
+
+fl=(6)
+fn=(3096)
+27 9
++5 98
++1 2
++1 71
++1 1
++7 3
+cfn=(3097) secp256r1_mmod_model'2
+calls=1 -4 
+* 3525
+187 4
+cfn=(3013) main'2
+calls=1 +13 
+* 14
+
+fn=(3097)
+46 20
+-9 40
++1 10
++1 10
++1 20
++2 70
++1 10
++1 10
+-3 30
++1 490
++1 70
++1 70
+-3 220
+cfn=(3097)
+calls=10 +5 
+* 29425
+* 1
++10 1
++3 4
++1 1
++3 1
+-18 1
++11 2
++3 7
++1 2
++1 1
++1 2
++1 2
++1 1
+-6 3
+-13 7
++11 14
++3 49
++1 14
++1 7
++1 14
++1 14
++1 7
+-6 21
++1 392
++1 112
++1 56
++1 112
++1 112
++1 56
+-6 168
++8 8
++1 8
++1 8
++1 16
++2 32
++1 8
++1 16
++2 120
+-1 24
++1 728
+-1 168
++2 32
+-21 17
++23 52
++1 24
++1 10
+
+fn=(3012)
+cob=(2)
+cfi=(2)
+cfn=(3032)
+calls=1 0 
+173 3727
+
+fn=(3013)
+200 14
+
+totals: 3727

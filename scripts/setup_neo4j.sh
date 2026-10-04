@@ -14,12 +14,11 @@
 # unavailable. Everything here therefore lives under RED_NEO4J_PREFIX and
 # needs no privileges.
 #
-# WHY ON THE HEAD, NOT A WORKER. The graph is RED's memory *across* runs: what
+# WHY IT IS A SEPARATE LIFECYCLE. The graph is RED's memory *across* runs: what
 # earlier runs designed for a hot loop, what it was predicted to be worth, and
-# what the reviewers said about it. GCP workers are created and destroyed by
-# `red_env.sh up`/`down`, so a graph living on one would be erased on every
-# teardown, which is the opposite of persistent. It runs on the head, whose
-# disk outlives any cluster, and workers reach it over bolt.
+# what the reviewers said about it. So it is the one piece of RED that must
+# outlive a run, and deliberately the one piece that `red_env.sh` never stops
+# on its own: a run starts it if it is down and leaves it up on the way out.
 #
 # WHERE THE DATA LIVES. RED_NEO4J_HOME/data, i.e. ~/.local/share/red-neo4j by
 # default — deliberately NOT under the repo's output/, which the operator is

@@ -22,10 +22,8 @@ import json
 import os
 import re
 
-from chia.base.ChiaFunction import get
-
 from red import state_def
-from red.constants import LLM_PROMPTS_DIR, LLM_RESOURCE, REVIEW_MAX_FINDINGS
+from red.constants import LLM_PROMPTS_DIR, REVIEW_MAX_FINDINGS
 
 REVIEWERS = ("implementability", "callability", "benefit", "legality")
 
@@ -272,10 +270,10 @@ def review_spec(llm, spec_json: str, report_json: str, core: str,
                 perf=None, security=None) -> state_def.ReviewReport:
     """Run every reviewer concurrently and merge what they found.
 
-    *dispatch* is a callable ``(message, tag) -> ObjectRef`` supplied by the
-    loop, so this module never has to know how the LLM is scheduled. All the
-    refs are created before any is resolved — that is what makes the reviewers
-    parallel rather than four turns in a row.
+    *dispatch* is a callable ``(message, tag) -> Future`` supplied by the loop,
+    so this module never has to know how a turn is run. Every turn is started
+    before any is collected — that is what makes the reviewers parallel rather
+    than four turns in a row.
     """
     if llm is None:
         return state_def.ReviewReport(reviewers=[], findings=[])
@@ -290,7 +288,7 @@ def review_spec(llm, spec_json: str, report_json: str, core: str,
         if ref is None:
             continue
         try:
-            res = get(ref)
+            res = ref.result()
         except Exception as exc:                      # noqa: BLE001
             print(f"[red] reviewer {reviewer} failed: {exc}")
             continue

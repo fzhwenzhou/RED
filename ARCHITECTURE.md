@@ -6,6 +6,19 @@ it now stands: what each agent does, what each gate refuses, and why each piece
 exists — every one of them was added because something measurable went wrong
 without it.
 
+**Where it runs.** On one machine, with nothing provisioned. An agentic stage
+is one headless `claude -p` subprocess (`red/backend.py`); the tools it may use
+are MCP servers RED runs in threads of the driver process, on loopback ports
+(`red/localtool.py`, `red/tools.py`), named in a per-turn config passed with
+`--strict-mcp-config` and an explicit `--allowedTools` list. A mechanical gate
+is a program in this repository that compiles something and measures it.
+Concurrency is a thread pool, because a turn is a subprocess that waits.
+
+RED was a distributed CHIA/Ray loop on GCP before this, and the sections below
+keep the defects that configuration exposed, because the fixes are in the code
+and the reasoning still applies. What is gone is the part that was never the
+contribution: a scheduler, three VMs, and a teardown you had to remember.
+
 ---
 
 ## 1. The loop at a glance
@@ -291,12 +304,12 @@ passing on the static checks alone, because those establish nothing about what a
 model does. This was a real bug during development — a memcheck that could not
 start (a stripped `ld.so` without debuginfo) was being read as "no leak found".
 
-**What this actually did on the cluster.** Two full runs plus one targeted
+**What this actually did on real runs.** Two full runs plus one targeted
 experiment on the bundled example:
 
-- Both runs' designs passed Gate 4 on round 1 with all 13 checks running — the
-  GCP profile node can run memcheck, so the ctgrind check is live there (the
-  aarch64 head cannot, and says so rather than passing).
+- Both runs' designs passed Gate 4 on round 1 with all 13 checks running,
+  including ctgrind. On a host where memcheck cannot start, that check reports
+  a skip naming the reason rather than a pass.
 - The sub-agent read the spec, the core profile and the mechanical report, then
   probed: all-ones through the 256x256 multiply to test carry propagation into
   the top word, an already-reduced input through the reduction, an input chosen
@@ -365,10 +378,13 @@ gantt
 - the four reviewers are toolless, so all four dispatch in one round trip;
 - Gate 2's per-instruction differential tests run on a thread pool.
 
-Tool servers are the other cost: every `ChiaTool` is a separate Ray actor that
-rescans the port range as it binds, so the surface is **two servers**
-(`DesignerTool`, `IssTool`) rather than one per artifact — that alone removed
-~2 minutes of dead time before the first agent turn.
+Tool servers are the other cost: each is a uvicorn app in its own thread on a
+loopback port, and every agent turn re-reads the MCP config naming them. So the
+surface is **four servers split by what an agent may see** — `DesignerTool`,
+`IssTool`, `WorkloadTool`, `SecurityTool` — rather than one per artifact. The
+split that remains is the one that does work: the ISS implementer's config
+contains no server that could show it the reference C models, which is what
+makes Gate 2's independence mechanical rather than a promise.
 
 ---
 
@@ -422,9 +438,9 @@ A single Neo4j graph accumulates every run:
                            (:HotLoop)
 ```
 
-It runs **on the head**, because `red_env.sh up`/`down` creates and destroys the
-GCP workers and a graph on one of them would be erased at every teardown. Its
-data directory sits outside `output/` for the same reason.
+It is a userland Neo4j on the machine RED runs on, and its data directory sits
+outside `output/` on purpose: the graph is the one piece of RED that must
+outlive a run, and `output/` is what the operator deletes between batches.
 
 Three decisions carry the design:
 
@@ -486,7 +502,7 @@ Nothing here is speculative; each was added after a measurement.
 | **Gate 4** | every gate above can pass on an instruction that leaks the key it multiplies: a conditional subtraction in a modular reduction is correct, fast, and a working timing attack |
 | **the security agent's inability to block** | a model asked "is this safe?" answers confidently either way; the one thing it can do that a checker cannot is *name an interesting input*, so it gets an executor and not a verdict |
 | **requiring the battery to have run** | a memcheck that could not start was being read as "no leak found" — a security report that silently omits what it could not check is worse than none |
-| **the llm node advertising 4 units** | it advertised 1, so every agent turn in the loop serialized — including the four review sub-agents `red/review.py` dispatches together precisely so they cost one round trip instead of four. The fan-out the module documents had never actually happened on a cluster |
+| **a dispatch pool that is actually wide** | the fan-out `red/review.py` documents — four reviewers in one round trip rather than four — only happens if something lets four turns run at once. It serialized for most of this project's life behind a scheduler that advertised one unit. `RED_AGENT_PARALLEL` (default 4) is now what bounds it, and a turn is a subprocess that mostly waits |
 | **enforcing the ABI at the tool boundary** | "the instruction omits rs2" was the most common blocking review finding in the project's history: all four reviewers spend a finding on it and the loop pays a fan-out plus a revision round for something decidable from the spec's own fields |
 | **merging identical findings** | four reviewers read one spec, so one defect arrived as four blocking findings — counted four times, shown to the designer four times, and ranked as four problems |
 | **a repair edge after the final Gate 4 re-check** | matrixmul passed Gate 4 cleanly, the review revised the spec, the re-check caught a reintroduced data-dependent branch, and the run was reported not converged for a defect nobody was given the chance to fix |
@@ -592,22 +608,22 @@ gate has already priced correctly.
 The bar itself is unchanged: a spec with an unresolved blocking finding is not
 converged, and the run says so.
 
-### 9.1 Four more, found only by running on the cluster
+### 9.1 Four more, found only by running somewhere else
 
-The four fixes above were developed against a locally-hosted loop, where a run
-converged. Moving the same code to the cluster produced **three consecutive
+The four fixes above were developed on one host, where a run converged. Running
+the same code on a *different* machine produced **three consecutive
 non-converged runs, all reporting `1.00x over 0% of cycles` in every Gate 3
 round** — a signature no design can produce. Each cause was environmental in
-origin and a code defect in substance, and none was reachable without running
-distributed:
+origin and a code defect in substance, and every one was a hard-coded
+assumption about the machine underneath:
 
 5. **Call counts came from threshold-filtered text.** RED parsed
    `callgrind_annotate`, which prints a callee row only above a cost cutoff.
    Both micro-ecc kernels are reached from many individually-cold call sites, so
-   on the profiling node's valgrind 3.19 neither had a callee row at all and
+   under the second host's valgrind 3.19 neither had a callee row at all and
    both call counts read as zero. Gate 3 prices software *per call*, so a zero
    there silently disables every benefit it could credit. It worked on the
-   development host only because valgrind 3.27 happened to print enough rows.
+   first host only because its valgrind happened to print enough rows.
    RED now reads the raw callgrind file (`red/callgrind.py`), which records
    every `calls=` event exactly at every version; the parse reproduces the
    file's own `summary:` line to the instruction, and matches a self-counting
@@ -625,36 +641,39 @@ distributed:
    naming the profiler.
 8. **`_IR_PER_OP` was a hard-coded compiler property.** Gate 3 compares a
    model's measured instruction count against its declared `mac_ops`; the
-   conversion was fixed at 8.0 Ir per MAC. The real figure is 14.7 on the
-   development host and 16.1 on the profiling node, so honest declarations were
-   being rejected as understatements and their instructions overpriced. It is
+   conversion was fixed at 8.0 Ir per MAC. The real figure measured 14.7 on
+   one host and 16.1 on another, so honest declarations were being rejected as
+   understatements and their instructions overpriced. It is
    now calibrated on whichever machine is measuring, against a reference
    multiply of known MAC count.
 
-Two infrastructure faults were fixed alongside them, because both corrupt
-results rather than merely inconveniencing the operator:
+Two infrastructure faults were fixed alongside them. Both are gone now with
+the cluster that caused them, but one left a rule behind that still holds:
 
-- **A lost worker hung the driver indefinitely.** The workers' reverse SSH
-  tunnels dropped mid-run, the `llm` resource left the scheduler, and `ray.get`
-  on the next turn blocked for **nine hours** while the autoscaler logged "No
-  available node types can fulfill resource request" twice a minute and the
-  instances billed. A plain timeout would be the wrong fix — callgrind over a
-  whole ECDH exchange legitimately runs ~20 minutes — so `red.loop._await`
-  polls: it re-checks that the resource the task needs is still in the cluster,
-  waits as long as necessary while it is, and fails at once with an actionable
-  message when it is gone.
-- **Recycled IPs poisoned `known_hosts`.** GCP reuses external addresses within
-  a project, so the address that was the database node returns as the llm node
-  with a new host key; ssh then refuses, chia's `echo ok` setup probe times out,
-  and that node silently drops out of the bring-up. `scripts/red_env.sh` now
-  purges the cluster's addresses from `known_hosts` on both `up` and `down`, and
-  `up` recovers the orphaned-instances-with-no-live-head state instead of
-  leaving nodes billing that nothing can reach.
+- **A lost worker hung the driver indefinitely.** A reverse SSH tunnel dropped
+  mid-run, the resource the next turn needed left the scheduler, and the driver
+  blocked for **nine hours** while the instances billed. A plain timeout would
+  have been the wrong fix at the time — callgrind over a whole ECDH exchange
+  legitimately runs ~20 minutes — so the driver polled for the resource rather
+  than clock-watching. The scheduler is gone, but the rule survives it: **no
+  dispatch may wait forever, and a turn that exceeds its bound is a failed
+  turn, not an exception and not a hang.** A turn is a subprocess now, so
+  `RED_AGENT_TIMEOUT` (1800 s) is the whole mechanism, and `tests/test_env.py`
+  proves a wedged turn comes back as `success=False` promptly.
+- **Recycled IPs poisoned `known_hosts`.** The provider reused external
+  addresses within a project, so the address that was one node returned as
+  another with a new host key, ssh refused, and that node silently dropped out
+  of the bring-up. Nothing provisions anything any more; this one is simply
+  obsolete.
 
-The lesson worth keeping: a single-host run cannot validate a distributed loop.
-Every one of these eight defects was invisible to the tests and to a local run,
+The lesson worth keeping outlived the cluster: **a loop that measures things
+cannot be validated on the machine it was written on.** Every one of these
+eight defects was invisible to the tests and to a run on the development host,
 and the three that mattered most were *silent* — they degraded a measurement to
-zero rather than raising, and the loop dutifully blamed the design.
+zero rather than raising, and the loop dutifully blamed the design. The
+hard-coded machine assumptions are gone (the Ir-per-op rate is calibrated per
+host, the profile is parsed from a format that does not vary), but the
+discipline that found them is the reason they are.
 
 ## 10. Known limits
 

@@ -14,7 +14,6 @@ micro-ecc ECDH/ECDSA library accelerated on a PicoRV32 core — under
 point at it as *default* inputs, overridable at run time via ``--project`` /
 ``--core`` / ``--workload``.
 
-Resource tags map 1:1 onto the node types in ``cluster.yaml``.
 """
 
 from __future__ import annotations
@@ -73,14 +72,15 @@ def find_sources(root: str, exts=SOURCE_EXTS):
 
 
 # ---------------------------------------------------------------------------
-# Cluster resources (match cluster.yaml available_node_types)
+# Toolchain groups
 # ---------------------------------------------------------------------------
-
-RES_LLM = "llm"                  # agent nodes (A1 mining, A2 synthesis)
-RES_DATABASE = "database"        # durable artifact store
-RES_HEAD_LOCAL = "head_local"    # sealed tools + driver-side gates and links
-RES_PROFILE = "profile"          # native harness build + perf/callgrind (A1)
-RES_SPIKE = "spike"              # patched Spike ISS (Gate 2)
+#
+# These were Ray resource tags naming which cluster node a stage ran on. RED
+# runs on one machine now, so they survive only as the names of the toolchain
+# groups `EXPECTED_TOOLS` probes: the profiler's compiler and valgrind, the C
+# models' compiler, Gate 2's Spike.
+GROUP_PROFILE = "profile"        # native harness build + perf/callgrind (A1)
+GROUP_SPIKE = "spike"            # patched Spike ISS (Gate 2)
 
 # ---------------------------------------------------------------------------
 # Gates & budgets (RED design §2)
@@ -93,7 +93,7 @@ GATE2_VECTORS = 100_000          # vectors the C model and Spike must agree on
 GATE2_BLOCK = 1_024              # vectors per checksum in Gate 2's phase 1
 # Gate 2's per-instruction tests are subprocess-bound (cross-compile, native
 # run, Spike run), so they overlap well on threads. Capped so a large spec
-# cannot oversubscribe a small profile/head node.
+# cannot oversubscribe the machine.
 GATE2_MAX_PARALLEL = int(os.environ.get("RED_GATE2_PARALLEL", "4"))
 CRITIC_MAX_ROUNDS = 3            # S2c self-critique cap (the review
                                  # sub-agents in red.review do the rest)
@@ -242,21 +242,6 @@ SECURITY_MAX_FINDINGS = 12       # per agent reply; keeps a runaway reply bounde
 SECURITY_MAX_PROBES = int(os.environ.get("RED_SECURITY_PROBES", "24"))
 
 # ---------------------------------------------------------------------------
-# Dispatch watchdog (red.loop._await)
-# ---------------------------------------------------------------------------
-#
-# A plain ray.get() on a task whose resource has left the cluster waits
-# forever. When the workers' reverse SSH tunnels dropped mid-run, the driver
-# sat on one unschedulable LLM turn for nine hours while the instances billed.
-# So the driver polls instead: every STAGE_POLL_SECONDS it re-checks that the
-# resource the task needs is still in the cluster, which distinguishes a slow
-# stage (callgrind over a whole ECDH exchange takes ~20 min, and must not be
-# failed) from a dead one. STAGE_MAX_SECONDS is the backstop for a task that is
-# schedulable but wedged.
-STAGE_POLL_SECONDS = float(os.environ.get("RED_STAGE_POLL_SECONDS", "120"))
-STAGE_MAX_SECONDS = float(os.environ.get("RED_STAGE_MAX_SECONDS", "5400"))
-
-# ---------------------------------------------------------------------------
 # Toolchain probing
 # ---------------------------------------------------------------------------
 
@@ -266,9 +251,9 @@ STAGE_MAX_SECONDS = float(os.environ.get("RED_STAGE_MAX_SECONDS", "5400"))
 #   cmodel  — link 1 compiles and stress-runs each instruction's C model
 #   spike   — Gate 2's C-model <=> patched-Spike differential run
 EXPECTED_TOOLS = {
-    RES_PROFILE: ["cc", "perf", "valgrind"],
+    GROUP_PROFILE: ["cc", "perf", "valgrind"],
     "cmodel": ["cc"],
-    RES_SPIKE: ["spike", "riscv64-unknown-elf-gcc", "dtc"],
+    GROUP_SPIKE: ["spike", "riscv64-unknown-elf-gcc", "dtc"],
 }
 
 # ---------------------------------------------------------------------------
@@ -293,54 +278,44 @@ SPIKE_BUILD = os.environ.get("RED_SPIKE_BUILD", os.path.join(_SPIKE_SHARE, "buil
 RISCV_GCC = os.environ.get("RED_RISCV_GCC", "riscv64-unknown-elf-gcc")
 
 # ---------------------------------------------------------------------------
-# LLM backend — Google Gemini on Vertex AI (GCP)
+# Agent backend — Claude Code, run headlessly
 # ---------------------------------------------------------------------------
 #
-# RED is model-agnostic in design; this deployment runs the Gemini model named
-# by LLM_MODEL below on Vertex AI, billed to the GCP credit. Auth is Application Default
-# Credentials (ADC) — set up once on the host that runs the LLM node:
+# RED is model-agnostic by construction: the loop only ever calls
+# `ClaudeCodeLLM.prompt(message, tools)`. Each turn is one `claude -p`
+# subprocess given exactly the sealed MCP tools that stage is entitled to and
+# nothing else (`--strict-mcp-config` plus an explicit allow-list), so a turn
+# cannot reach another agent's surface, the file system, or a shell.
 #
-#     gcloud auth application-default login
-#     gcloud auth application-default set-quota-project <GCP_PROJECT>
-#     gcloud services enable compute.googleapis.com --project <GCP_PROJECT>
-#
-# See the GCP guide PDF and chia/models/vertex.py (VertexGeminiLLM). The
-# Vertex backend reads GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION if
-# project/location aren't passed; we pass them explicitly from here.
-LLM_BACKEND = "gemini"                        # "gemini" (Vertex AI) — the chosen backend
-LLM_MODEL = os.environ.get("RED_LLM_MODEL", "gemini-3.1-pro-preview")
-GCP_PROJECT = os.environ.get("RED_GCP_PROJECT", "project-160a0199-6b4a-464c-86a")
-# Preview Gemini models are served from the "global" Vertex endpoint, not a
-# regional one — a region here 404s the model.
-GCP_LOCATION = os.environ.get("RED_GCP_LOCATION", "global")
-LLM_RESOURCE = float(os.environ.get("RED_LLM_RESOURCE", "1.0"))   # "llm" token share
-LLM_TIMEOUT_SECONDS = int(os.environ.get("RED_LLM_TIMEOUT_SECONDS", "1800"))
-# Output budget per turn, passed to the backend in red.loop. The backend's
-# 16k default truncates a spec carrying a C model (and a Spike model) for
-# several instructions, and a truncated reply arrives as MaxOutputTokensError
-# rather than as text -- a failed turn, not a short one.
-#
-# 64k, not 32k, because the constant-time rewrites Gate 4 asks for make the
-# models materially longer: a branch-free modular reduction carries its own
-# is_zero/is_greater helpers, and the ISS agent has to emit a Spike model for
-# every instruction in one reply.
-LLM_MAX_TOKENS = int(os.environ.get("RED_LLM_MAX_TOKENS", "64000"))
-# Vertex throttles a driver that runs turns back to back, and a throttled turn
-# is not a failed one -- red.loop backs off and retries rather than counting it
-# against the "the backend is down" guard.
+# This replaces the Vertex AI backend, and with it the GCP project, the service
+# accounts, the ADC dance and the cluster those were there to serve.
+# A throttled turn is not a failed one: red.loop backs off and retries rather
+# than counting it against the "the backend is down" guard.
 LLM_RATE_LIMIT_RETRIES = int(os.environ.get("RED_LLM_RATE_LIMIT_RETRIES", "3"))
 LLM_RATE_LIMIT_BACKOFF = float(os.environ.get("RED_LLM_RATE_LIMIT_BACKOFF", "45"))
+CLAUDE_BIN = os.environ.get("RED_CLAUDE_BIN", "claude")
+# Empty means "whatever the CLI is configured to use", which is the right
+# default: the operator's own Claude Code settings decide.
+AGENT_MODEL = os.environ.get("RED_AGENT_MODEL", "")
+# Per turn. A design turn reads several sources and writes a spec, so it needs
+# room; a reviewer answers in one JSON array.
+AGENT_MAX_TURNS = int(os.environ.get("RED_AGENT_MAX_TURNS", "40"))
+AGENT_TIMEOUT_SECONDS = int(os.environ.get("RED_AGENT_TIMEOUT_SECONDS", "1800"))
+# The agents touch nothing but their own MCP tools, so there is nothing for a
+# permission prompt to guard and a prompt would hang a headless run.
+AGENT_PERMISSION_MODE = os.environ.get("RED_AGENT_PERMISSION_MODE", "acceptEdits")
+# How many agent turns may be in flight at once. The four review sub-agents are
+# dispatched together — that is the whole reason they are separate agents — and
+# each turn is a subprocess waiting on the network, not on this CPU.
+AGENT_MAX_PARALLEL = int(os.environ.get("RED_AGENT_MAX_PARALLEL", "4"))
 LLM_PROMPTS_DIR = os.path.join(REPO_ROOT, "red", "prompts")
 
 # ---------------------------------------------------------------------------
 # Neo4j — the persistent design-knowledge graph (red/graph.py)
 # ---------------------------------------------------------------------------
 #
-# Runs on the HEAD, not on a cluster worker: `red_env.sh up`/`down` creates and
-# destroys the GCP nodes, so a graph living on one would be erased on every
-# teardown. The head's disk outlives any cluster, and tunnelled workers reach it
-# over bolt. Install and run it with scripts/setup_neo4j.sh (a userland install
-# under ~/.local — this host has neither passwordless sudo nor a docker group).
+# Install and run it with scripts/setup_neo4j.sh (a userland install under
+# ~/.local — no root, no docker group needed).
 #
 # The data directory is deliberately OUTSIDE the repo's output/, which the
 # operator is told to delete between test batches: the whole value of the graph
@@ -356,9 +331,9 @@ NEO4J_DATABASE = os.environ.get("RED_NEO4J_DATABASE", "neo4j")
 # ---------------------------------------------------------------------------
 
 # Everything a run produces lands under <repo>/output/ (git-ignored): the
-# driver's scratch for the in-flight run, and the database node's durable
-# store. The repo is rsynced to the same absolute path on every worker, so the
-# database node writes to <repo>/output/db on its own disk.
+# driver's scratch for the in-flight run, and the durable store that outlives
+# it. Point RED_DB_ROOT somewhere outside the repo to keep a batch's record
+# when the operator deletes output/ between batches.
 OUTPUT_ROOT = os.environ.get("RED_OUTPUT_ROOT", os.path.join(REPO_ROOT, "output"))
 RED_LOG_ROOT = os.path.join(OUTPUT_ROOT, "work")         # driver-side scratch
 DB_ROOT = os.environ.get("RED_DB_ROOT", os.path.join(OUTPUT_ROOT, "db"))

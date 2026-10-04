@@ -19,9 +19,14 @@
 # runs with everything empty, which is the fully automatic path: AW writes the
 # workload and Gate 0 decides.
 #
+# Everything runs on this machine. Projects run one after another because each
+# one saturates the box with callgrind and Spike; RED's own fan-out inside a
+# run is what uses the cores.
+#
 #   bash scripts/run_projects.sh                 # every project, once each
 #   bash scripts/run_projects.sh libcrc          # just these
 #   RED_RUNS=3 bash scripts/run_projects.sh      # three runs of each
+#   RED_MODEL=... bash scripts/run_projects.sh   # pin the agent model
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,20 +56,10 @@ config_for() {
     esac
 }
 
-# ORDERING, and it matters: prepare_project runs on the HEAD, but the profile
-# node compiles the project from its own copy of the tree, which is rsynced only
-# by a fresh `red_env.sh up` (`up --add` against a live head does not re-sync).
-# So generated sources must exist BEFORE the cluster is brought up. This script
-# checks and says so rather than letting every build on the worker fail on an
-# include the head can resolve perfectly well.
-#
 # Some projects generate part of their own source before they can be compiled.
 # RED compiles the sources itself (that is how it instruments them), so the
-# generator has to have run first -- and the generated files have to reach the
-# profile node, which they do not if the project's .gitignore excludes them:
-# the cluster ships the working directory with gitignored paths removed, so a
-# generated *source* silently goes missing on the worker and every build there
-# fails on an include the head can resolve perfectly well.
+# generator has to have run first, and the generated files are sources as far
+# as RED is concerned even when the project gitignores them as build output.
 prepare_project() {
     case "$1" in
         libcrc)
@@ -78,12 +73,6 @@ prepare_project() {
                 (cd "$d" && make >/dev/null 2>&1) || true
             fi
             [ -f "$d/tab/gentab32.inc" ] || echo "!!  libcrc tables missing"
-            # If the cluster is already up, the workers have the pre-generation
-            # copy of the tree and every build there will fail.
-            if "$VENV/bin/ray" status >/dev/null 2>&1; then
-                echo "    NOTE: if the tables were generated after the cluster"
-                echo "          came up, re-run: bash scripts/red_env.sh down && up"
-            fi
             ;;
     esac
 }
@@ -115,6 +104,7 @@ for proj in "${PROJECTS[@]}"; do
         "$VENV/bin/python" -u -m red.loop \
             --project "$dir" --core "$CORE" --workload "$proj" \
             --harness "$HARNESS" --cflags "$CFLAGS" --exclude "$EXCLUDE" \
+            ${RED_MODEL:+--model "$RED_MODEL"} \
             > "$log" 2>&1
         rc=$?
         echo "=== PROJECT $proj RUN $n finished rc=$rc in $(( $(date +%s) - start ))s"

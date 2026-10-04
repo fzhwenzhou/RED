@@ -1,0 +1,14 @@
+[
+  {
+    "counterexample": null,
+    "detail": "coverage 100.00% >= 80%; 1/1 C models built and survived 100,000 vectors under ASan+UBSan",
+    "gate": "link1",
+    "passed": true
+  },
+  {
+    "counterexample": null,
+    "detail": "1/1 instructions: C model and patched Spike agree on 100,000 random + corner vectors",
+    "gate": "link2",
+    "passed": true
+  }
+]

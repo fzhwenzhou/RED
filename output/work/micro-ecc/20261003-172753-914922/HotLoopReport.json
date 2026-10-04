@@ -1,0 +1,51 @@
+{
+  "coverage": 0.9718252163675268,
+  "loops": [
+    {
+      "body": "static void vli_mmod_fast_secp256r1(uint64_t *result, uint64_t *product) {\n    uint64_t tmp[num_words_secp256r1];\n    int carry;\n    uECC_vli_set(result, product, num_words_secp256r1);\n    /* s1 */\n    tmp[0] = 0;\n    tmp[1] = product[5] & 0xffffffff00000000ull;\n    tmp[2] = product[6];\n    tmp[3] = product[7];\n    carry = (int)uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    /* s2 */\n    tmp[1] = product[6] << 32;\n    tmp[2] = (product[6] >> 32) | (product[7] << 32);\n    tmp[3] = product[7] >> 32;\n    carry += uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);\n    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    /* s3 */ ... carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    /* s4 */ ... carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);\n    /* d1..d4 */ ... carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);\n    if (carry < 0) {\n        do {\n            carry += uECC_vli_add(result, result, curve_secp256r1.p, num_words_secp256r1);\n        } while (carry < 0);\n    } else {\n        while (carry || uECC_vli_cmp_unsafe(curve_secp256r1.p, result, num_words_secp256r1) != 1) {\n            carry -= uECC_vli_sub(result, result, curve_secp256r1.p, num_words_secp256r1);\n        }\n    }\n}\n/* inner loop (uECC.c uECC_vli_add / uECC_vli_sub, inlined): */\nfor (i = 0; i < num_words; ++i) {\n    uECC_word_t sum = left[i] + right[i] + carry;\n    if (sum != left[i]) {\n        carry = (sum < left[i]);\n    }\n    result[i] = sum;\n}",
+      "calls": 530967,
+      "cycle_share": 0.4848672445963151,
+      "dynamic_cycles": 4336815473,
+      "function": "vli_mmod_fast_secp256r1",
+      "ir": "",
+      "loop_id": "vli_mmod_fast_secp256r1::nist_fast_reduction",
+      "operand_stats": "uECC_WORD_SIZE=8 on the x86_64 profiling host (4 x 64-bit limbs per 256-bit field element); on RV32 it builds the WORD_SIZE==4 variant (8 x 32-bit limbs, curve-specific.inc:883). Input is a 512-bit product (8 limbs) and the output is a 256-bit residue mod p256. Work is 8 limb-wise add/sub chains of 4 limbs (s1..s4 added, d1..d4 subtracted, plus two doubling adds) with operands built by 32-bit-granularity shift/OR/mask of product[4..7]. The serial recurrence is carry/borrow propagation across limbs, done in software as compare-and-select (sum<left / diff>left) because base RV has no carry flag. Final correction is a data-dependent loop of conditional add/sub of p, usually 0-2 iterations. All memory access is sequential and unit-stride over small stack arrays. Called once per modular multiply (530,967 calls), so it is on every field-mult path.",
+      "rank": 1,
+      "source_file": "micro-ecc/curve-specific.inc",
+      "trip_count": 4
+    },
+    {
+      "body": "for (k = 0; k < num_words; ++k) {\n    for (i = 0; i <= k; ++i) {\n        muladd(left[i], right[k - i], &r0, &r1, &r2);\n    }\n    result[k] = r0;\n    r0 = r1;\n    r1 = r2;\n    r2 = 0;\n}\nfor (k = num_words; k < num_words * 2 - 1; ++k) {\n    for (i = (k + 1) - num_words; i < num_words; ++i) {\n        muladd(left[i], right[k - i], &r0, &r1, &r2);\n    }\n    result[k] = r0;\n    r0 = r1;\n    r1 = r2;\n    r2 = 0;\n}\nresult[num_words * 2 - 1] = r0;\n/* muladd (SUPPORTS_INT128 path): */\nuECC_dword_t p = (uECC_dword_t)a * b;\nuECC_dword_t r01 = ((uECC_dword_t)(*r1) << uECC_WORD_BITS) | *r0;\nr01 += p;\n*r2 += (r01 < p);\n*r1 = r01 >> uECC_WORD_BITS;\n*r0 = (uECC_word_t)r01;",
+      "calls": 3694592,
+      "cycle_share": 0.42463081042187595,
+      "dynamic_cycles": 3798040576,
+      "function": "uECC_vli_mult",
+      "ir": "",
+      "loop_id": "uECC_vli_mult::comba_muladd",
+      "operand_stats": "Product-scanning (Comba) schoolbook multiply of two 256-bit operands. On the 64-bit host that is num_words=4, giving 16 muladd per call; on RV32 it is num_words=8, giving 64 muladd per call. uECC_SQUARE_FUNC=0, so squarings also come through here (3,694,592 calls). Each muladd is one full WxW->2W unsigned multiply (needs MUL + MULHU on RISC-V) accumulated into a 3-word accumulator (r0,r1,r2), with carry detection by compare. The loop-carried recurrence is the triple-word accumulator, a natural fit for a fused multiply-accumulate-with-carry instruction. Memory access: left[i] ascending and right[k-i] descending, both unit-stride and read-only; one store per output column. Operands are full-width, uniformly random field elements.",
+      "rank": 2,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 16
+    },
+    {
+      "body": "uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);\nif (l_borrow) {\n    uECC_vli_add(result, result, mod, num_words);\n}\n/* uECC_vli_sub inner loop: */\nfor (i = 0; i < num_words; ++i) {\n    uECC_word_t diff = left[i] - right[i] - borrow;\n    if (diff != left[i]) {\n        borrow = (diff > left[i]);\n    }\n    result[i] = diff;\n}",
+      "calls": 3939328,
+      "cycle_share": 0.06232716134933582,
+      "dynamic_cycles": 557475063,
+      "function": "uECC_vli_modSub",
+      "ir": "",
+      "loop_id": "uECC_vli_modSub::sub_borrow_then_add_mod",
+      "operand_stats": "Modular subtraction over 4x64-bit limbs (8x32 on RV32). The borrow-propagation recurrence runs across limbs, and a conditional add of p follows when the subtraction borrows (about 50% for random operands). It uses the same add/sub-with-carry primitive as the mmod_fast reduction. Calls are frequent but short (3,939,328 calls, around 140 cycles each), coming from the XYcZ_add/XYcZ_addC/double_jacobian point formulas. Memory access is sequential and unit-stride.",
+      "rank": 3,
+      "source_file": "micro-ecc/uECC.c",
+      "trip_count": 4
+    }
+  ],
+  "passes_gate1": true,
+  "profile_command": "valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/micro-ecc/20261003-172753-914922/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/micro-ecc/20261003-172753-914922/profile/run1/harness >/dev/null 2>&1",
+  "profile_method": "callgrind",
+  "profile_runs": [
+    8944335839
+  ],
+  "workload": "micro-ecc"
+}

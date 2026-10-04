@@ -21,8 +21,9 @@ needs root — this host has neither passwordless sudo nor a docker group, so ap
 and containers are both unavailable. The JDK is chosen for the machine's
 architecture (`aarch64` and `x64` are both handled).
 
-`scripts/red_env.sh up` starts the graph for you if it is installed, so in normal
-use the command above is the only time you run it by hand.
+`scripts/red_env.sh setup` and `check` start the graph for you if it is
+installed, so in normal use the command above is the only time you run it by
+hand.
 
 | command | effect |
 |---|---|
@@ -34,13 +35,17 @@ use the command above is the only time you run it by hand.
 
 ## Where it runs, and why there
 
-**On the head, not on a cluster worker.** `red_env.sh up` and `down` create and
-destroy the GCP nodes, so a graph living on one would be erased on every
-teardown — the opposite of persistent. The head's disk outlives any cluster.
+**A userland install under `~/.local`, on the machine RED runs on.** No root,
+no apt, no docker — this host has none of them available — so everything lives
+under `RED_NEO4J_PREFIX` and needs no privileges.
 
 **Data lives in `~/.local/share/red-neo4j/data`**, deliberately outside the
-repo's `output/`. `down` leaves the server running on purpose: stopping it there
-would make teardown look as though it had deleted your history.
+repo's `output/`. The graph is the one piece of RED that must outlive a run,
+and `output/` is the directory you are told to delete between batches.
+`red_env.sh` starts the server if it is down and never stops it on its own, for
+the same reason: a command that looked like it had deleted your history would
+be a bad command. Stop it yourself with `setup_neo4j.sh stop` (the data is
+kept).
 
 Configuration is by environment variable, all with working defaults:
 `RED_NEO4J_URI` (default `bolt://127.0.0.1:7687`), `RED_NEO4J_USER`,

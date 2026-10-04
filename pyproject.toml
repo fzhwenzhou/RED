@@ -4,19 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "red-agent"
-version = "0.1.0"
-description = "RED — an agentic RISC-V ISA extension designer (A1 kernel mining + A2 ISA synthesis on the CHIA framework)"
+version = "0.2.0"
+description = "RED — an agentic RISC-V ISA extension designer (A1 kernel mining + A2 ISA synthesis, driven by Claude Code)"
 readme = "README.md"
 requires-python = ">=3.10"
+# RED runs on one machine. Its agent turns are subprocesses of the Claude Code
+# CLI (`claude`, installed separately — it is not a Python package), and its
+# tools are in-process MCP servers on loopback. That leaves two dependencies.
 dependencies = [
-    # CHIA (installed separately: `pip install -e /home/naonao/chia`)
-    "ray>=2.9",
-    "google-genai>=1.0",         # VertexGeminiLLM backend
-    "google-cloud-compute>=1.0", # GCP cluster provisioning
-    "mcp>=1.0",                  # ChiaTool MCP servers
+    "mcp>=1.0",      # the four sealed tool servers (red/localtool.py)
+    "uvicorn>=0.27",  # serves them over streamable HTTP on 127.0.0.1
 ]
 
 [project.optional-dependencies]
+# Cross-run memory. Without it RED still runs; it just starts every run blank.
+graph = ["neo4j>=5.0"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]

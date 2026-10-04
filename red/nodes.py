@@ -1,4 +1,4 @@
-"""ChiaFunction workers for the RED loop — the programmatic evaluation edges.
+"""The RED loop's programmatic evaluation edges.
 
 Scope: **A1 kernel mining + A2 ISA synthesis** (the dashed enclosure of Fig. 1
 in the RED design) — the research contribution, and all this repo implements.
@@ -9,7 +9,7 @@ ISASpec they would consume.
 
 The graph the loop drives:
 
-    A1_profile_workload (x2, profile node) ─┐
+    A1_profile_workload (x2) ───────────────┐
                                             ├─ gate1 (±5% re-profile)
     A1 mining agent (loop.py) ──────────────┴──> HotLoopReport
     A2 synthesis agent (loop.py, S2a->S2b->S2c) ─┐
@@ -21,7 +21,7 @@ The graph the loop drives:
                                                  └─ link2 (mirrors gate2)
                                                  └──> ISASpec  (final artifact)
 
-Every node degrades gracefully: a missing tool returns a typed result whose
+Every edge degrades gracefully: a missing tool returns a typed result whose
 ``detail`` says "not available" rather than crashing.
 
 All inputs (project dir, workload name, cflags) are parameters — RED is
@@ -37,7 +37,6 @@ import shutil
 import subprocess
 from typing import Optional
 
-from chia.base.ChiaFunction import ChiaFunction
 
 from red import state_def
 from red.callgrind import parse_raw as _parse_callgrind_raw
@@ -300,20 +299,17 @@ def _parse_asm(text: str) -> dict:
 # AW / Gate 0 — is the workload a workload? (red.workload)
 # ---------------------------------------------------------------------------
 
-@ChiaFunction(resources={"profile": 1.0})
 def workload_check(project: str, harness_source: str, work_dir: str,
                    cflags: str = "", exclude: str = "") -> str:
     """Build the candidate harness, run it twice under callgrind, and return a
     measured ``WorkloadSpec`` as JSON.
 
-    Takes the harness's **source text**, not a path. The agent that wrote it
-    talks to a tool server pinned to the head, so the file lands on the head's
-    disk; this node is a different machine, and the run directory is created
-    during the run so it is not part of the rsynced repo. Shipping the content
-    is what makes the harness available on whichever node compiles it.
+    Takes the harness's **source text**, not a path — the agent writes it
+    through a sealed tool that chooses where it lands, and this edge should not
+    have to agree with it about where that is.
 
-    On a profile node because it needs the compiler and valgrind, exactly like
-    the A1 profile it is a precondition for. Returns a spec whose ``detail``
+    Needs the compiler and valgrind, exactly like the A1 profile it is a
+    precondition for. Returns a spec whose ``detail``
     carries the failure rather than raising, so a harness that does not compile
     comes back as a measurement the agent can act on."""
     from red import workload                  # local: only this node needs it
@@ -325,7 +321,6 @@ def workload_check(project: str, harness_source: str, work_dir: str,
     return state_def.to_json(spec)
 
 
-@ChiaFunction(resources={"head_local": 0.1})
 def gate0(spec_json: str) -> state_def.GateResult:
     """Gate 0: the workload does enough work, in the project's own code,
     reproducibly.
@@ -342,7 +337,6 @@ def gate0(spec_json: str) -> state_def.GateResult:
     return workload.verdict(spec)
 
 
-@ChiaFunction(resources={"profile": 1.0})
 def A1_profile_workload(project: str, workload: str, work_dir: str,
                         cflags: str = "", harness: str = "",
                         exclude: str = "", harness_source: str = "") -> dict:
@@ -400,7 +394,6 @@ def A1_profile_workload(project: str, workload: str, work_dir: str,
     }
 
 
-@ChiaFunction(resources={"head_local": 0.1})
 def gate1(total_a: int, total_b: int) -> state_def.GateResult:
     """Gate 1: two independent profile runs must agree within ±GATE1_TOLERANCE.
 
@@ -515,7 +508,6 @@ def _stress_c_model(ins: state_def.InstructionSpec, work_dir: str,
     return True, run.stdout.strip()
 
 
-@ChiaFunction(resources={"head_local": 0.1})
 def link1(report_json: str, spec_json: str,
           work_dir: str = "") -> state_def.GateResult:
     """Link 1: the mined kernels' coverage holds AND every instruction's C
@@ -571,7 +563,6 @@ def link1(report_json: str, spec_json: str,
         counterexample="\n".join(failures) or None)
 
 
-@ChiaFunction(resources={"spike": 1.0})
 def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
     """Gate 2: the ISASpec's C model and a patched Spike ISS must agree on
     GATE2_VECTORS random + corner vectors.
@@ -604,15 +595,14 @@ def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
 # Gate 4 — the security bound (red.security)
 # ---------------------------------------------------------------------------
 
-@ChiaFunction(resources={"profile": 1.0})
 def security_scan(spec_json: str, core_json: str = "",
                   work_dir: str = "") -> str:
     """Run every mechanical security check on the spec; return a SecurityReport
     as JSON.
 
-    Placed on a profile node because that is where the tools it needs live: a C
-    compiler with the sanitizers, and valgrind for the constant-time checks. The
-    verdict itself is :func:`gate4`, kept separate and pure so the report can be
+    Needs a C compiler with the sanitizers, and valgrind for the constant-time
+    checks. The verdict itself is :func:`gate4`, kept separate and pure so the
+    report can be
     shown to the agents, merged with the security sub-agent's findings, and only
     then turned into a pass or a fail.
 
@@ -634,7 +624,6 @@ def security_scan(spec_json: str, core_json: str = "",
     return state_def.to_json(security.analyze(spec, core, work_dir))
 
 
-@ChiaFunction(resources={"head_local": 0.1})
 def gate4(report_json: str) -> state_def.GateResult:
     """Gate 4: the spec carries no mechanically confirmed security defect.
 
@@ -654,7 +643,6 @@ def gate4(report_json: str) -> state_def.GateResult:
     return security.verdict(report)
 
 
-@ChiaFunction(resources={"head_local": 0.1})
 def link2(gate2_json: str) -> state_def.GateResult:
     """Link 2: C model <=> patched Spike agreement — mirrors Gate 2's verdict."""
     g = state_def.from_json(gate2_json, state_def.GateResult)

@@ -1,0 +1,162 @@
+{
+  "findings": [
+    {
+      "evidence": "The c_model's innermost loop runs 16 words x 4 bytes x 8 bits = 512 times, and each step depends on the one before it through crc. Gate 3 already overrode the declaration (\"3,163 instructions ... charged as 438 sequential logic steps\") and priced the instruction at 569 cycles. Two hardware readings fit the prose. (a) Bit-serial, 1 bit per cycle: 28 + 2x34 + 512 = 608 cycles, and the arithmetic dominates. (b) A 16-bit-per-cycle unrolled CRC XOR network, which consumes one 32-bit word every 2 cycles and so keeps pace with the 2-cycle bus beat: compute hides entirely under the input stream, giving about 28 + 68 + 2 = 98 cycles. Both still beat the 3,811-cycle software, so the verdict does not change. But a Gate 2 implementer or an RTL author could build (a), at 6x the latency of (b).",
+      "finding": "The spec declares mac_ops=0 and \"constant compute\" but never says how wide the datapath is, and its c_model is a bit-serial loop of 64 x 8 = 512 dependent shift/XOR steps, so it is not a zero-latency operation and the hardware latency is undefined.",
+      "fix": "State in the semantics that the unit folds 16 bits (2 bytes) per cycle as the words arrive, using the standard 32x16 GF(2) update matrix for 0xEDB88320, so latency = 28 + 2x(2x17) + 2 cycles. Set mac_ops to the compute cycles that are not overlapped (about 2, or 64 if you choose 1 byte per cycle) instead of 0. Optionally rewrite the c_model byte-at-a-time with a precomputed 256-entry table or an unrolled 8-step update, so the gate's profiler stops charging 438 serial steps.",
+      "instruction": "crc32.step64b",
+      "reviewer": "implementability",
+      "severity": "major"
+    },
+    {
+      "evidence": "Built as a streaming unit, this instruction needs very little state, because output depends only on the running crc and the semantics already require all 17 reads before any write. That state is: crc register 32 flops, current input word 32 flops, in/out address counters 2x30 flops, word/byte counter about 6 flops, and FSM about 4 flops, for roughly 135 flops. Logic is a 32x16 XOR matrix of about 250-300 XOR2 gates, or about 40 gates if bit-serial. That is about 5% of the core's ~2.5k state bits. It needs no operand buffer and no multiplier, so it duplicates neither fast_mul nor the divider. Bus traffic is 17 read beats + 17 write beats = 34 beats = 68 cycles through the existing acc_busy mux. The baseline-vs-extended comparison charges everything in red_accel, so keeping the matrix-multip",
+      "finding": "The spec does not say whether this unit replaces red_accel or sits beside it. If it is added next to the existing red_accel, the extension pays the +74% area of red_accel's 1,024 buffer bits and second 32x32 multiplier, none of which a CRC uses.",
+      "fix": "Add to the spec: \"Implemented as the sole red_accel datapath. It reuses red_accel's bus-master FSM (busy/pcpi_wait asserted on the first pcpi_valid cycle, S_WAIT handshake) and drops the 2x16-word buffers and the internal multiplier. No input buffering is needed: the input is consumed as it streams in, and out[0] is written from the crc register.\" Report the area as about 135 flops plus about 300 XOR2 gates.",
+      "instruction": "crc32.step64b",
+      "reviewer": "implementability",
+      "severity": "major"
+    },
+    {
+      "evidence": "The gate's figure of 74 is 234,634 / 3,163. That divides the table-driven software's host instructions by the instruction count of the bit-serial c_model, which runs about 49 instructions per byte (3,163 / 64) against about 7 per byte for the table loop (lbu, xor, andi, slli, add, lw, srli/xor, pointer/counter/branch). Measured in bytes instead: 3,811 cycles per 64 bytes is about 59.5 cycles per byte, about 7 host instructions per byte at 8.5 cycles each, so 234,634 / 7 \u2248 33,500 bytes per call \u2248 524 blocks of 64 bytes. So 524 is consistent with the data volume and 74 comes from the mismatch between implementations. However, the \"alternating 64 KiB and 1,500 B\" split is inferred, not read from the harness. The 1,500 B case leaves a 28-byte software tail (23 blocks, 1,472 B), about 1.5% of a",
+      "finding": "The 524-invocation claim is flagged UNVERIFIED, and the spec does not explain why it conflicts with the gate's ~74 estimate.",
+      "fix": "Put the bytes-per-call derivation in the description: instructions per byte from the loop body, then bytes per call, then blocks. Cite the harness source for the buffer sizes or mark them as inferred. Note that the whole-application speedup is set by the per-block ratio and is insensitive to the invocation count beyond tail effects.",
+      "instruction": "crc32.step64b",
+      "reviewer": "implementability",
+      "severity": "major"
+    },
+    {
+      "evidence": "The workload calls crc_32(buf + (it & 1023), 1500), so 3 of every 4 frame calls have ptr & 3 != 0. buf is a static unsigned char[] with no alignment declared, so even crc_32(buf, 65536) is only word-aligned by accident of the linker. The semantics ignore bits [1:0] of rs1, so the caller cannot point rs1 into its own buffer. PicoRV32 traps on misaligned lw. The existing caller in eval/projects/libcrc/bench.c (pack32) builds each word from 4 lbu + 3 shifts + 3 or + 1 sw. That is about 28 + ~24 (iterative shifts, 4-14 cycles each) + 12 + 7 \u2248 71 cycles per word, so about 1,140 cycles for 16 words, against the 464 assumed. Per invocation that gives 569 + ~1,150 + ~20 (crc store and reload) \u2248 1,740 cycles against 3,811 cycles of software, which is about 2.2x rather than 3.69x. The instruction st",
+      "finding": "The gate assumed ~464 cycles of marshalling per call, but that only holds if the 64 data bytes can be copied with 16 word loads and 16 word stores. The profiled workload passes byte-aligned pointers, so the caller has to pack bytes, and that costs about 2.5x more.",
+      "fix": "In the semantics, prescribe an alignment-peeling caller sequence. Handle the first (-ptr) & 3 bytes, at most 3, with the existing table loop. Then copy 16 aligned words per block with lw/sw (16 \u00d7 14 \u2248 224 cycles, plus in[0]). Make marshal_words and the pricing assume that path. State explicitly that the byte-packing pack32 caller in bench.c is not the intended call sequence.",
+      "instruction": "crc32.step64b",
+      "reviewer": "callability",
+      "severity": "major"
+    },
+    {
+      "evidence": "The spec says bits [1:0] of rs1 are ignored and that in[1..16] are 'byte-identical to the RV32 memory image'. That lets the caller copy with 16 lw + 16 sw only when ptr is 4-byte aligned. For an unaligned ptr on RV32IM with no misaligned-access support, the caller must assemble each word from bytes: 64 lbu (~7 cyc) + 48 shifts (4-14 cyc on this TWO_STAGE_SHIFT core, ~6 avg) + 48 or (~4) + 16 sw (~7) \u2248 448 + 288 + 192 + 112 \u2248 1,040 cycles, plus the state store and result load \u2248 1,060. The ratio then drops from 3811/(569+464) = 3.69x to 3811/(569+1060) \u2248 2.34x, and the whole-application bound from 3.67x to 1/(0.002 + 0.998/2.34) \u2248 2.33x. The extension still pays, but the predicted 3.67x holds only for aligned buffers, and the harness's alignment is not visible in the sources.",
+      "finding": "The 464 cycles of marshalling the gate charges assume the caller's 64-byte chunk is word-aligned. crc_32 takes a byte pointer with no alignment guarantee, so an unaligned buffer makes the copy into in[1..16] more than twice as expensive.",
+      "fix": "Document the caller contract: use word copies when (ptr & 3) == 0 and otherwise process bytes in software until ptr is aligned (at most 3 bytes, ~180 cycles once per call), then issue on aligned 64-byte chunks. Then 464 is the correct marshalling cost for every invocation after the first.",
+      "instruction": "crc32.step64b",
+      "reviewer": "benefit",
+      "severity": "major"
+    },
+    {
+      "evidence": "The semantics say the caller 'copies 64 contiguous bytes of its buffer to in[1..16] unchanged', and marshal_words=18 counts 16 word copies. With an unaligned ptr, RV32IM firmware cannot use lw for this (PicoRV32 traps on misaligned loads under CATCH_MISALIGN). It needs 64 lbu plus shift/or packing, which is about 64 loads and 48 ALU ops, roughly 64x5 + 48x4 \u2248 510 cycles for the copy alone instead of ~160. That pushes total marshalling from 464 toward ~800 cycles per invocation and cuts the per-invocation gain from 3.69x to about 2.8x.",
+      "finding": "The 18-word marshal count only holds if the caller's byte pointer is word-aligned. crc_32 takes a `const unsigned char *` with no alignment guarantee, and the spec does not say what the caller does with an unaligned stream.",
+      "fix": "State the precondition in the spec: the caller processes software bytes until ptr is 4-byte aligned, then issues crc32.step64b on aligned 64-byte chunks with word copies. Declare marshal_words for that aligned path. Note that the alignment prologue costs at most 3 software bytes per call and the tail at most 63.",
+      "instruction": "crc32.step64b",
+      "reviewer": "legality",
+      "severity": "major"
+    },
+    {
+      "evidence": "Arithmetic per operand word moved is 0 MAC/word as declared, or 512 bit-steps / 34 words \u2248 15 XOR-steps per word. Writes out[1..16] = 0 cost 16 beats x 2 = 32 cycles and carry no information. Marshalling cannot be avoided: crc_32 takes a const unsigned char*, which may be unaligned or read-only, and rs1 ignores bits [1:0], so the 64 bytes must be copied into an aligned scratch block. out must also be a scratch block and never the caller's buffer, because it is zero-filled. With a fast datapath, per-block cost is about 98 + 464 \u2248 562 cycles against 3,811, so marshalling is about 80% of the cost.",
+      "finding": "Moving operands, not arithmetic, dominates the latency: with a 16-bit-per-cycle datapath, 68 of about 98 cycles are bus beats, 32 of them write 16 constant-zero words, and the caller's 464 cycles of marshalling exceed the instruction itself.",
+      "fix": "Keep the fixed ABI, but state in the semantics that rs2 must point at caller-owned scratch (it may equal rs1, since in is scratch too). Have the calling sequence reuse one static 17-word block across all invocations, so only the 16 data words and the state word are rewritten each time. Do not try an in-place trick on the user's buffer.",
+      "instruction": "crc32.step64b",
+      "reviewer": "implementability",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The profiled workload (ITERS=600) calls crc_32(buf, 65536) and crc_32(buf + (it&1023), 1500) once each per iteration, which is 1,200 calls. That works out to (65536/64 + floor(1500/64))/2 = (1024 + 23)/2 = 523.5 invocations per call, with a 28-byte tail left in software. 234,634 host instructions / 33,518 bytes = 7.0 instructions per byte, which matches the table loop. The C model runs 3,163 instructions per 64 bytes (about 49 per byte, because it is bit-serial), so 234,634 / 3,163 \u2248 74 compares two different implementations.",
+      "finding": "The declared invocations=524 is correct. The gate's 'roughly 74 invocations' is an artifact of comparing a bit-serial C model with the table-driven loop, and the spec should give the workload-derived figure so that warning goes away.",
+      "fix": "Cite the workload directly in the description: ITERS=600, sizes 65536 and 1500, 1024 and 23 full blocks, 28-byte tail. That way the invocation count comes from the harness and not from the 7 instructions/byte estimate.",
+      "instruction": "crc32.step64b",
+      "reviewer": "callability",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The semantics say out[1..16] are all written with 0. The cost model charges 2 \u00d7 (2 \u00d7 17) beats. Only out[0] is consumed, and the value could have gone in rd, which the ABI forces to 0.",
+      "finding": "Of the 17 output words, 16 are always 0, and the instruction still spends 16 bus writes (~32 cycles, about 6% of its 569 cycles) on them every invocation. The caller also has to reserve a 68-byte output block that it never reads.",
+      "fix": "If RED's ABI allows the output word count to differ from the input count, declare the output block as 1 word (out[0] only) and drop the zero writes. If the ABI requires out to mirror in, allow rs2 == rs1 (in-place, which the read-all-then-write rule already makes well defined) so the caller does not need a second 68-byte stack block.",
+      "instruction": "crc32.step64b",
+      "reviewer": "callability",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The pseudocode has 64 \u00d7 8 sequential bit-steps, and the gate charged 438 sequential logic steps. The bus delivers one 32-bit word every 2 cycles, so the unit keeps pace with streaming only if it folds at least 16 bits per cycle. No operand buffer is needed either way: the only state is the 32-bit crc, because the outputs are crc and zeros.",
+      "finding": "Nothing in the spec says how fast the datapath must be. A literal 1-bit-per-cycle implementation adds 512 cycles of compute, almost doubling the instruction's 569-cycle cost.",
+      "fix": "Add an implementation note to the spec: fold each input word into the 32-bit state as it arrives, either with a single-cycle 32-bit (or two-cycle 16-bit) CRC XOR network or with 2 bytes per cycle, so compute overlaps the 2-cycle beat. Hold no 17-word buffer; the area is one 32-bit register plus the XOR tree. Bound the latency at about 28 + 68 cycles.",
+      "instruction": "crc32.step64b",
+      "reviewer": "callability",
+      "severity": "minor"
+    },
+    {
+      "evidence": "invocations means bytes per call divided by 64. The gate's 74 comes from 234,634 / 3,163, which divides the table-driven software (~7-10 instructions per byte) by the bit-serial C model (~49 instructions per byte). It does not measure data volume. The actual RV32 loop body is lbu, xor, andi, slli, add, lw, srli, xor, addi, bne: about 10 instructions per byte, which gives \u2248 23,460 bytes per call and \u2248 367 invocations rather than 524. Because invocations scales hardware cost and software cost equally, the per-invocation ratio does not change. Overstating invocations makes the gate's software cost per invocation smaller (3,811 instead of \u2248 5,440 cycles), so the 3.69x figure is conservative, not optimistic.",
+      "finding": "invocations = 524 is consistent with the data volume, and the gate's '~74 implied' figure is an artifact of comparing different implementations. However, the spec's 7-instructions-per-byte figure undercounts the compiled loop.",
+      "fix": "Derive invocations from the harness's real trip counts (bytes per call / 64, plus the tail) rather than from instructions per byte. Also state that the alternating 64 KiB / 1500 B workload is an assumption, because the trip count is not visible in the sources.",
+      "instruction": "crc32.step64b",
+      "reviewer": "benefit",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The cost formula 28 + 2\u00d7(2\u00d717) gives 96 cycles of issue plus traffic, and the gate added ~473 for the 512 bit-steps. A combinational byte-wide reflected-CRC network (8 chained shift/XOR stages, about 32\u00d78 XOR plus a mux) does one byte per cycle. A 16-bit network does 2 bytes per cycle, which keeps pace with one word every 2 cycles. Compute then overlaps the 16 data-word reads, and the true latency is \u2248 96-130 cycles, not 569. That would raise the per-invocation ratio to \u2248 3811/(130+464) \u2248 6.4x, so the gate's 3.67x is a lower bound.",
+      "finding": "mac_ops = 0 misstates the compute cost. The gate therefore charged 438 serial logic steps, while a reasonable datapath hides the compute entirely behind the bus beats.",
+      "fix": "Declare the throughput in the semantics, e.g. '2 bytes per cycle, overlapped with the input stream'. Set mac_ops to the residual non-overlapped steps (\u2248 0-64) so the gate's price matches the hardware.",
+      "instruction": "crc32.step64b",
+      "reviewer": "benefit",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The semantics say the unit 'reads all 17 input words before writing any output word'. A naive implementation would read that as a 544-bit operand buffer: half the 1,024-bit register file and about 20% of the core's state, per the area notes. Only the 32-bit crc and the current 32-bit word are live at any time, and every output word except out[0] is a constant 0. A multiplier is not needed either.",
+      "finding": "The unit must stream and must not buffer the 17-word input block. Otherwise it repeats red_accel's area mistake for a function that needs only about 64 flops of state.",
+      "fix": "State in the semantics that the implementation holds only crc[31:0] and one input word, folds each word as it arrives, and then writes out[0] = crc and 16 zero words. Area should then be \u2248 64 flops + XOR network + FSM, a few percent of the core rather than +74%.",
+      "instruction": "crc32.step64b",
+      "reviewer": "benefit",
+      "severity": "minor"
+    },
+    {
+      "evidence": "For chunk k \u2265 1, the word at ptr-4 is the last word of the previous chunk, which has already been consumed. The caller can save it (lw), store crc there (sw), issue with rs1 = ptr-4 and rs2 = a separate 17-word scratch block, read out[0] (lw), and restore the word (sw): about 4 memory ops \u2248 28 cycles instead of \u2248 464. The ratio becomes 3811/(569+28) \u2248 6.4x. Caveats: crc_32 takes a const buffer, so this needs a writable-buffer guarantee from the harness. The first chunk still needs the copy. out must never alias the data, because out[1..16] are written with zeros.",
+      "finding": "For every chunk after the first, the copy of 16 data words can be avoided within the fixed ABI by pointing rs1 at ptr-4. That removes most of the 464-cycle marshalling, which is 45% of the per-invocation cost.",
+      "fix": "Offer this as an optional fast path in the caller's description, guarded by a buffer-writable and alignment check, with the copy path as the fallback.",
+      "instruction": "crc32.step64b",
+      "reviewer": "benefit",
+      "severity": "minor"
+    },
+    {
+      "evidence": "Only out[0] carries information. 16 writes x 2 cycles x 524 invocations \u2248 16.8k cycles per call, about 3% of the instruction's own cost (569 x 524 \u2248 298k). The caller also cannot point rs2 at live data, because the unit overwrites it with zeros.",
+      "finding": "Writing 0 to out[1..16] spends 16 bus beats (~32 cycles) per invocation on values nobody reads, and those writes clobber 64 bytes of caller memory.",
+      "fix": "If the fixed ABI requires words=17 on both sides, keep it. Otherwise declare an output width of 1 word. Either way, document that rs2 must point at a 17-word scratch area the caller owns.",
+      "instruction": "crc32.step64b",
+      "reviewer": "legality",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The C model is bit-serial: 3,163 instructions / 64 bytes \u2248 49 host instructions per byte. The table loop runs ~7 per byte. 234,634 / 3,163 \u2248 74 therefore undercounts by about 49/7 \u2248 7x, and 74 x 7 \u2248 518 \u2248 524. The gate's software cost of 3,811 cycles per invocation, about 60 cycles/byte x 64, independently confirms 64 bytes per invocation and 33.5 KB per call.",
+      "finding": "Gate 3's '~74 invocations implied' warning is an artifact of its own comparison, not evidence against the declared 524. Recording why in the spec would stop the doubt from coming back each round.",
+      "fix": "Add to the description that invocations = bytes per call / 64 = 33,518 / 64 \u2248 524. Say that the C-model ratio is not comparable because the model is bit-serial and the replaced code is table-driven.",
+      "instruction": "crc32.step64b",
+      "reviewer": "legality",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The pseudocode reads MEM32[base_in + 4 + 4*i] and writes MEM32[base_out + 4*i] without saying whether the addition is modulo 2^32. With rs1 = 0xFFFFFFC0, the reads reach base_in + 64 and cross the top of the address space.",
+      "finding": "The spec does not say what happens when the 68-byte input or output block wraps past 0xFFFFFFFF. That is the one addressing case left undefined.",
+      "fix": "Add one sentence: 'all address arithmetic is modulo 2^32', which matches the 32-bit mem_addr the unit drives.",
+      "instruction": "crc32.step64b",
+      "reviewer": "legality",
+      "severity": "minor"
+    },
+    {
+      "evidence": "The output depends only on the running crc, so each input word can be folded in as soon as it arrives: 4 byte-steps of 8 unrolled XOR/shift stages, or one 32-bit fold. That needs only 32 bits of state plus one word register, versus the 512 to 1024 bits red_accel buffers. Folding as words arrive still satisfies 'reads all 17 input words before writing any output word'.",
+      "finding": "The spec does not tell the RTL implementer that the unit needs no 16-word operand buffer, and the area note in the context makes such a buffer the dominant cost.",
+      "fix": "Add an implementation note saying the unit streams and folds each word on arrival with only a 32-bit state register, and needs no multiplier and no operand buffer.",
+      "instruction": "crc32.step64b",
+      "reviewer": "legality",
+      "severity": "minor"
+    },
+    {
+      "evidence": "\"encodings\": [] while instructions[0].encoding = \"0000000 rs2 rs1 000 rd 0101011\". The encoding itself is legal: custom-1 is free on this core, the slot is used once, and it does not collide with red_accel's custom-0 slot or the 0110011/funct7=0000001 M decode.",
+      "finding": "The top-level `encodings` array is empty, although the instruction declares opcode custom-1 (0101011), funct3=000 and funct7=0000000.",
+      "fix": "Populate `encodings` with the custom-1/000/0000000 R-type entry so the tooling's summary matches the instruction record.",
+      "instruction": "",
+      "reviewer": "legality",
+      "severity": "minor"
+    }
+  ],
+  "reviewers": [
+    "implementability",
+    "callability",
+    "benefit",
+    "legality"
+  ]
+}

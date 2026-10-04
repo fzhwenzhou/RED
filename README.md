@@ -14,9 +14,12 @@ bundled (`micro-ecc`, `libcrc`, `matrixmul`) and
 The loop's agents, gates and feedback edges are documented with flow charts in
 **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
-RED runs on [CHIA](https://github.com/ucb-bar/chia) (UC Berkeley's agentic
-hardware design framework). Its **LLM backend is Google Gemini on Vertex AI**,
-billed to GCP credit.
+RED runs **on one machine**. Nothing is provisioned, nothing bills while it is
+idle, and the only long-lived process is its knowledge graph. Each agentic
+stage is a headless [Claude Code](https://claude.com/claude-code) turn
+(`claude -p`) over MCP tool servers RED runs in-process on loopback; each gate
+is a program that measures something. There is no cloud account to set up —
+if `claude` is on your PATH and authenticated, RED runs.
 
 ## Scope
 
@@ -80,7 +83,16 @@ Read this before quoting any result.
    agentic repair edges.)
 5. **`perf` cycle counts are corroboration only** and are usually 0 (no PMU
    access inside WSL/VMs). Ranking comes from callgrind instruction counts.
-6. **Gate 4 audits the reference model, not the silicon.** Its evidence is what
+6. **Gate 4's constant-time evidence needs a host that can run memcheck.**
+   The ctgrind check marks the operand block undefined and asks memcheck which
+   branches depend on it. memcheck refuses to start without glibc debuginfo
+   (`sudo apt-get install -y libc6-dbg`), and on a host without it the gate
+   reports `NOT CHECKED — timing.secret_branch` rather than passing. That is
+   the designed behaviour — a skipped check is not a passed check — but it
+   means the taint signal is absent from those runs, and the instruction-count
+   check is then the only constant-time evidence. `bash scripts/red_env.sh
+   check` says up front whether it will run.
+7. **Gate 4 audits the reference model, not the silicon.** Its evidence is what
    the C model does when executed: an out-of-bounds access, an unwritten output
    word, an instruction count that varies with the operands. That is the right
    level for a *spec* — a model whose execution time depends on its data
@@ -92,19 +104,19 @@ Read this before quoting any result.
    and is still a branch in the pseudo-code the hardware would be built from,
    which is why the taint scan runs alongside as an advisory signal. Gate 4
    passing is a floor, not a certificate.
-7. **Gate 4 audits the instruction against its own declared operand block**, not
+8. **Gate 4 audits the instruction against its own declared operand block**, not
    against the caller. A model that writes all 16 words it declares is clean
    here even if the application's buffer is 8 words long — that overflow lives
    at the call site, and it is the `callability` reviewer's question (it was
    caught there, as a blocking finding, on a real run). The two are
    complementary, and neither subsumes the other.
-8. **The security sub-agent cannot fail a design on its own word.** By
+9. **The security sub-agent cannot fail a design on its own word.** By
    construction: what it merely asserts is recorded as `major` and reaches the
    designer as advice. It earns a blocking finding only by handing over an
    operand value that actually breaks the model when executed. That keeps
    hallucinated vulnerabilities out of the gate — and it means a real
    vulnerability it can describe but not trigger will not stop the spec either.
-9. **Gate 3's accuracy is bounded by two declarations it cannot measure.**
+10. **Gate 3's accuracy is bounded by two declarations it cannot measure.**
    Where they are sound the model is good: on the one design that has been both
    predicted and built, it predicts **1.81× against a measured 1.67×** (8%
    error). Where they are not, it is wrong by an order of magnitude. `mac_ops`
@@ -117,12 +129,12 @@ Read this before quoting any result.
    147 for a true 4 — so the gate reports the inconsistency, refuses a
    declaration more than 10× out, and does not substitute a number it cannot
    stand behind.
-10. **A workload AW wrote is a workload AW chose.** Gate 0 establishes that a
+11. **A workload AW wrote is a workload AW chose.** Gate 0 establishes that a
    synthesized harness does enough work, in the project's own code,
    reproducibly. It cannot establish that the work is *representative* of how
    anyone actually uses the library. Results on a synthesized workload
    characterise RED on that kernel, not on the repository's own tests.
-11. **The instruction ABI is fixed by RED**, not chosen per instruction: an
+12. **The instruction ABI is fixed by RED**, not chosen per instruction: an
    R-type in a custom opcode slot with `rs1` = input block address, `rs2` =
    output block address, `rd` = 0. That is what lets any designed instruction be
    harnessed mechanically, but it means RED currently designs memory-operand
@@ -132,10 +144,12 @@ Read this before quoting any result.
 
 ```
 red/
-  constants.py    config: example inputs, gates, Gemini/GCP backend, output paths
+  constants.py    config: example inputs, gate thresholds, agent backend, paths
   state_def.py    typed artifacts: HotLoopReport, ISASpec, GateResult
-  db_node.py      durable artifact store (database node)
+  db_node.py      durable artifact store (outlives the run directory)
   tools.py        sealed MCP tools the agents use (source/profile/report/spec/…)
+  localtool.py    runs one of those tool servers in-process on a loopback port
+  backend.py      one agent turn = one `claude -p` subprocess over those tools
   nodes.py        mechanical edges: A1 profiling, Gate 1, link 1, Gate 2, link 2
   iss.py          Gate 2: Spike extension codegen, rv32 harness, the diff
   iss_selftest.py proves Gate 2 both passes agreeing models and fails others
@@ -152,10 +166,9 @@ red/
 target_project/   the projects to design for (micro-ecc, libcrc, matrixmul)
                   — INPUTS, not hard-coded
 target_cpu/       one example core (PicoRV32)      — an INPUT, not hard-coded
-cluster.yaml      GCP cluster definition (llm, database, profile + local head)
-scripts/          red_env.sh (cluster lifecycle), run_projects.sh (every
-                  project in turn), setup_spike.sh (Gate 2 toolchain),
-                  setup_neo4j.sh (knowledge graph), gcp_util.py
+scripts/          red_env.sh (set this machine up, check it), run_projects.sh
+                  (every project in turn), setup_spike.sh (Gate 2 toolchain),
+                  setup_neo4j.sh (knowledge graph)
 ARCHITECTURE.md   the agent loop: agents, gates, feedback edges, flow charts
 SPIKE_SETUP.md    installing Spike for Gate 2 (what, where, why, verifying)
 NEO4J_SETUP.md    the knowledge graph: install, model, what the agents ask it
@@ -167,8 +180,9 @@ output/           all run artifacts (git-ignored): output/work + output/db
                   output/ between batches does not erase RED's memory
 ```
 
-RED keeps a **persistent knowledge graph** of every run it has done (Neo4j, on
-the head). The designer consults it before designing: what earlier runs built
+RED keeps a **persistent knowledge graph** of every run it has done (Neo4j, a
+userland install on this machine). The designer consults it before designing:
+what earlier runs built
 for the same hot loop, what the performance gate predicted for each, and which
 reviewer objections sank them. See `NEO4J_SETUP.md`.
 
@@ -195,15 +209,21 @@ arithmetic 32-bit, matching the rv32 target the extension is designed for.
 See **[run_instructions.md](run_instructions.md)** for the full guide.
 
 ```bash
-python tests/test_env.py          # verify the environment (91 checks)
-python -m red.loop --local        # mechanical smoke test: A1 + Gate 1, no LLM
-python -m red.loop --local-llm    # full loop on this machine, real Gemini
-bash scripts/red_env.sh up        # bring the GCP cluster up
-python -m red.loop                # one project on the CHIA cluster
-bash scripts/run_projects.sh      # every project under target_project/, in turn
-bash scripts/run_projects.sh libcrc   # just this one
-bash scripts/red_env.sh down      # tear down, verify nothing is billing
+bash scripts/red_env.sh setup      # one-time: venv, backend check, graph, self-test
+bash scripts/red_env.sh check      # is this machine ready? (re-runnable, cheap)
+python tests/test_env.py           # verify the environment (92 checks)
+python -m red.loop --mechanical    # smoke test: profile + Gate 1, no agent spend
+python -m red.loop                 # the full loop on one project
+bash scripts/run_projects.sh       # every project under target_project/, in turn
+bash scripts/run_projects.sh libcrc    # just this one
+bash scripts/red_env.sh status     # graph, toolchain, backend, runs on disk
 ```
+
+There is no bring-up and no teardown. `--mechanical` is the free path: it runs
+the profile, Gate 1 and the typed artifacts with no agent turns at all, which
+is what to run after changing anything mechanical. `--model` pins the model for
+the agent turns; without it RED uses whatever your Claude Code install is
+configured for.
 
 `run_projects.sh` holds the per-project inputs that cannot be guessed from the
 sources — the harness (leave it empty and AW writes one), the cflags that define
@@ -268,18 +288,22 @@ the evidence is in `eval/RESULTS.md`.
 
 ## Loop performance
 
-On the cluster (`gemini-3.1-pro-preview`), the three bundled projects converge
-in **16–41 minutes** each. The mechanical front end is 1–3 minutes of that;
-agent turns dominate, and which edge a run exercises decides the rest. Where the
-time went:
+All three bundled projects converge, on one machine, in **42 minutes for the
+whole batch**: libcrc 9.4 min (1 synthesis round), matrixmul 13.3 min (2),
+micro-ecc 19.3 min (2). The same three took 16–41 minutes *each* on the cluster
+this loop used to run on — the agent turns are the same work, but a turn is now
+a subprocess rather than a scheduled task on a VM reached through a tunnel.
+
+The mechanical front end is 1–3 minutes of that; agent turns dominate, and
+which edge a run exercises decides the rest. Where the time went:
 
 | change | effect |
 |---|---|
-| ten tool servers collapsed to two (`DesignerTool`, `IssTool`) | each ChiaTool is its own Ray actor that rescans the port range as it binds; a server per artifact cost minutes before the first agent turn |
+| ten tool servers collapsed to four, split by *what an agent may see* rather than by artifact | every turn re-reads the MCP config and every server is a thread and a port; a server per artifact cost startup time for a boundary that did no work |
 | the two Gate-1 profile runs dispatch before either is resolved | the second profile is free in wall-clock terms |
-| four reviewers dispatch concurrently, with no tool servers | one model round trip instead of four — though the llm node advertised `llm: 1` for most of this project's life, so every turn *including the reviewers* serialized behind it. It advertises 4 now; the node makes HTTPS calls and waits, it does not compute |
+| four reviewers dispatch concurrently, with no tool servers | one turn's wall-clock instead of four. An agent turn is a subprocess that mostly waits, so `RED_AGENT_PARALLEL` (default 4) bounds how many run at once rather than how much CPU they get |
 | a throttled turn is retried with backoff, not counted as a failure | two consecutive `RateLimitError`s used to trip the "backend is down" guard and abandon synthesis; three runs in one batch died that way |
-| `measure_ops` caches on a hash of the C model | re-pricing every review round compiles and runs each model under callgrind; on a 12-instruction spec that was 48 passes where 12 suffice, and it OOM-killed a tool server on the 5.7 GB head |
+| `measure_ops` caches on a hash of the C model | re-pricing every review round compiles and runs each model under callgrind; on a 12-instruction spec that was 48 passes where 12 suffice, and it ran the machine out of memory and lost a tool server |
 | Gate 2's per-instruction differential tests run on a thread pool | subprocess-bound work overlaps; `RED_GATE2_PARALLEL` (default 4) |
 | self-critique rounds cut from 8 to 3 | the dedicated reviewers do that job better than the designer re-reading itself |
 

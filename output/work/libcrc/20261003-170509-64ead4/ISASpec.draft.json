@@ -1,0 +1,36 @@
+{
+  "critic_rounds": 1,
+  "description": "Single memory-operand instruction that advances a reflected CRC-32 (IEEE 802.3, poly 0xEDB88320) state over a 64-byte block, replacing the table-driven byte loop of crc_32 (99.8% of cycles). The block is 17 words (state + 64 data bytes), so the 28-cycle issue and 2-cycle/word streaming overhead is amortised over 64 bytes, against about 7 host instructions (~60 target cycles) per byte in software. Tails shorter than 64 bytes stay in software. invocations: the profile shows 281,560,800 host instructions over 1200 calls, which is 234,634 per call. At about 7 instructions per byte a call processes about 33,518 bytes, i.e. (65,536 + 1,500)/2 for the alternating 64 KiB buffer and 1500 B frame. That is 1024 and 23 invocations, averaging 523.5, so 524. marshal_words: 1 state word stored plus 16 data words copied into the input block, and 1 result word read back, for 18.",
+  "encodings": [],
+  "gate2_vectors": 0,
+  "instructions": [
+    {
+      "c_model": "#include <stdint.h>\n#include <string.h>\n/* mnemonic \"crc32.step64b\" -> crc32_step64b_model.\n   in[0] = running CRC-32 state; in[1..16] = 64 data bytes, little-endian:\n   byte k = (in[1 + k/4] >> (8*(k%4))) & 0xFF. out[0] = new state, out[1..16] = 0. */\nvoid crc32_step64b_model(const uint32_t in[17], uint32_t out[17]) {\n    uint32_t crc = in[0];\n    int i, j, b;\n    for (i = 0; i < 16; i++) {\n        uint32_t w = in[1 + i];\n        for (j = 0; j < 4; j++) {\n            crc ^= (w >> (8 * j)) & 0xFFu;\n            for (b = 0; b < 8; b++) {\n                uint32_t m = (uint32_t)0 - (crc & 1u);\n                crc = (crc >> 1) ^ (0xEDB88320u & m);\n            }\n        }\n    }\n    out[0] = crc;\n    for (i = 1; i < 17; i++) out[i] = 0;\n}\n",
+      "encoding": "0000000 rs2 rs1 000 rd 0101011",
+      "funct3": "000",
+      "funct7": "0000000",
+      "invocations": 524,
+      "mac_ops": 0,
+      "marshal_words": 18,
+      "mnemonic": "crc32.step64b",
+      "name": "CRC-32 step over 64 bytes",
+      "opcode": "custom-1",
+      "operands": [
+        "rd",
+        "rs1",
+        "rs2"
+      ],
+      "pseudocode": "base_in = rs1 & ~3\nbase_out = rs2 & ~3\ncrc_0 = MEM32[base_in]\nfor i in 0..15: w[i] = MEM32[base_in + 4 + 4*i]\nfor k in 0..63:\n  x_0 = crc_k XOR ((w[k/4] >> (8*(k%4))) & 0xFF)\n  for b in 0..7:\n    m_b = 0 - (x_b & 1)\n    x_{b+1} = (x_b >> 1) XOR (0xEDB88320 & m_b)\n  crc_{k+1} = x_8\nMEM32[base_out] = crc_64\nfor i in 1..16: MEM32[base_out + 4*i] = 0\nrd = 0",
+      "replaces": "crc_32::byte_loop",
+      "semantics": "Memory-operand instruction using the RED block ABI `crc32.step64b rd, rs1, rs2`. rs1 holds the byte address of a 17-word input block in[0..16]; rs2 holds the byte address of a 17-word output block out[0..16]; rd receives 0 (if rd is x0 nothing is written). Both addresses are word aligned: bits [1:0] of rs1 and rs2 are ignored (treated as 0). Input packing: in[0] is the running CRC-32 state exactly as held by the crc_32 loop variable `crc` (the caller applies the 0xFFFFFFFF start value and the final 0xFFFFFFFF XOR itself; the instruction applies neither). in[1..16] hold 64 data bytes in stream order, packed little-endian, so data byte k (k = 0..63) is (in[1 + floor(k/4)] >> (8*(k mod 4))) & 0xFF. This is byte-identical to the RV32 memory image of the data, so the caller copies 64 contiguous bytes of its buffer to in[1..16] unchanged. Operation: for k = 0..63 in order, crc = crc XOR byte_k, then 8 times crc = (crc >> 1) XOR (0xEDB88320 if bit 0 of crc was 1, else 0). This equals 64 iterations of crc = (crc >> 8) ^ crc_tab32[(crc ^ byte) & 0xFF]. Output: out[0] = the final crc; out[1..16] are all written with 0. The unit reads all 17 input words before writing any output word, so overlapping or identical in/out blocks are well defined. The latency is fixed (17 word reads, 17 word writes, and constant compute) and does not depend on operand values. Every 32-bit input is valid and the instruction raises no exceptions of its own.",
+      "spike_model": "",
+      "words": 17
+    }
+  ],
+  "link1_vectors": 0,
+  "name": "CRC32_Accel",
+  "passes_gate2": false,
+  "passes_link1": false,
+  "tests": [],
+  "version": "1.0"
+}

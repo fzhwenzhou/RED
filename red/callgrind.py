@@ -1,8 +1,8 @@
 """Reading callgrind's own output format.
 
 Kept free of every other RED import so both the profiling node (red.nodes) and
-the cost model (red.cost) can use one parser, and so it is testable without a
-cluster.
+the cost model (red.cost) can use one parser, and so it is testable on its
+own.
 
 RED parses the raw callgrind file rather than ``callgrind_annotate`` text.
 Annotate prints a row only above a cost threshold and reformats between
@@ -10,7 +10,7 @@ releases; the raw file records every event exactly at every version. That is
 not a stylistic preference: on valgrind 3.19 the annotate output showed no
 callee row at all for micro-ecc's two hot kernels, because each is reached from
 many individually-cold call sites. Their call counts read as zero, a call count
-of zero disables all benefit crediting in Gate 3, and three full cluster runs
+of zero disables all benefit crediting in Gate 3, and three full runs
 reported a worthless extension instead of a broken profile.
 """
 

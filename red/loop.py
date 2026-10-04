@@ -1,8 +1,9 @@
 """RED loop driver — orchestrate A1 kernel mining + A2 ISA synthesis.
 
 A1 and A2 are the research contribution and RED's whole scope; the **ISASpec is
-the final artifact**. Each stage is *agentic* (a Gemini agent over the sealed
-MCP tools) and bounded by a *programmatic* edge from :mod:`red.nodes`:
+the final artifact**. Each stage is *agentic* (a Claude Code turn over the
+sealed MCP tools -- see :mod:`red.backend`) and bounded by a *programmatic*
+edge from :mod:`red.nodes`:
 
     A1  profile the project (mechanical) x2  ->  Gate 1 (±5% re-profile)
         mining agent ranks hot loops         ->  HotLoopReport
@@ -22,13 +23,16 @@ replaces. Their findings are the loop's feedback edge back to the designer.
 Every artifact is persisted as typed JSON (HotLoopReport / ISASpec) and
 mirrored to the durable DB sweep as it is produced.
 
-Three run modes:
-    default      dispatch nodes via .chia_remote() onto the CHIA cluster
-    --local      call nodes in-process (no cluster resources) and skip the LLM
-                 (llm=None) so the mechanical A1 + gates smoke-test on one
-                 machine without credentials.
-    --local-llm  in-process nodes, but with the real Gemini backend and the
-                 sealed tools — the full A1+A2 loop on one machine.
+Everything runs on one machine. The mechanical edges are ordinary function
+calls; each agent turn is a ``claude -p`` subprocess given only the sealed MCP
+tools that stage is entitled to (:mod:`red.backend`), and the tool servers are
+uvicorn apps on loopback ports in threads of this process
+(:mod:`red.localtool`).
+
+Two run modes:
+    default        the whole loop
+    --mechanical   the mechanical edges only — profile, Gate 1, the typed
+                   artifacts — with no agents and no model spend
 """
 
 from __future__ import annotations
@@ -49,13 +53,7 @@ sys.path.insert(0, _REPO_ROOT)
 
 import time
 
-import ray
-from ray.exceptions import GetTimeoutError
-
-from chia.base.ChiaFunction import get
-from chia.base.llm_call import QueryResult
-from chia.models.vertex import VertexGeminiLLM
-from chia.trace.profiler import start_collector, stop_collector
+import concurrent.futures as cf
 
 from red import (cost, db_node, graph, nodes, review, security, state_def,
                  workload as workload_mod)
@@ -68,49 +66,30 @@ from red.constants import (
     EXAMPLE_HARNESS,
     EXAMPLE_PROJECT,
     EXAMPLE_WORKLOAD,
-    GCP_LOCATION,
-    GCP_PROJECT,
     GATE2_VECTORS,
     LINK1_VECTORS,
-    LLM_BACKEND,
-    LLM_MAX_TOKENS,
-    LLM_MODEL,
+    AGENT_MAX_PARALLEL,
+    AGENT_MODEL,
     LLM_PROMPTS_DIR,
     LLM_RATE_LIMIT_BACKOFF,
     LLM_RATE_LIMIT_RETRIES,
-    LLM_RESOURCE,
-    LLM_TIMEOUT_SECONDS,
     RED_LOG_ROOT,
     REPAIR_MAX_ROUNDS,
     PERF_MAX_ROUNDS,
-    RES_DATABASE,
-    RES_HEAD_LOCAL,
-    RES_LLM,
-    RES_PROFILE,
-    RES_SPIKE,
     REVIEW_MAX_ROUNDS,
     SECURITY_MAX_PROBES,
     SECURITY_MAX_ROUNDS,
     SPEEDUP_TARGET,
-    STAGE_MAX_SECONDS,
     WORKLOAD_MAX_ROUNDS,
     WORKLOAD_MIN_IR,
     WORKLOAD_MIN_PROJECT_SHARE,
     WORKLOAD_DETERMINISM,
-    STAGE_POLL_SECONDS,
-    REPO_ROOT,
     find_sources,
 )
-from red.tools import (DesignerTool, IssTool, RelayTool, SecurityTool,
-                       WorkloadTool)
+from red.backend import ClaudeCodeLLM, QueryResult
+from red.localtool import quiet_servers
+from red.tools import DesignerTool, IssTool, SecurityTool, WorkloadTool
 
-HEAD_LOCAL = {"resources": {"head_local": 0.1}}   # sealed-tool placement
-
-
-# Resources a single-machine run advertises so every ChiaFunction (and the LLM
-# backend) schedules locally — the cluster advertises the same tags per node.
-LOCAL_RESOURCES = {"llm": 4, "head_local": 8, "database": 2, "profile": 4,
-                   "spike": 2}
 
 
 @dataclass
@@ -131,6 +110,7 @@ class REDResult:
     review: state_def.ReviewReport | None = None
     security: state_def.SecurityReport | None = None
     workload_spec: state_def.WorkloadSpec | None = None
+    model: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +127,12 @@ def _load_prompt(name: str, **subs: str) -> str:
 def _tool_map(tools) -> dict[str, str]:
     """{PLACEHOLDER: full tool-call name} for prompt substitution.
 
-    The Vertex backend registers each MCP method as ``<tool>_<method>`` (the
-    ``name=`` passed to ``mcp.add_tool`` in red/tools.py) and exposes it to the
-    model as ``<tool>__<tool>_<method>`` (see vertex.py ``_run_generate_async``).
+    Each MCP method is registered as ``<tool>_<method>`` (the ``name=`` passed
+    to ``mcp.add_tool`` in red/tools.py), and Claude Code namespaces it by the
+    server it came from, so the agent calls it as
+    ``mcp__<tool>__<tool>_<method>``. The charters are written with
+    placeholders and filled in here, so a renamed tool renames itself in every
+    prompt.
 
     The method list comes from each tool's own ``METHODS`` — the same tuple it
     registers with MCP — and never from a copy kept here. A second list drifts:
@@ -190,154 +173,95 @@ def _review_rank(report, link1_result, perf=None, bar=None) -> tuple:
             len(report.findings))
 
 
-def _await(ref, what: str, resource: str | None = None):
-    """``get(ref)``, but bounded — and able to tell a slow stage from a dead one.
+# What the backend says when it is asking us to slow down rather than telling
+# us the request was wrong. Matched loosely and across several phrasings on
+# purpose: the cost of a false positive is one wasted backoff, and the cost of
+# a false negative is abandoning a design that was never refused.
+_THROTTLED = re.compile(r"rate.?limit|\b429\b|quota exceeded|usage limit|"
+                        r"overloaded|too many requests|try again later", re.I)
 
-    A plain ``get()`` on a task whose resource has left the cluster waits
-    forever. That is not theoretical: the three GCP workers' reverse SSH tunnels
-    dropped mid-run, the ``llm`` resource disappeared from the scheduler, and the
-    driver sat on one unschedulable turn for nine hours while the autoscaler
-    logged "No available node types can fulfill resource request" twice a
-    minute and the instances kept billing.
-
-    A timeout alone would be the wrong fix, because some stages legitimately run
-    for half an hour (callgrind over the whole ECDH exchange). So poll instead:
-    every ``STAGE_POLL_SECONDS`` ask whether the resource this task needs still
-    exists in the cluster. If it does, the work is merely slow and we keep
-    waiting; if it has gone, fail immediately with something the operator can
-    act on.
-    """
-    if ref is None:
-        return None
-    started = time.monotonic()
-    while True:
-        try:
-            return get(ref, timeout=max(STAGE_POLL_SECONDS, 1.0))
-        except GetTimeoutError:
-            # Real elapsed time, not the sum of nominal polls: a poll that
-            # returns early or overruns must still count toward the cap.
-            waited = time.monotonic() - started
-            if resource:
-                try:
-                    avail = ray.cluster_resources().get(resource, 0)
-                except Exception:                             # noqa: BLE001
-                    avail = 0
-                if not avail:
-                    raise RuntimeError(
-                        f"{what}: the '{resource}' resource is no longer in the "
-                        f"cluster after {waited / 60:.0f} min, so this task can "
-                        f"never be scheduled. A worker has detached (the reverse "
-                        f"SSH tunnels are the usual cause). Re-establish it with "
-                        f"`bash scripts/red_env.sh up` and re-run."
-                    ) from None
-            if waited >= STAGE_MAX_SECONDS:
-                raise RuntimeError(
-                    f"{what}: still unfinished after {waited / 60:.0f} min "
-                    f"(cap {STAGE_MAX_SECONDS / 60:.0f} min) — giving up rather "
-                    f"than hanging."
-                ) from None
-            print(f"[red] still waiting on {what} ({waited / 60:.0f} min)")
-
-
-# What the backend says when it is asking us to slow down rather than telling us
-# the request was wrong.
-_THROTTLED = re.compile(r"RateLimit|RESOURCE_EXHAUSTED|\b429\b|Quota exceeded",
-                        re.I)
+# Agent turns are subprocesses waiting on the network, so they overlap well and
+# cost this process almost nothing while they do. One pool for the whole run.
+_POOL = cf.ThreadPoolExecutor(max_workers=AGENT_MAX_PARALLEL,
+                              thread_name_prefix="red-agent")
 
 
 def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
                   log_path: str | None = None):
-    """Dispatch one agent turn; None-safe (used by --local smoke runs).
+    """Run one agent turn, synchronously. None-safe (used by --mechanical runs).
 
-    A failed turn (backend unreachable, tool servers down, repeated API
-    errors) comes back as QueryResult(success=False) rather than raising —
-    surface that loudly instead of letting the loop burn every critic round
-    on a dead backend and report a bare "no ISASpec produced".
+    A failed turn comes back as ``QueryResult(success=False)`` rather than an
+    exception, because every stage above has a bounded repair edge and those
+    only work if a failure is a value they can act on.
 
-    The backend also writes its own transcript, but it writes it on whichever
-    node ran the prompt — on a cluster that is the llm node, where the head
-    never sees it. ``QueryResult.stream_result`` carries the same transcript
-    back with the result, so append it here and the audit trail lands with the
-    rest of the run's artifacts."""
+    A throttled turn is not a failed one. Treating the two alike cost three
+    runs in one batch: two consecutive rate limits tripped the "backend is
+    down" guard, the run abandoned synthesis, and the report said a design
+    could not be produced when what actually happened is that we were asked to
+    wait.
+    """
     if llm is None:
         return None
-    # Hand the backend relay-aware stand-ins: the head's tool ports are reachable
-    # from a tunnelled worker only through CHIA_TOOL_RELAY_HOST (see RelayTool).
-    #
-    # The backend re-raises some failures instead of reporting them (a reply that
-    # hits max_output_tokens, a content block, an auth error), and one of those
-    # escaping would abandon a run that is twenty minutes in with every artifact
-    # so far unsummarised. Turn them into a failed turn, which every caller
-    # already knows how to handle: repair rounds, budget caps, escalation.
-    # A rate limit is not a failed turn, it is a turn that has not happened yet.
-    # Treating the two alike cost three runs in one batch: two consecutive
-    # RateLimitErrors trip the "backend failing on every turn" guard, the run
-    # abandons synthesis, and the report says a design could not be produced
-    # when what actually happened is that Vertex asked us to wait. Back off and
-    # try again; every other failure still comes straight back.
     res = None
     for attempt in range(LLM_RATE_LIMIT_RETRIES + 1):
         try:
-            res = _await(llm.prompt.options(resources={"llm": LLM_RESOURCE})
-                         .chia_remote(llm, message, [RelayTool(t) for t in tools]),
-                         f"{tag} LLM turn", RES_LLM)
-            break
+            res = llm.prompt(message, tools)
         except Exception as exc:                              # noqa: BLE001
-            name = type(exc).__name__
-            text = f"{name}: {exc}"
-            throttled = bool(_THROTTLED.search(text))
-            if throttled and attempt < LLM_RATE_LIMIT_RETRIES:
-                wait = LLM_RATE_LIMIT_BACKOFF * (2 ** attempt)
-                print(f"[red] {tag} LLM turn throttled by the backend "
-                      f"(attempt {attempt + 1}/{LLM_RATE_LIMIT_RETRIES + 1}) — "
-                      f"waiting {wait:.0f}s")
-                time.sleep(wait)
-                continue
-            print(f"[red] {tag} LLM turn RAISED {name}: {str(exc)[:200]}")
-            res = QueryResult(result="", returncode=-1, stderr=text,
-                              stream_result="", success=False)
+            res = QueryResult(returncode=-1, success=False,
+                              stderr=f"{type(exc).__name__}: {exc}")
+        # A usage limit can arrive either as the CLI's own error or as the
+        # body of an errored result, so look at both.
+        throttled = bool(res) and bool(_THROTTLED.search(
+            (res.stderr or "") + ("" if res.success else " " + (res.result or ""))))
+        if not throttled or attempt == LLM_RATE_LIMIT_RETRIES:
             break
-    if res is not None and not getattr(res, "success", True):
-        print(f"[red] WARNING: {tag} LLM turn FAILED "
-              f"(returncode={getattr(res, 'returncode', '?')}) — the backend is "
-              "unreachable or erroring; see the ray logs for VertexGeminiLLM.prompt")
-    if log_path and res is not None and getattr(res, "stream_result", ""):
-        with open(log_path, "a") as f:
-            f.write(f"\n{'=' * 78}\n### {tag}\n{'=' * 78}\n{res.stream_result}")
+        wait = LLM_RATE_LIMIT_BACKOFF * (2 ** attempt)
+        print(f"[red] {tag} turn throttled (attempt {attempt + 1}/"
+              f"{LLM_RATE_LIMIT_RETRIES + 1}) — waiting {wait:.0f}s")
+        time.sleep(wait)
+    _record(res, tag, log_path)
     return res
 
 
 def _dispatch_async(llm, message: str, tag: str = "agent", tools=()):
-    """Dispatch an agent turn without waiting for it.
+    """Start an agent turn without waiting for it.
 
-    Used wherever turns are independent of each other: the four reviewers (which
-    are toolless — their context is the prompt and their answer is JSON), and
-    A1 mining alongside A0 core analysis, which read different things and can
-    overlap. The caller creates every ref first and resolves them afterwards.
-    Returns an ObjectRef, or None when there is no backend."""
+    Used wherever turns are independent: the four reviewers (toolless — their
+    context is the prompt and their answer is JSON), and A1 mining alongside A0
+    core analysis, which read different things. The caller starts every turn
+    first and collects them afterwards, so they genuinely overlap.
+
+    Returns a Future, or None when there is no backend.
+    """
     if llm is None:
         return None
-    return (llm.prompt.options(resources={"llm": LLM_RESOURCE})
-            .chia_remote(llm, message, [RelayTool(t) for t in tools]))
+    return _POOL.submit(_dispatch_llm, llm, message, tools, tag, None)
 
 
-def _resolve(ref, tag: str, log_path: str | None = None):
-    """Resolve a ref from :func:`_dispatch_async`, with the same failure
-    handling as a blocking turn."""
-    if ref is None:
+def _resolve(fut, tag: str, log_path: str | None = None):
+    """Collect a turn started by :func:`_dispatch_async`."""
+    if fut is None:
         return None
     try:
-        res = _await(ref, f"{tag} LLM turn", RES_LLM)
+        res = fut.result()
     except Exception as exc:                                  # noqa: BLE001
-        print(f"[red] {tag} LLM turn RAISED {type(exc).__name__}: {str(exc)[:200]}")
-        return QueryResult(result="", returncode=-1, stderr=str(exc),
-                           stream_result="", success=False)
-    if res is not None and not getattr(res, "success", True):
-        print(f"[red] WARNING: {tag} LLM turn FAILED")
-    if log_path and res is not None and getattr(res, "stream_result", ""):
+        print(f"[red] {tag} turn RAISED {type(exc).__name__}: {str(exc)[:200]}")
+        return QueryResult(returncode=-1, stderr=str(exc), success=False)
+    _record(res, tag, log_path)
+    return res
+
+
+def _record(res, tag: str, log_path: str | None) -> None:
+    """Report a failed turn, and keep every turn's transcript with the run."""
+    if res is None:
+        return
+    if not getattr(res, "success", True):
+        print(f"[red] WARNING: {tag} turn FAILED "
+              f"(rc={getattr(res, 'returncode', '?')}): "
+              f"{(getattr(res, 'stderr', '') or '')[:200]}")
+    if log_path and getattr(res, "stream_result", ""):
         with open(log_path, "a") as f:
             f.write(f"\n{'=' * 78}\n### {tag}\n{'=' * 78}\n{res.stream_result}")
-    return res
 
 
 def _publish_status(status_path: str, gate: state_def.GateResult,
@@ -598,7 +522,7 @@ def _merge_mechanical(report: state_def.HotLoopReport,
 
 def run_red_loop(project: str, core: str, workload: str, cflags: str,
                  run_id: str, work_root: str, archive_dir: str | None = None,
-                 llm=None, tools=None, local: bool = False,
+                 llm=None, tools=None,
                  harness: str = "", exclude: str = "") -> REDResult:
     """One end-to-end RED pass: A1 + Gate 1 -> HotLoopReport, then A2 + link 1
     (with a bounded repair edge) -> ISASpec."""
@@ -619,18 +543,17 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
     transcript_path = os.path.join(llm_logs_dir, "transcript.log")
 
     if tools is None:
-        # One tool server, not seven. Every ChiaTool is its own Ray actor and
-        # each rescans the port range as it binds, so a server per artifact cost
-        # minutes before the first agent turn (see red/tools.py). In --local
-        # smoke mode nothing advertises head_local, so placement is left default.
-        task_opts = None if local else HEAD_LOCAL
+        # One tool server, not seven. Each server is a uvicorn app on its own
+        # loopback port and every agent turn re-reads the MCP config, so a
+        # server per artifact cost startup time and config size for nothing
+        # (see red/tools.py). The split that does exist is by what an agent is
+        # allowed to see, not by artifact.
         tools = [DesignerTool(
             name=f"red_dsn_{tag}", source_roots=[project, core],
             profile_path=profile_path, report_path=report_path,
             spec_path=spec_path, status_path=status_path,
             knowledge_path=knowledge_path, sentinel_path=sentinel_path,
-            core_path=core_path, workload=workload, run_id=run_id,
-            task_options=task_opts)]
+            core_path=core_path, workload=workload, run_id=run_id)]
     finish_tool = next((t for t in tools if hasattr(t, "was_finished")), None)
     if finish_tool is not None:
         finish_tool.reset()
@@ -639,10 +562,11 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
     def _mirror(rel: str, content) -> None:
         """Archive one artifact to the database node AND beside the run.
 
-        The local copy is not redundancy for its own sake: every per-round
-        review and performance verdict used to live only on the database node,
-        so tearing the cluster down after a run destroyed the evidence needed to
-        explain why it had not converged.
+        The local copy is not redundancy for its own sake: the run directory
+        under output/work is what the operator actually reads while a run is in
+        flight, and it is routinely deleted between batches, whereas the store
+        under RED_DB_ROOT is the record that survives. Writing both as the
+        artifact is produced means a killed run still explains itself.
         """
         try:
             here = os.path.join(work_root, rel)
@@ -652,24 +576,14 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         except OSError as exc:
             print(f"[red] could not write local copy of {rel}: {exc}")
         if archive_dir:
-            if local:
-                db_node.put(archive_dir, rel, content, workload=workload)
-            else:
-                # Same reason as the transcript archival below: a bare get()
-                # against a node that has left the cluster never returns, and
-                # this one is called from every stage.
-                try:
-                    _await(db_node.put.chia_remote(archive_dir, rel, content,
-                                                   workload=workload),
-                           f"archiving {rel}", RES_DATABASE)
-                except RuntimeError as exc:
-                    print(f"[red] could not archive {rel} to the store: {exc}")
+            db_node.put(archive_dir, rel, content, workload=workload)
 
     # The persistent knowledge graph (red/graph.py). Opened here so a run is
     # recorded from its first stage; every call is a no-op when Neo4j is not
     # running, so a design run never depends on it.
     run_started = time.monotonic()
-    graph.start_run(workload, run_id, project, core, model=LLM_MODEL,
+    graph.start_run(workload, run_id, project, core,
+                    model=(getattr(llm, "model", "") or "claude-code"),
                     harness=harness, cflags=cflags)
 
     gate0, gate1, gate2 = None, None, None
@@ -703,8 +617,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
             wl_tools.append(WorkloadTool(
                 name=f"red_wl_{tag}", source_roots=[project],
                 harness_path=wl_path, status_path=wl_status,
-                knowledge_path=knowledge_path,
-                task_options=None if local else HEAD_LOCAL))
+                knowledge_path=knowledge_path))
             wtm = _tool_map(wl_tools)
             for round_ in range(1, WORKLOAD_MAX_ROUNDS + 1):
                 designer_charter, llm.system_message = llm.system_message, ""
@@ -734,17 +647,11 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     continue
                 with open(wl_path) as f:
                     harness_source = f.read()
-                raw = (nodes.workload_check(project, harness_source,
-                                            os.path.join(wl_dir, f"r{round_}"),
-                                            cflags, exclude) if local
-                       else _await(nodes.workload_check.chia_remote(
-                           project, harness_source,
-                           os.path.join(wl_dir, f"r{round_}"),
-                           cflags, exclude), "workload check", RES_PROFILE))
+                raw = nodes.workload_check(
+                    project, harness_source,
+                    os.path.join(wl_dir, f"r{round_}"), cflags, exclude)
                 workload_spec = state_def.from_json(raw, state_def.WorkloadSpec)
-                gate0 = (nodes.gate0(raw) if local
-                         else _await(nodes.gate0.chia_remote(raw), "Gate 0",
-                                     RES_HEAD_LOCAL))
+                gate0 = nodes.gate0(raw)
                 with open(wl_status, "w") as f:
                     f.write(workload_mod.render(workload_spec))
                 _mirror(f"workload/round{round_}.json",
@@ -768,8 +675,9 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     gate="gate0", passed=False,
                     detail=f"AW produced no harness in {WORKLOAD_MAX_ROUNDS} "
                            "rounds (the agent's turns did not complete)")
-            # AW is finished; its tool server is a Ray actor on a head with
-            # little memory to spare, and nothing reads it again.
+            # AW is finished and nothing reads its tool server again. Every
+            # server is a uvicorn app in this process, so one left running is
+            # a thread and a port held for the rest of the run.
             for t in wl_tools:
                 t.stop()
             wl_tools.clear()
@@ -787,29 +695,22 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # ---------------- A1: profile x2 -> Gate 1 -> mining agent ----------
         prof_args = (project, workload, profile_dir, cflags, harness, exclude,
                      synthesized)
-        if local:
-            prof1 = nodes.A1_profile_workload(*prof_args)
-            prof2 = nodes.A1_profile_workload(*prof_args)
-        else:
-            # Gate 1 needs two independent profiles; dispatch both before
-            # resolving either so the second run is free in wall-clock terms.
-            # They write to sibling directories so they cannot share a harness.
-            refs = [nodes.A1_profile_workload.chia_remote(
-                        project, workload, os.path.join(profile_dir, f"run{i}"),
-                        cflags, harness, exclude, synthesized)
-                    for i in (1, 2)]
-            # Resolve one at a time: both tasks are already running, so this
-            # still costs one profile's wall clock, and get() unwraps the
-            # profiler's result wrapper per ref (it does not for a list).
-            prof1, prof2 = [_await(r, "A1 profile", RES_PROFILE) for r in refs]
+        # Gate 1 needs two independent profiles. They run in parallel threads
+        # into sibling directories, so they cannot share a harness and the
+        # second costs almost nothing in wall clock: callgrind is the slow part
+        # and it is one process per profile.
+        with cf.ThreadPoolExecutor(max_workers=2) as pool:
+            prof1, prof2 = list(pool.map(
+                lambda i: nodes.A1_profile_workload(
+                    project, workload, os.path.join(profile_dir, f"run{i}"),
+                    cflags, harness, exclude, synthesized),
+                (1, 2)))
         _write_json(profile_path, prof1)
         _mirror("profile.json", state_def.to_json(prof1))
 
         total_a = sum(v for k, v in prof1.get("cycle_counts", {}).items() if k != "__total__")
         total_b = sum(v for k, v in prof2.get("cycle_counts", {}).items() if k != "__total__")
-        gate1 = nodes.gate1(total_a, total_b) if local \
-            else _await(nodes.gate1.chia_remote(total_a, total_b),
-                        "Gate 1", RES_HEAD_LOCAL)
+        gate1 = nodes.gate1(total_a, total_b)
         _mirror("gates/gate1.json", state_def.to_json(gate1))
 
         # ---------------- A0 core analysis, alongside A1 mining -------------
@@ -870,8 +771,9 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 GRAPH_QUERY=tm.get("graph_query", ""),
                 CORE_PROFILE=review.render_core(core_profile),
                 CRITIC_MAX_ROUNDS=str(CRITIC_MAX_ROUNDS))
-            # NOTE: Gemini has no cross-call session resume, so each round
-            # re-supplies context via the read tools (see red/prompts/system.md).
+            # NOTE: each round is a fresh `claude -p` turn with no memory of
+            # the last one, so the charter re-supplies context via the read
+            # tools rather than assuming it (see red/prompts/system.md).
             llm.system_message = system
             consecutive_failures = 0
             for r in range(CRITIC_MAX_ROUNDS + 1):
@@ -914,9 +816,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         link1_dir = os.path.join(work_root, "link1")
 
         def _run_link1(sjson: str) -> state_def.GateResult:
-            return (nodes.link1(report_json, sjson, link1_dir) if local
-                    else _await(nodes.link1.chia_remote(report_json, sjson, link1_dir),
-                                "link 1", RES_PROFILE))
+            return nodes.link1(report_json, sjson, link1_dir)
 
         l1 = _run_link1(spec_json)
         # A failing link 1 is a concrete counterexample (a compile error, a
@@ -1083,10 +983,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         security_revisions = 0
 
         def _scan(sjson: str, where: str) -> state_def.SecurityReport:
-            raw = (nodes.security_scan(sjson, core_json, where) if local
-                   else _await(nodes.security_scan.chia_remote(sjson, core_json,
-                                                               where),
-                               "security scan", RES_PROFILE))
+            raw = nodes.security_scan(sjson, core_json, where)
             return state_def.from_json(raw, state_def.SecurityReport)
 
         if llm is not None:
@@ -1102,8 +999,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         name=f"red_sec_{tag}", spec_path=spec_path,
                         core_path=core_path, security_path=security_md,
                         findings_path=agent_findings_path, probe_dir=sec_dir,
-                        knowledge_path=knowledge_path,
-                        task_options=None if local else HEAD_LOCAL))
+                        knowledge_path=knowledge_path))
                 stm = _tool_map(sec_tools)
                 # Clear the designer's charter for the turn, exactly as the
                 # review does: an agent told it is the designer audits its own
@@ -1203,7 +1099,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         review_report = None
         # Keep the best spec the review ever reached, exactly as Gate 3 keeps
         # its best design. A revision is not guaranteed to be an improvement:
-        # two cluster runs walked their blocking findings down to 1 and then
+        # two runs walked their blocking findings down to 1 and then
         # regressed on the final round (1 -> 4 and 1 -> 3, one of them also
         # breaking a C model so link 1 fell to 1/2), and the loop reported that
         # regression because it handed on the *latest* spec instead of the best
@@ -1343,16 +1239,12 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # The implementer gets its own sealed tools: a spec view with the C
         # models hidden (IssSpecTool), the last verdict, and the shared notes.
         if llm is not None and not iss_tools:
-            opts = None if local else HEAD_LOCAL
             iss_tools.append(IssTool(
                 name=f"red_iss_{tag}", spec_path=spec_path,
-                status_path=status_path, knowledge_path=knowledge_path,
-                task_options=opts))
+                status_path=status_path, knowledge_path=knowledge_path))
 
         def _run_gate2(sjson: str) -> state_def.GateResult:
-            return (nodes.gate2(sjson, gate2_dir) if local
-                    else _await(nodes.gate2.chia_remote(sjson, gate2_dir),
-                                "Gate 2", RES_SPIKE))
+            return nodes.gate2(sjson, gate2_dir)
 
         gate2 = None
         for attempt in range(REPAIR_MAX_ROUNDS + 1):
@@ -1395,9 +1287,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
 
         if gate2 is None:
             gate2 = _run_gate2(state_def.to_json(spec))
-        l2 = nodes.link2(state_def.to_json(gate2)) if local \
-            else _await(nodes.link2.chia_remote(state_def.to_json(gate2)),
-                        "link 2", RES_HEAD_LOCAL)
+        l2 = nodes.link2(state_def.to_json(gate2))
         _mirror("gates/gate2.json", state_def.to_json(gate2))
 
         chain = [l1, l2]
@@ -1498,10 +1388,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                                                   state_def.ISASpec) or spec
                             spec_json = state_def.to_json(spec)
                             gate2 = _run_gate2(spec_json)
-                            l2 = (nodes.link2(state_def.to_json(gate2)) if local
-                                  else _await(nodes.link2.chia_remote(
-                                      state_def.to_json(gate2)), "link 2",
-                                      RES_HEAD_LOCAL))
+                            l2 = nodes.link2(state_def.to_json(gate2))
                             chain = [l1, l2]
                             _mirror("gates/gate2.json", state_def.to_json(gate2))
                             _mirror("gates/chain.json", state_def.to_json(chain))
@@ -1582,7 +1469,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         return REDResult(workload, converged, iters, gate0=gate0, gate1=gate1,
                          gate2=gate2, gate3=gate3, gate4=gate4, chain=chain,
                          report=report, spec=spec, review=review_report,
-                         security=sec_report, workload_spec=workload_spec)
+                         security=sec_report, workload_spec=workload_spec,
+                         model=getattr(llm, "model", "") or "")
     finally:
         # A run that returned early or died must not sit at status='running'.
         # finish_run has already fired on the normal path; this only catches the
@@ -1597,19 +1485,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 with tarfile.open(fileobj=buf, mode="w") as tar:
                     tar.add(llm_logs_dir, arcname=".")
                 blob = buf.getvalue()
-                if local:
-                    db_node.archive_dir(archive_dir, "llm_logs", blob, workload=workload)
-                else:
-                    # Through the watchdog, not a bare get(). This runs in the
-                    # `finally`, so it runs precisely when something has already
-                    # gone wrong -- including "the database node left the
-                    # cluster", which is exactly when a bare get() waits
-                    # forever. One run wedged here for 33 minutes after its llm
-                    # and database workers detached, with the instances still
-                    # billing, while the loop had already finished its work.
-                    _await(db_node.archive_dir.chia_remote(
-                        archive_dir, "llm_logs", blob, workload=workload),
-                        "transcript archival", RES_DATABASE)
+                db_node.archive_dir(archive_dir, "llm_logs", blob,
+                                    workload=workload)
         except Exception as exc:  # noqa: BLE001 — archival must not fail the run
             print(f"[{run_id}] WARNING: could not archive LLM transcripts: {exc}")
         for t in list(tools) + iss_tools + sec_tools + wl_tools:
@@ -1661,7 +1538,8 @@ def _render_summary(r: REDResult, run_n: int) -> str:
         for skipped in r.security.checks_skipped[:4]:
             security_line += f"    - NOT CHECKED — {skipped}\n"
     return (f"# RED run_{run_n} — {r.workload}\n\n"
-            f"- model: `{LLM_BACKEND}:{LLM_MODEL}` (project `{GCP_PROJECT}`)\n"
+            f"- backend: Claude Code"
+            + (f" (`{r.model}`)" if r.model else "") + "\n"
             f"- result: **{'converged (A1+A2)' if r.converged else 'NOT converged'}**\n"
             f"- A2 rounds: {r.iterations}\n"
             f"- Gate 0 (workload): {mark(r.gate0)} "
@@ -1704,94 +1582,42 @@ def _parse_args():
                         "not linked.")
     p.add_argument("--run-id", default=None)
     p.add_argument("--work-root", default=None)
-    p.add_argument("--local", action="store_true",
-                   help="run nodes in-process and skip the LLM (mechanical smoke test)")
-    p.add_argument("--local-llm", action="store_true",
-                   help="run the full A1+A2 loop on this machine with the real "
-                        "Gemini backend (no cluster; needs ADC on this host)")
+    p.add_argument("--mechanical", action="store_true",
+                   help="run the mechanical edges only — profile, Gate 1, the "
+                        "typed artifacts — with no agents and no model spend")
+    p.add_argument("--model", default=AGENT_MODEL,
+                   help="model for the agent turns (default: whatever your "
+                        "Claude Code install is configured to use)")
     return p.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    if args.local and args.local_llm:
-        raise SystemExit("--local and --local-llm are mutually exclusive")
+    quiet_servers()
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id = args.run_id or f"{ts}-{uuid.uuid4().hex[:6]}"
     work_root = args.work_root or os.path.join(RED_LOG_ROOT, args.workload, run_id)
-    single_machine = args.local or args.local_llm
 
-    import ray
-    runtime_env = {"working_dir": REPO_ROOT,
-                   "py_modules": [os.path.join(REPO_ROOT, "red")]}
-    if single_machine:
-        # Advertise the cluster's resource tags locally so the same dispatch
-        # path (chia_remote) schedules on this one node.
-        ray.init(runtime_env=runtime_env, resources=LOCAL_RESOURCES)
-    else:
-        ray.init(address="auto", runtime_env=runtime_env)  # the CHIA cluster from cluster.yaml
-    start_collector(log_dir=os.path.join(work_root, "profiler"))
+    # --mechanical runs the gates with no agents at all: the profile, Gate 1
+    # and the typed artifacts, so the toolchain can be checked without spending
+    # anything on a model.
+    llm = None if args.mechanical else ClaudeCodeLLM(model=args.model)
 
-    llm = None
-    if not args.local:
-        if LLM_BACKEND != "gemini":
-            raise SystemExit(f"unsupported LLM_BACKEND {LLM_BACKEND!r} (only 'gemini' is wired)")
-        # No log_dir: the backend would write its transcript on whichever node
-        # runs the prompt, and on a cluster that path does not exist there
-        # (output/ is git-ignored, so it is never rsynced) — the write then
-        # raises inside the tool task group and every turn fails. The driver
-        # captures QueryResult.stream_result on the head instead
-        # (see _dispatch_llm).
-        llm = VertexGeminiLLM(
-            model=LLM_MODEL, project=GCP_PROJECT, location=GCP_LOCATION,
-            # Pass the output budget explicitly. It was imported and never
-            # handed to the backend, so every turn ran at VertexGeminiLLM's
-            # 16,000-token default -- and a reply carrying two C models, or the
-            # ISS agent's two Spike models, does not fit in 16k. It arrives as
-            # MaxOutputTokensError, which the loop treats as a failed turn, so
-            # the symptom was "the backend is erroring" rather than "the reply
-            # was too long". Three runs in one batch died this way.
-            max_tokens=LLM_MAX_TOKENS,
-            timeout_seconds=LLM_TIMEOUT_SECONDS)
-
-    run_n, sweep_path = (db_node.claim_run(args.workload, DB_ROOT) if args.local
-                         else get(db_node.claim_run.chia_remote(args.workload, DB_ROOT)))
+    run_n, sweep_path = db_node.claim_run(args.workload, DB_ROOT)
     try:
         result = run_red_loop(args.project, args.core, args.workload, args.cflags,
                               run_id, work_root, archive_dir=sweep_path,
-                              llm=llm, tools=([] if args.local else None),
-                              local=args.local, harness=args.harness,
-                              exclude=args.exclude)
+                              llm=llm, tools=([] if args.mechanical else None),
+                              harness=args.harness, exclude=args.exclude)
     except Exception:
         import traceback
         traceback.print_exc()
         result = REDResult(args.workload, False, 0)
 
     summary = _render_summary(result, run_n)
-    if args.local:
-        db_node.write_text(sweep_path, "summary.md", summary, workload=args.workload)
-    else:
-        get(db_node.write_text.chia_remote(sweep_path, "summary.md", summary,
-                                           workload=args.workload))
-
-    # On a cloud cluster the store sits on a VM that teardown deletes — pull the
-    # run back to the head so the artifacts survive `red_env.sh down`.
-    local_sweep = sweep_path
-    if not single_machine:
-        # The database node numbers runs against ITS OWN store, which is a
-        # different sequence from the head's — claim a free local slot instead of
-        # reusing run_n, or a fetch would land on top of an earlier local run.
-        try:
-            _, local_sweep = db_node.claim_run(args.workload, DB_ROOT)
-            blob = get(db_node.fetch_run.chia_remote(sweep_path))
-            with tarfile.open(fileobj=io.BytesIO(blob), mode="r") as tar:
-                tar.extractall(path=local_sweep)
-        except Exception as exc:  # noqa: BLE001 — the run itself already succeeded
-            print(f"[red] WARNING: could not fetch the run from the database node "
-                  f"({exc}); artifacts remain on that node at {sweep_path}")
-            local_sweep = sweep_path
-    print(f"\n{summary}\nartifacts -> {local_sweep}")
-    stop_collector()
+    db_node.write_text(sweep_path, "summary.md", summary, workload=args.workload)
+    print(f"\n{summary}\nartifacts -> {sweep_path}")
+    _POOL.shutdown(wait=False)
     return 0 if result.converged else 1
 
 
