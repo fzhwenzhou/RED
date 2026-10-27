@@ -1,7 +1,7 @@
 # The knowledge graph (Neo4j)
 
 RED records every run in a persistent Neo4j graph, and the agents read it back.
-Everything else RED writes is per-run JSON under `output/`, which you are told to
+Everything else RED writes is per-run YAML under `output/`, which you are told to
 delete between test batches; the graph is what survives, and it is how run *N+1*
 learns what run *N* already tried.
 

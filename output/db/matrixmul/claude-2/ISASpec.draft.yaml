@@ -1,0 +1,376 @@
+base_isa: rv32im + Zicntr (PicoRV32, COMPRESSED_ISA=0, ENABLE_IRQ=0, no F extension)
+critic_rounds: 2
+csrs: []
+description: |
+  Two R-type register-to-register instructions in custom-1 plus one 32-bit
+  architectural accumulator register (FACC). Together they implement the
+  binary32 dot product sum_k A[i][k]*B[k][j] that is the body of
+  multiply::ijk_matmul, with exactly the rounding of the application's C code:
+  each product is rounded to binary32 (round-to-nearest-even), then added to the
+  running sum and rounded again (NOT a fused multiply-add). On this RV32IM core
+  there is no F extension, so each of those two operations is otherwise a
+  libgcc soft-float call. The loop nest, the address arithmetic and the loads of
+  A and B stay in software. Neither instruction touches memory.
+encodings: []
+gate2_vectors: 0
+instructions:
+- c_model: |
+    #include <stdint.h>
+
+    /* FACC: the extension's single 32-bit architectural accumulator, holding
+       a binary32 value. Reset value 0x00000000 (+0.0). File-scope state; this
+       instruction returns only the product, so its output is a pure function
+       of in[]. */
+    static uint32_t xf_facc = 0u;
+
+    typedef union { uint32_t u; float f; } xf_word;
+
+    /* xfmac.s rd, rs1, rs2: in[0] = x[rs1], in[1] = x[rs2], out[0] -> x[rd].
+       p = RNE(x[rs1] * x[rs2]); FACC = RNE(FACC + p); x[rd] = p.
+       Any NaN result becomes 0x7FC00000 (branch-free select). */
+    void xfmac_s_model(const uint32_t in[2], uint32_t out[2])
+    {
+        xf_word a, b, p, c, s;
+        uint32_t pm, sm;
+        a.u = in[0];
+        b.u = in[1];
+        p.f = a.f * b.f;
+        pm = (uint32_t)0 - (uint32_t)((p.u & 0x7FFFFFFFu) > 0x7F800000u);
+        p.u = (p.u & ~pm) | (0x7FC00000u & pm);
+        c.u = xf_facc;
+        s.f = c.f + p.f;
+        sm = (uint32_t)0 - (uint32_t)((s.u & 0x7FFFFFFFu) > 0x7F800000u);
+        s.u = (s.u & ~sm) | (0x7FC00000u & sm);
+        xf_facc = s.u;
+        out[0] = p.u;
+        out[1] = 0u;
+    }
+  encoding: 0000100 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000100'
+  group: compute
+  imm_bits: 0
+  invocations: 682
+  mac_ops: 1
+  marshal_words: 0
+  mnemonic: xfmac.s
+  name: binary32 multiply-accumulate into FACC
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    // canon(v): select, not a branch
+    canon(v)      = ((v & 0x7FFFFFFF) > 0x7F800000) ? 0x7FC00000 : v
+    // IEEE 754 binary32, roundTiesToEven, gradual underflow, no flags
+    fmul32(a, b)  = canon(binary32_mul_rne(a, b))
+    // IEEE 754 binary32, roundTiesToEven, gradual underflow, no flags
+    fadd32(a, b)  = canon(binary32_add_rne(a, b))
+
+    a      = X[rs1]
+    b      = X[rs2]
+    // product rounded to binary32 first
+    p      = fmul32(a, b)
+    // then added and rounded again (unfused)
+    s      = fadd32(FACC, p)
+    FACC'  = s
+    // no write when rd = x0
+    X[rd]' = p
+  reads_state:
+  - facc
+  replaces: multiply::ijk_matmul
+  semantics: |
+    xfmac.s rd, rs1, rs2 treats x[rs1] and x[rs2] as IEEE 754 binary32 bit
+    patterns. It computes p = their product rounded to binary32, adds p into
+    the accumulator (FACC <- FACC + p, rounded to binary32) and writes p to
+    x[rd].
+
+    Operand packing (register form): in[0] = x[rs1], in[1] = x[rs2], and
+    out[0] -> x[rd]. out[1] is not architectural and the model writes it 0.
+    Reading x0 gives 0x00000000 (+0.0). If rd = x0 the product is discarded
+    but FACC is still updated, which is how the kernel normally issues it.
+    Both sources are read before rd is written.
+
+    Arithmetic, for both steps:
+    - IEEE 754-2008 binary32 multiplication, then a separate binary32
+      addition. Each is rounded with roundTiesToEven. This is NOT a fused
+      multiply-add: the product is rounded to binary32 before the addition,
+      exactly as the C expression c + a*b does with float operands.
+    - Subnormal inputs and outputs are fully supported (gradual underflow,
+      no flush-to-zero, no denormals-are-zero).
+    - Overflow gives +/-Infinity.
+    - The sign of a product is the XOR of the operand signs, including zero
+      results (-2.0 * +0.0 = -0.0). An exactly-zero sum of opposite-signed
+      addends is +0.0, and (-0.0) + (-0.0) = -0.0.
+    - NaN rule: whenever IEEE 754 would produce a NaN, the result is exactly
+      0x7FC00000, the RISC-V canonical quiet NaN. That covers any NaN operand
+      (signalling or quiet, any sign or payload), Inf * 0 and Inf + (-Inf).
+      The rule applies to p (and so to x[rd]) and to the new FACC.
+    - No exception flags, no fcsr access, no traps.
+
+    Timing: the latency from issue to result is a fixed constant of the
+    implementation, independent of operand values and of FACC. There is no
+    early-out for zero, Inf, NaN or subnormal operands. Normalisation uses
+    fixed-depth leading-zero count and shift, and the significand product
+    takes a fixed number of iterations. Non-normative: a radix-4 sequential
+    24x24 significand multiplier (12 steps) plus align, add, normalise and round
+    gives roughly 16-20 cycles and needs no second array multiplier beside
+    fast_mul.
+
+    Use in multiply::ijk_matmul (K = A.columns >= 1). Each output element
+    issues K-1 xfmac.s x0, A[i][k], B[k][j], then one
+    xfmacr.s rd, A[i][K], B[K][j], whose rd is stored to C[i][j]. Because
+    FACC starts each element at +0.0, which is the value clearMatrix gives
+    C[i][j], the result is bit-identical to the original loop.
+
+    Worked sequences, from reset (FACC = 0x00000000):
+      xfmac.s  t0, 0x3FC00000(1.5), 0x40000000(2.0) -> t0 = 0x40400000 (3.0),  FACC = 0x40400000
+      xfmac.s  t0, 0x3E800000(0.25), 0xC0800000(-4) -> t0 = 0xBF800000 (-1.0), FACC = 0x40000000 (2.0)
+      xfmacr.s t1, 0x3F800000(1.0), 0x3F000000(0.5) -> t1 = 0x40200000 (2.5),  FACC = 0x00000000
+    Unfused rounding (distinguishes this from an FMA):
+      xfmac.s  x0, 0xBF800002, 0x3F800000           -> FACC = 0xBF800002 (-(1+2^-22))
+      xfmacr.s t1, 0x3F800001, 0x3F800001           -> p = 0x3F800002, t1 = 0x00000000 (+0.0; an FMA would give 0x28800000)
+    Single-instruction vectors for x[rd] = p (FACC does not affect x[rd]):
+      0x00000001 * 0x3F000000 -> 0x00000000 (2^-150 is a tie; rounds to even, +0)
+      0x00000003 * 0x3F000000 -> 0x00000002 (tie 1.5*2^-149 rounds to even)
+      0x7F7FFFFF * 0x40000000 -> 0x7F800000 (overflow to +Inf)
+      0x7F800000 * 0x00000000 -> 0x7FC00000 (invalid, canonical NaN)
+      0xFFC12345 * 0x3F800000 -> 0x7FC00000 (NaN payload and sign not propagated)
+      0x80000000 * 0x3F800000 -> 0x80000000 (-0.0)
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - facc
+- c_model: |
+    #include <stdint.h>
+
+    /* FACC: the extension's single 32-bit architectural accumulator, holding
+       a binary32 value. Reset value 0x00000000 (+0.0). File-scope state; this
+       instruction always leaves it +0.0, so from a clean accumulator its
+       output is a pure function of in[]. */
+    static uint32_t xf_facc = 0u;
+
+    typedef union { uint32_t u; float f; } xf_word;
+
+    /* xfmacr.s rd, rs1, rs2: in[0] = x[rs1], in[1] = x[rs2], out[0] -> x[rd].
+       p = RNE(x[rs1] * x[rs2]); x[rd] = RNE(FACC + p); FACC = +0.0.
+       Any NaN result becomes 0x7FC00000 (branch-free select). */
+    void xfmacr_s_model(const uint32_t in[2], uint32_t out[2])
+    {
+        xf_word a, b, p, c, s;
+        uint32_t pm, sm;
+        a.u = in[0];
+        b.u = in[1];
+        p.f = a.f * b.f;
+        pm = (uint32_t)0 - (uint32_t)((p.u & 0x7FFFFFFFu) > 0x7F800000u);
+        p.u = (p.u & ~pm) | (0x7FC00000u & pm);
+        c.u = xf_facc;
+        s.f = c.f + p.f;
+        sm = (uint32_t)0 - (uint32_t)((s.u & 0x7FFFFFFFu) > 0x7F800000u);
+        s.u = (s.u & ~sm) | (0x7FC00000u & sm);
+        xf_facc = 0u;
+        out[0] = s.u;
+        out[1] = 0u;
+    }
+  encoding: 0000101 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000101'
+  group: reduction
+  imm_bits: 0
+  invocations: 69
+  mac_ops: 1
+  marshal_words: 0
+  mnemonic: xfmacr.s
+  name: binary32 multiply-accumulate, read and reset FACC
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    // canon(v): select, not a branch
+    canon(v)      = ((v & 0x7FFFFFFF) > 0x7F800000) ? 0x7FC00000 : v
+    // IEEE 754 binary32, roundTiesToEven, gradual underflow, no flags
+    fmul32(a, b)  = canon(binary32_mul_rne(a, b))
+    // IEEE 754 binary32, roundTiesToEven, gradual underflow, no flags
+    fadd32(a, b)  = canon(binary32_add_rne(a, b))
+
+    a      = X[rs1]
+    b      = X[rs2]
+    // product rounded to binary32 first
+    p      = fmul32(a, b)
+    // then added and rounded again (unfused), using FACC before reset
+    s      = fadd32(FACC, p)
+    // accumulator is reset after the read
+    FACC'  = 0x00000000
+    // no write when rd = x0
+    X[rd]' = s
+  reads_state:
+  - facc
+  replaces: multiply::ijk_matmul
+  semantics: |
+    xfmacr.s rd, rs1, rs2 performs the last multiply-accumulate of a dot
+    product and hands the finished sum back. It computes p = x[rs1] * x[rs2]
+    rounded to binary32, then s = FACC + p rounded to binary32. It writes s to
+    x[rd] and resets FACC to +0.0 (0x00000000).
+
+    Operand packing (register form): in[0] = x[rs1], in[1] = x[rs2], and
+    out[0] -> x[rd]. out[1] is not architectural and the model writes it 0.
+    Reading x0 gives 0x00000000 (+0.0). Both sources and FACC are read before
+    rd and FACC are written. FACC is reset even when rd = x0.
+
+    Arithmetic: exactly as for xfmac.s. That means a binary32 multiply, then a
+    separate binary32 add (NOT fused), each with roundTiesToEven and gradual
+    underflow, overflow to +/-Inf, and IEEE signed-zero rules. Any NaN result
+    becomes exactly 0x7FC00000. No flags, no fcsr access, no traps. The
+    latency is the same fixed, operand-independent constant as xfmac.s. The
+    unit uses the same multiplier and adder.
+
+    Idioms:
+    - xfmacr.s rd, a, b: the final term of a dot product. x[rd] = the
+      complete sum, and FACC is clean for the next one.
+    - xfmacr.s x0, x0, x0: clear FACC (issued once on kernel entry).
+    - xfmacr.s t, x0, x0: save. It returns fl(FACC + fl(+0 * +0)) = FACC
+      exactly, because FACC is never -0.0. FACC is left +0.0.
+    Because xfmacr.s always leaves FACC = +0.0, issuing it repeatedly from a
+    clean state gives x[rd] = fl(+0.0 + fl(x[rs1] * x[rs2])) every time, a
+    function of the operands alone.
+
+    Worked sequences, from reset (FACC = 0x00000000):
+      xfmac.s  x0, 0x3FC00000(1.5), 0x40000000(2.0)  -> FACC = 0x40400000 (3.0)
+      xfmacr.s t1, 0x3F800000(1.0), 0x3F000000(0.5)  -> t1 = 0x40600000 (3.5), FACC = 0x00000000
+      xfmacr.s t2, 0x80000000(-0.0), 0x3F800000(1.0) -> p = 0x80000000, t2 = 0x00000000 (+0 + -0 = +0), FACC = 0x00000000
+      xfmac.s  x0, 0x7F800000(+Inf), 0x3F800000      -> FACC = 0x7F800000
+      xfmacr.s t3, 0xFF800000(-Inf), 0x3F800000      -> t3 = 0x7FC00000 (Inf + -Inf), FACC = 0x00000000
+      xfmacr.s t4, 0x00000003, 0x3F000000            -> t4 = 0x00000002 (subnormal tie to even)
+    Unfused rounding (distinguishes this from an FMA):
+      xfmac.s  x0, 0xBF800002, 0x3F800000            -> FACC = 0xBF800002
+      xfmacr.s t5, 0x3F800001, 0x3F800001            -> t5 = 0x00000000 (an FMA would give 0x28800000)
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - facc
+link1_vectors: 0
+name: 'RED-XFACC: binary32 dot-product accumulator for RV32IM'
+passes_gate2: false
+passes_link1: false
+rationale: |
+  S2a (pattern). The report has one hot function, multiply (68.3% of cycles,
+  Amdahl ceiling 1/(1-0.683) = 3.15x). Its two mined regions are the ijk triple
+  loop and the 100-store clearMatrix zero fill; Gate 3 credits them together as
+  one function, and the zero fill is plain stores the base ISA already does well,
+  so it stays in software. The ijk body is one recurring dataflow pattern: a
+  binary32 dot product with sequential accumulation, c = fl(c + fl(a*b)), with
+  c starting at +0.0 (clearMatrix) and K = A.columns terms per output element.
+  On RV32IM both fl(a*b) and fl(c+p) are soft-float library calls.
+
+  S2b (shape). A multiply-accumulate has three binary32 inputs (a, b and the
+  running sum c), and a PCPI instruction gets two source registers. A pure
+  two-register pair (an fmul.s/fadd.s in integer registers, Zfinx-style) needs two
+  instructions per MAC. At the gate's ~31 cycles per register-form instruction
+  that is ~62 cycles per MAC against ~79 cycles of credited software, which
+  predicts ~1.19x for the application. Moving the third input into one
+  architectural 32-bit accumulator (FACC) makes it one instruction per MAC, for
+  32 bits of state (a "small" addition by the core profile's measure). Folding the
+  read-out and clear into the last MAC of each dot product (xfmacr.s) removes a
+  separate read instruction per output element. It also keeps both instructions
+  observable and twice-call pure:
+  xfmac.s returns the rounded product, which depends only on its operands, and
+  xfmacr.s returns the finished sum and leaves FACC at +0.0. So from a clean
+  accumulator its result is again a function of its operands alone.
+  The same two instructions give clear (xfmacr.s x0, x0, x0), save
+  (xfmacr.s t, x0, x0) and exact restore (xfmac.s x0, t, 1.0), so no third
+  instruction is needed.
+
+  Rejected: (1) block-form dot products or tile multiplies, which are
+  memory-operand arithmetic and structurally blocked; (2) a tile register file
+  holding rows of A/B, which costs hundreds to thousands of bits of state and has
+  compute results that depend on state written by other instructions;
+  (3) packed or quantised operand formats, which are not exact for general
+  binary32 inputs and would change the application's results; (4) a fused
+  multiply-add, which rounds once and so changes results relative to the C
+  source; (5) any fixed matrix-size limit, which would truncate larger matrices.
+  The instructions impose no limit on M, N or K.
+
+  Cost (data-volume derivation). The profiled harness rotates the shapes
+  (M,K,N) = (10,10,10), (8,12,8), (5,20,5), (9,9,9) over its 40,000 calls. That
+  is M*K*N = 1000, 768, 500, 729 MACs (mean 749.25 per call) and M*N = 100, 64,
+  25, 81 output elements (mean 67.5 per call). Each output element issues K-1
+  xfmac.s and 1 xfmacr.s, and each call adds one xfmacr.s x0,x0,x0 on entry to
+  guarantee a clean FACC. So per call: xfmac.s 749.25-67.5 = 681.75 -> 682
+  invocations, and xfmacr.s 67.5+1 = 68.5 -> 69 invocations (both rounded up).
+  Gate 3 cost: ~751 register-form invocations at ~31 cycles is ~23.3k cycles
+  against 6,987 host Ir x 8.51 = ~59.5k cycles of credited software per call. That
+  predicts ~2.55x on multiply and ~1.71x for the application. The real target's
+  software side is soft-float (the host profile used hardware floating point),
+  so the gain on PicoRV32 itself should be larger than the gate's figure. The
+  gate's figure is the conservative one.
+
+  Prior-run findings designed around: fused-vs-unfused mismatch (the semantics
+  state two roundings and give a distinguishing vector); subnormals flushed to
+  zero (gradual underflow is required and examples are given); data-dependent FP
+  latency (the latency is fixed by specification); rd left undefined (both
+  instructions always define x[rd]); dimension truncation (no size limit);
+  custom-0 IRQ aliasing (custom-1 is used).
+register_files:
+- context: |
+    Per-thread architectural state, 32 bits. Save: xfmacr.s t, x0, x0. This
+    returns fl(FACC + fl(+0 * +0)) = FACC exactly and leaves FACC = +0.0.
+    Restore (FACC is +0.0 after the save): xfmac.s x0, t, t1, with
+    t1 = 0x3F800000 (1.0). This sets FACC = fl(+0 + fl(t*1.0)) = t exactly.
+    Both identities are exact because FACC can never hold -0.0 and any NaN in
+    FACC is already the canonical 0x7FC00000 (see state_note). On this
+    core (ENABLE_IRQ=0) there is no preemption. Software keeps FACC at +0.0
+    between dot products, because every accumulation chain ends with xfmacr.s.
+  count: 1
+  name: facc
+  purpose: |
+    The running binary32 sum of the dot product currently being formed.
+    xfmac.s adds its rounded product into it. xfmacr.s adds its rounded
+    product, returns the result in x[rd] and resets FACC to +0.0. This one
+    register is what lets a three-input multiply-accumulate issue as one
+    two-source R-type instruction.
+  reset: 0x00000000 (+0.0)
+  width_bits: 32
+state_note: |
+  FACC is the only state. It is written only by xfmac.s (FACC <- fl(FACC + p))
+  and xfmacr.s (FACC <- +0.0), and reset sets it to +0.0.
+  Invariants that follow from IEEE 754 round-to-nearest-even and are relied on
+  above:
+  (a) FACC never holds -0.0. An RNE sum is -0 only when both addends are -0,
+      and FACC starts at +0. Also, a nonzero exact sum of two binary32 values
+      is at least 2^-149 in magnitude, so it never rounds to zero.
+  (b) Any NaN in FACC is 0x7FC00000.
+  Residue: FACC is per-thread state and may hold a partial sum of one thread's
+  data. Before another thread or privilege domain runs, the outgoing context
+  must save it (xfmacr.s t, x0, x0, which also clears it) or clear it
+  (xfmacr.s x0, x0, x0), so one context's partial sum never enters another's
+  results. Within a thread, every chain that ends in xfmacr.s leaves it +0.0.
+  The kernel issues one xfmacr.s x0, x0, x0 on entry, so it does not depend on
+  the caller having done so.
+  No instruction raises an exception, accesses memory, or reads or writes any
+  CSR. There is no fcsr (the core has no F extension), the rounding mode is
+  fixed at RNE, and no accrued-exception flags exist. This matches the libgcc
+  soft-float routines being replaced, which on this target neither honour a
+  dynamic rounding mode nor expose flags.
+  Hardware binding: a PCPI unit that claims exactly opcode 0101011 with
+  funct3=000 and funct7 in {0000100, 0000101}. It raises pcpi_wait in the cycle
+  after pcpi_valid (well inside the 16-cycle timeout) and returns pcpi_wr=1 with
+  pcpi_rd after a fixed latency. It never asserts acc_busy, so it never takes the
+  memory bus. All other custom-1 encodings are left unclaimed and trap as
+  illegal instructions (CATCH_ILLINSN=1). It never claims OP/funct7=0000001, so
+  it cannot collide with fast_mul/div in the pcpi_int mux.
+  Gate 2 runs each instruction alone from reset. That fully exercises the
+  multiplier and rounding (xfmac.s returns p) and the product + 0 + clear
+  path (xfmacr.s). Accumulation into a nonzero FACC is only observable across
+  a sequence, so the worked sequences in each instruction's semantics are the
+  reference for reviewers and for the RTL testbench.
+tests: []
+version: 0.1.0

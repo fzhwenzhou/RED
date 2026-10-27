@@ -1,0 +1,911 @@
+base_isa: rv32im_zicntr (PicoRV32, red_core.v, ENABLE_ACCEL=1)
+critic_rounds: 1
+csrs: []
+description: Eight pure two-register CRC primitives for libcrc on PicoRV32. Seven of them fold 8 message bytes (two lw-loaded words) through one fixed polynomial starting from a zero register. The caller XORs the running CRC into the first word, so the instruction needs no state operand. Results come back in message byte order, so for both reflected and MSB-first CRCs the fold costs one xor. The eighth instruction threads CRC-SICK's (crc, previous-byte) state through rs1 -> rd, four bytes at a time. All eight run on one shared, constant-time shift-register engine inside red_accel (no multiplier, no memory traffic, no architectural state). The loop over the buffer, the start values and the final XOR/byte-swap epilogues stay in C.
+encodings: []
+gate2_vectors: 100000
+instructions:
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crc32.f8 -> crc32_f8_model. Reflected (LSB-first) CRC-32, polynomial
+       0xEDB88320, over 8 message bytes, starting from a zero register.
+       in[0] = x[rs1] = message bytes M0..M3 (Mi = bits 8i+7..8i),
+       in[1] = x[rs2] = message bytes M4..M7. out[0] -> x[rd]; out[1] = 0. */
+
+    /* One shift-register step: shift right, XOR the polynomial if the bit
+       shifted out was 1. Branch-free, so the model runs in constant time. */
+    #define REFL_STEP(r, p) ((r) = ((r) >> 1) ^ ((p) & ((uint32_t)0 - ((r) & 1u))))
+
+    /* 32 steps. Each pass of the loop is one cycle of the reference
+       datapath, which advances 8 message bits per cycle. */
+    static uint32_t refl_steps32(uint32_t r, uint32_t p)
+    {
+        for (int i = 0; i < 4; i++) {
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+        }
+        return r;
+    }
+
+    void crc32_f8_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = refl_steps32(in[0], 0xEDB88320u);
+        r = refl_steps32(r ^ in[1], 0xEDB88320u);
+        out[0] = r;
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000000'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crc32.f8
+  name: crc32.f8
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0xEDB88320
+    a[0] = x[rs1]
+    for i in 0..31: a[i+1] = (a[i] >>u 1) XOR (a[i][0] == 1 ? P : 0)
+    b[0] = a[32] XOR x[rs2]
+    for i in 0..31: b[i+1] = (b[i] >>u 1) XOR (b[i][0] == 1 ? P : 0)
+    x[rd] = b[32]
+    // all values 32 bits; >>u is a logical right shift; the select is a mask, not a branch
+  reads_state: []
+  replaces: crc_32::byte_loop
+  semantics: |
+    Reflected (LSB-first) CRC-32 with polynomial 0xEDB88320, over 8 message
+    bytes, starting from an all-zero register. This is libcrc's CRC_POLY_32,
+    the polynomial behind crc_tab32.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i of its register. That is exactly what two lw
+    of an 8-byte chunk produce on this little-endian core.
+    Result: out[0] -> x[rd] is the 32-bit register after all 8 bytes. out[1] is
+    always 0 and not architecturally visible.
+    Bytes are consumed in the order M0..M7, each LSB first.
+    The result is the same as 8 iterations of libcrc's
+    crc = (crc >> 8) ^ crc_tab32[(crc ^ byte) & 0xFF] from crc = 0.
+    Caller sequence: by GF(2) linearity, starting from state S is the same as
+    starting from 0 with S XORed into M0..M3, S bits 7..0 into M0. So the
+    running CRC s lives in a register and each aligned chunk costs:
+    lw w0,0(p); lw w1,4(p); xor w0,w0,s; crc32.f8 s,w0,w1; addi p,p,8.
+    crc_32 starts with s = 0xFFFFFFFF and returns s ^ 0xFFFFFFFF.
+    Bytes before the first 4-byte-aligned address, and a final partial chunk,
+    stay on the existing table loop. The profiled 16384-byte buffer has neither.
+    invocations: one profiled crc_32 call processes 16384 bytes (HotLoopReport
+    trip_count; 114,696 host instructions per call = 7 per byte). One invocation
+    consumes 8 bytes, so 16384 / 8 = 2048 per call. Gate 3 will imply only a few
+    hundred, because the model does 8 shift/XOR steps per byte where the
+    software does one table lookup per byte. That ratio is biased; the byte
+    count above is the actual figure.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t refl_fold(uint32_t a, uint32_t b, uint32_t P) {
+      for (int i = 0; i < 32; i++) a = (a >> 1) ^ ((0u - (a & 1u)) & P);
+      b ^= a;
+      for (int i = 0; i < 32; i++) b = (b >> 1) ^ ((0u - (b & 1u)) & P);
+      return b;
+    }
+    void crc32_f8_iss(const uint32_t in[2], uint32_t out[2]) {
+      out[0] = refl_fold(in[0], in[1], 0xEDB88320u);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crc16.f8 -> crc16_f8_model. Reflected (LSB-first) CRC-16, polynomial
+       0xA001 (crc_16, crc_modbus), over 8 message bytes, starting from a zero
+       register. in[0] = x[rs1] = message bytes M0..M3 (Mi = bits 8i+7..8i),
+       in[1] = x[rs2] = message bytes M4..M7.
+       out[0] -> x[rd] (16-bit register, zero-extended); out[1] = 0. */
+
+    /* One shift-register step: shift right, XOR the polynomial if the bit
+       shifted out was 1. The CRC register is bits 15..0 of r; message bits
+       still to enter sit above it. Branch-free, so constant time. */
+    #define REFL_STEP(r, p) ((r) = ((r) >> 1) ^ ((p) & ((uint32_t)0 - ((r) & 1u))))
+
+    /* 32 steps. Each pass of the loop is one cycle of the reference
+       datapath, which advances 8 message bits per cycle. */
+    static uint32_t refl_steps32(uint32_t r, uint32_t p)
+    {
+        for (int i = 0; i < 4; i++) {
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+        }
+        return r;
+    }
+
+    void crc16_f8_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = refl_steps32(in[0], 0x0000A001u);
+        r = refl_steps32(r ^ in[1], 0x0000A001u);
+        out[0] = r;
+        out[1] = 0;
+    }
+  encoding: 0000001 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crc16.f8
+  name: crc16.f8
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x0000A001
+    a[0] = x[rs1]
+    for i in 0..31: a[i+1] = (a[i] >>u 1) XOR (a[i][0] == 1 ? P : 0)
+    b[0] = a[32] XOR x[rs2]
+    for i in 0..31: b[i+1] = (b[i] >>u 1) XOR (b[i][0] == 1 ? P : 0)
+    x[rd] = b[32]
+    // all values 32 bits; a[32][31:16] and b[32][31:16] are 0 by construction,
+    // because P only has bits below 16 and 32 right shifts empty the upper half
+  reads_state: []
+  replaces: crc_16::byte_loop
+  semantics: |
+    Reflected (LSB-first) 16-bit CRC with polynomial 0xA001, over 8 message
+    bytes, starting from an all-zero register. This is libcrc's CRC_POLY_16, the
+    crc_tab16 polynomial shared by crc_16 and crc_modbus.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i of its register. That is what two lw of an
+    8-byte chunk produce.
+    Result: out[0] -> x[rd] is the 16-bit register, zero-extended, so bits
+    31..16 are always 0. out[1] is always 0 and not architecturally visible.
+    Bytes are consumed in order M0..M7, each LSB first.
+    The result is the same as 8 iterations of
+    crc = (crc >> 8) ^ crc_tab16[(crc ^ byte) & 0xFF] from crc = 0.
+    Caller sequence: by GF(2) linearity, starting from state S is the same as
+    starting from 0 with S XORed into M0..M1 (S bits 7..0 into M0). Per aligned
+    chunk: lw w0,0(p); lw w1,4(p); xor w0,w0,s; crc16.f8 s,w0,w1; addi p,p,8.
+    crc_16 starts with s = 0x0000 and crc_modbus with s = 0xFFFF. Both use this
+    instruction unchanged; Gate 3 credits it to crc_16 only.
+    Unaligned head bytes and a final partial chunk stay on the table loop.
+    invocations: one profiled crc_16 call processes 16384 bytes (trip_count;
+    114,704 host instructions per call = 7 per byte). That is 16384 / 8 = 2048
+    invocations. A ratio-based estimate reads lower because the model does 8
+    bit steps per byte against one table lookup.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t refl_fold(uint32_t a, uint32_t b, uint32_t P) {
+      for (int i = 0; i < 32; i++) a = (a >> 1) ^ ((0u - (a & 1u)) & P);
+      b ^= a;
+      for (int i = 0; i < 32; i++) b = (b >> 1) ^ ((0u - (b & 1u)) & P);
+      return b;
+    }
+    void crc16_f8_iss(const uint32_t in[2], uint32_t out[2]) {
+      out[0] = refl_fold(in[0], in[1], 0x0000A001u);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crcdnp.f8 -> crcdnp_f8_model. Reflected (LSB-first) CRC-16, polynomial
+       0xA6BC (crc_dnp), over 8 message bytes, starting from a zero register.
+       in[0] = x[rs1] = message bytes M0..M3 (Mi = bits 8i+7..8i),
+       in[1] = x[rs2] = message bytes M4..M7.
+       out[0] -> x[rd] (16-bit register, zero-extended); out[1] = 0. */
+
+    /* One shift-register step: shift right, XOR the polynomial if the bit
+       shifted out was 1. The CRC register is bits 15..0 of r; message bits
+       still to enter sit above it. Branch-free, so constant time. */
+    #define REFL_STEP(r, p) ((r) = ((r) >> 1) ^ ((p) & ((uint32_t)0 - ((r) & 1u))))
+
+    /* 32 steps. Each pass of the loop is one cycle of the reference
+       datapath, which advances 8 message bits per cycle. */
+    static uint32_t refl_steps32(uint32_t r, uint32_t p)
+    {
+        for (int i = 0; i < 4; i++) {
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+        }
+        return r;
+    }
+
+    void crcdnp_f8_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = refl_steps32(in[0], 0x0000A6BCu);
+        r = refl_steps32(r ^ in[1], 0x0000A6BCu);
+        out[0] = r;
+        out[1] = 0;
+    }
+  encoding: 0000010 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000010'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crcdnp.f8
+  name: crcdnp.f8
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x0000A6BC
+    a[0] = x[rs1]
+    for i in 0..31: a[i+1] = (a[i] >>u 1) XOR (a[i][0] == 1 ? P : 0)
+    b[0] = a[32] XOR x[rs2]
+    for i in 0..31: b[i+1] = (b[i] >>u 1) XOR (b[i][0] == 1 ? P : 0)
+    x[rd] = b[32]
+    // all values 32 bits; bits 31:16 of the result are 0 by construction
+  reads_state: []
+  replaces: crc_dnp::byte_loop
+  semantics: |
+    Reflected (LSB-first) 16-bit CRC with polynomial 0xA6BC, over 8 message
+    bytes, starting from an all-zero register. This is libcrc's CRC_POLY_DNP,
+    the crc_tabdnp polynomial.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i.
+    Result: out[0] -> x[rd] is the 16-bit register, zero-extended. out[1] is
+    always 0.
+    Bytes are consumed in order M0..M7, each LSB first.
+    The result is the same as 8 iterations of
+    crc = (crc >> 8) ^ crc_tabdnp[(crc ^ byte) & 0xFF] from crc = 0.
+    Caller sequence: identical to crc16.f8. s = 0x0000 (CRC_START_DNP). Per
+    aligned chunk: lw w0; lw w1; xor w0,w0,s; crcdnp.f8 s,w0,w1. crc_dnp's
+    epilogue (~crc, then byte swap) stays in C.
+    Unaligned head bytes and a final partial chunk stay on the table loop.
+    invocations: one profiled crc_dnp call processes 16384 bytes (trip_count;
+    114,704 host instructions per call). At 8 bytes per invocation that is 2048.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t refl_fold(uint32_t a, uint32_t b, uint32_t P) {
+      for (int i = 0; i < 32; i++) a = (a >> 1) ^ ((0u - (a & 1u)) & P);
+      b ^= a;
+      for (int i = 0; i < 32; i++) b = (b >> 1) ^ ((0u - (b & 1u)) & P);
+      return b;
+    }
+    void crcdnp_f8_iss(const uint32_t in[2], uint32_t out[2]) {
+      out[0] = refl_fold(in[0], in[1], 0x0000A6BCu);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crckermit.f8 -> crckermit_f8_model. Reflected (LSB-first) CRC-16,
+       polynomial 0x8408 (crc_kermit), over 8 message bytes, starting from a
+       zero register. in[0] = x[rs1] = message bytes M0..M3
+       (Mi = bits 8i+7..8i), in[1] = x[rs2] = message bytes M4..M7.
+       out[0] -> x[rd] (16-bit register, zero-extended); out[1] = 0. */
+
+    /* One shift-register step: shift right, XOR the polynomial if the bit
+       shifted out was 1. The CRC register is bits 15..0 of r; message bits
+       still to enter sit above it. Branch-free, so constant time. */
+    #define REFL_STEP(r, p) ((r) = ((r) >> 1) ^ ((p) & ((uint32_t)0 - ((r) & 1u))))
+
+    /* 32 steps. Each pass of the loop is one cycle of the reference
+       datapath, which advances 8 message bits per cycle. */
+    static uint32_t refl_steps32(uint32_t r, uint32_t p)
+    {
+        for (int i = 0; i < 4; i++) {
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+            REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p); REFL_STEP(r, p);
+        }
+        return r;
+    }
+
+    void crckermit_f8_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = refl_steps32(in[0], 0x00008408u);
+        r = refl_steps32(r ^ in[1], 0x00008408u);
+        out[0] = r;
+        out[1] = 0;
+    }
+  encoding: 0000011 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000011'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crckermit.f8
+  name: crckermit.f8
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x00008408
+    a[0] = x[rs1]
+    for i in 0..31: a[i+1] = (a[i] >>u 1) XOR (a[i][0] == 1 ? P : 0)
+    b[0] = a[32] XOR x[rs2]
+    for i in 0..31: b[i+1] = (b[i] >>u 1) XOR (b[i][0] == 1 ? P : 0)
+    x[rd] = b[32]
+    // all values 32 bits; bits 31:16 of the result are 0 by construction
+  reads_state: []
+  replaces: crc_kermit::byte_loop
+  semantics: |
+    Reflected (LSB-first) 16-bit CRC with polynomial 0x8408, over 8 message
+    bytes, starting from an all-zero register. This is libcrc's
+    CRC_POLY_KERMIT, the crckrmit.c crc_tab polynomial.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i.
+    Result: out[0] -> x[rd] is the 16-bit register, zero-extended. out[1] is
+    always 0.
+    Bytes are consumed in order M0..M7, each LSB first.
+    The result is the same as 8 iterations of
+    crc = (crc >> 8) ^ crc_tab[(crc ^ byte) & 0xFF] from crc = 0.
+    Caller sequence: identical to crc16.f8, with s = 0x0000
+    (CRC_START_KERMIT). crc_kermit's byte-swap epilogue stays in C.
+    Unaligned head bytes and a final partial chunk stay on the table loop.
+    invocations: one profiled crc_kermit call processes 16384 bytes (trip_count;
+    114,703 host instructions per call). At 8 bytes per invocation that is 2048.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t refl_fold(uint32_t a, uint32_t b, uint32_t P) {
+      for (int i = 0; i < 32; i++) a = (a >> 1) ^ ((0u - (a & 1u)) & P);
+      b ^= a;
+      for (int i = 0; i < 32; i++) b = (b >> 1) ^ ((0u - (b & 1u)) & P);
+      return b;
+    }
+    void crckermit_f8_iss(const uint32_t in[2], uint32_t out[2]) {
+      out[0] = refl_fold(in[0], in[1], 0x00008408u);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crcccitt.f8 -> crcccitt_f8_model. MSB-first CRC-16, polynomial 0x1021
+       (crc_xmodem, crc_ccitt_1d0f, crc_ccitt_ffff), over 8 message bytes,
+       starting from a zero register. in[0] = x[rs1] = message bytes M0..M3
+       (Mi = bits 8i+7..8i), in[1] = x[rs2] = message bytes M4..M7.
+       out[0] = the 16-bit register in message byte order (bits 7..0 =
+       register bits 15..8, bits 15..8 = register bits 7..0), zero-extended;
+       out[1] = 0. */
+
+    static uint32_t bswap32(uint32_t x)
+    {
+        return (x >> 24) | ((x >> 8) & 0x0000FF00u) | ((x << 8) & 0x00FF0000u) | (x << 24);
+    }
+
+    /* One step of an MSB-first shift register held in bits 31..16 of r, with
+       the message bits still to enter below it: shift left, XOR the
+       polynomial if the bit shifted out was 1. Branch-free. */
+    #define MSB_STEP(r, p) ((r) = ((r) << 1) ^ ((p) & ((uint32_t)0 - ((r) >> 31))))
+
+    /* 32 steps. Each pass of the loop is one cycle of the reference
+       datapath, which advances 8 message bits per cycle. */
+    static uint32_t msb_steps32(uint32_t r, uint32_t p)
+    {
+        for (int i = 0; i < 4; i++) {
+            MSB_STEP(r, p); MSB_STEP(r, p); MSB_STEP(r, p); MSB_STEP(r, p);
+            MSB_STEP(r, p); MSB_STEP(r, p); MSB_STEP(r, p); MSB_STEP(r, p);
+        }
+        return r;
+    }
+
+    void crcccitt_f8_model(const uint32_t in[2], uint32_t out[2])
+    {
+        /* M0 enters first, so it is the most significant byte. */
+        uint32_t r = msb_steps32(bswap32(in[0]), 0x10210000u);
+        uint32_t c;
+        r = msb_steps32(r ^ bswap32(in[1]), 0x10210000u);
+        c = r >> 16;
+        out[0] = (c >> 8) | ((c & 0xFFu) << 8);
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 001 rd 0101011
+  form: reg
+  funct3: '001'
+  funct7: '0000000'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crcccitt.f8
+  name: crcccitt.f8
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x10210000                    // 0x1021 aligned to bits 31:16
+    bswap32(v) = v[7:0] << 24 | v[15:8] << 16 | v[23:16] << 8 | v[31:24]
+    a[0] = bswap32(x[rs1])            // M0 in bits 31:24 ... M3 in bits 7:0
+    for i in 0..31: a[i+1] = (a[i] << 1)[31:0] XOR (a[i][31] == 1 ? P : 0)
+    b[0] = a[32] XOR bswap32(x[rs2])
+    for i in 0..31: b[i+1] = (b[i] << 1)[31:0] XOR (b[i][31] == 1 ? P : 0)
+    R = b[32][31:16]                  // b[32][15:0] is 0 by construction
+    x[rd] = zext32(R[7:0] << 8 | R[15:8])
+  reads_state: []
+  replaces: crc_ccitt_1d0f::ccitt_generic_byte_loop
+  semantics: |
+    Non-reflected (MSB-first) 16-bit CRC with polynomial 0x1021, over 8 message
+    bytes, starting from an all-zero register. This is libcrc's CRC_POLY_CCITT,
+    the crc_tabccitt polynomial of crc_ccitt_generic, used by crc_xmodem,
+    crc_ccitt_1d0f and crc_ccitt_ffff.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i of its register. That is what two lw of an
+    8-byte chunk produce.
+    Bytes are consumed in order M0..M7, each MSB first.
+    Result: out[0] -> x[rd] is the final 16-bit register R in message byte order,
+    zero-extended: x[rd][7:0] = R[15:8], x[rd][15:8] = R[7:0], x[rd][31:16] = 0.
+    out[1] is always 0. R equals 8 iterations of libcrc's
+    crc = (crc << 8) ^ crc_tabccitt[((crc >> 8) ^ byte) & 0xFF] from crc = 0.
+    Why byte-reversed: in an MSB-first CRC the register's high byte meets the
+    next message byte. In this order the result XORs straight into the next
+    lw-loaded word, so the loop needs no byte swap. RV32IM has no rev8, so a
+    swap would cost about 10 instructions with slow shifts.
+    Caller sequence: keep s = swap16(crc), i.e. (crc >> 8) | ((crc & 0xFF) << 8).
+    Per aligned chunk: lw w0,0(p); lw w1,4(p); xor w0,w0,s; crcccitt.f8 s,w0,w1;
+    addi p,p,8. At entry, s = swap16(start): 0x0000 for xmodem, 0x0F1D for
+    start 0x1D0F, 0xFFFF for start 0xFFFF. At exit, crc = swap16(s), done once
+    per call. The instruction is credited to crc_ccitt_1d0f; crc_xmodem and
+    crc_ccitt_ffff use it identically.
+    Unaligned head bytes and a final partial chunk stay on the table loop.
+    invocations: one profiled call processes 16384 bytes (trip_count; 131,085
+    host instructions per call = 8 per byte). At 8 bytes per invocation that is
+    2048.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t bswap32_(uint32_t v) {
+      return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+    }
+    void crcccitt_f8_iss(const uint32_t in[2], uint32_t out[2]) {
+      const uint32_t P = 0x10210000u;
+      uint32_t a = bswap32_(in[0]);
+      for (int i = 0; i < 32; i++) a = (a << 1) ^ ((0u - (a >> 31)) & P);
+      uint32_t b = a ^ bswap32_(in[1]);
+      for (int i = 0; i < 32; i++) b = (b << 1) ^ ((0u - (b >> 31)) & P);
+      uint32_t R = b >> 16;
+      out[0] = ((R & 0xFFu) << 8) | (R >> 8);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crc64.f8h -> crc64_f8h_model. MSB-first CRC-64, polynomial
+       0x42F0E1EBA9EA3693 (crc_64_ecma, crc_64_we), over 8 message bytes,
+       starting from a zero register; returns register bits 63..32 in message
+       byte order (bits 7..0 = register bits 63..56 ... bits 31..24 = register
+       bits 39..32). in[0] = x[rs1] = message bytes M0..M3
+       (Mi = bits 8i+7..8i), in[1] = x[rs2] = message bytes M4..M7.
+       out[1] = 0. */
+
+    static uint32_t bswap32(uint32_t x)
+    {
+        return (x >> 24) | ((x >> 8) & 0x0000FF00u) | ((x << 8) & 0x00FF0000u) | (x << 24);
+    }
+
+    /* One step: shift left, XOR the polynomial if the bit shifted out was 1.
+       Branch-free, so the model runs in constant time. */
+    #define MSB64_STEP(r) ((r) = ((r) << 1) ^ (0x42F0E1EBA9EA3693ull & ((uint64_t)0 - ((r) >> 63))))
+
+    void crc64_f8h_model(const uint32_t in[2], uint32_t out[2])
+    {
+        /* M0 enters first, so it is the most significant byte. */
+        uint64_t r = ((uint64_t)bswap32(in[0]) << 32) | (uint64_t)bswap32(in[1]);
+        /* 64 steps. Each pass is one cycle of the 8-bit-per-cycle datapath. */
+        for (int i = 0; i < 8; i++) {
+            MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r);
+            MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r);
+        }
+        out[0] = bswap32((uint32_t)(r >> 32));
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 010 rd 0101011
+  form: reg
+  funct3: '010'
+  funct7: '0000000'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crc64.f8h
+  name: crc64.f8h
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x42F0E1EBA9EA3693            // 64-bit
+    bswap32(v) = v[7:0] << 24 | v[15:8] << 16 | v[23:16] << 8 | v[31:24]
+    r[0] = zext64(bswap32(x[rs1])) << 32 | zext64(bswap32(x[rs2]))   // M0 in bits 63:56 ... M7 in bits 7:0
+    for i in 0..63: r[i+1] = (r[i] << 1)[63:0] XOR (r[i][63] == 1 ? P : 0)
+    x[rd] = bswap32(r[64][63:32])
+  reads_state: []
+  replaces: crc_64_ecma::byte_loop
+  semantics: |
+    High half of a non-reflected (MSB-first) 64-bit CRC with polynomial
+    0x42F0E1EBA9EA3693, over 8 message bytes, starting from an all-zero
+    register. This is libcrc's CRC_POLY_64, the crc_tab64 polynomial of
+    crc_64_ecma and crc_64_we.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i of its register.
+    Bytes are consumed in order M0..M7, each MSB first.
+    Result: out[0] -> x[rd] is register bits 63..32 in message byte order:
+    x[rd][7:0] = R[63:56], x[rd][15:8] = R[55:48], x[rd][23:16] = R[47:40],
+    x[rd][31:24] = R[39:32]. out[1] is always 0. R equals 8 iterations of
+    crc = (crc << 8) ^ crc_tab64[((crc >> 56) ^ byte) & 0xFF] from crc = 0.
+    Companion: crc64.f8l, given the same two operands, returns the low half in
+    the same byte order. One rd cannot hold 64 bits, so the pair is the
+    complete operation, and each half recomputes the full pass. The halves come
+    back in exactly the byte order that XORs into the next chunk's two lw words.
+    Caller sequence: keep s0 = bswap32(crc >> 32) and s1 = bswap32(crc & 0xFFFFFFFF).
+    Per aligned chunk:
+      lw w0,0(p); lw w1,4(p); xor m0,w0,s0; xor m1,w1,s1;
+      crc64.f8h s0,m0,m1; crc64.f8l s1,m0,m1; addi p,p,8
+    Note that rd of the first must not overwrite m0 or m1, which the second
+    still reads.
+    crc_64_ecma starts with s0 = s1 = 0. crc_64_we starts with
+    s0 = s1 = 0xFFFFFFFF and also uses the pair, uncredited. At exit,
+    crc = bswap32(s0) << 32 | bswap32(s1), done once per call.
+    Unaligned head bytes and a final partial chunk stay on the table loop.
+    invocations: one profiled crc_64_ecma call processes 16384 bytes (trip_count;
+    98,313 host instructions per call = 6 per byte on the 64-bit host). Each
+    chunk of 8 bytes runs this instruction once, so 2048 per call. crc64.f8l
+    also runs 2048 times.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t bswap32_(uint32_t v) {
+      return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+    }
+    void crc64_f8h_iss(const uint32_t in[2], uint32_t out[2]) {
+      const uint64_t P = 0x42F0E1EBA9EA3693ull;
+      uint64_t r = ((uint64_t)bswap32_(in[0]) << 32) | (uint64_t)bswap32_(in[1]);
+      for (int i = 0; i < 64; i++) r = (r << 1) ^ ((0ull - (r >> 63)) & P);
+      out[0] = bswap32_((uint32_t)(r >> 32));
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crc64.f8l -> crc64_f8l_model. MSB-first CRC-64, polynomial
+       0x42F0E1EBA9EA3693 (crc_64_ecma, crc_64_we), over 8 message bytes,
+       starting from a zero register; returns register bits 31..0 in message
+       byte order (bits 7..0 = register bits 31..24 ... bits 31..24 =
+       register bits 7..0). in[0] = x[rs1] = message bytes M0..M3
+       (Mi = bits 8i+7..8i), in[1] = x[rs2] = message bytes M4..M7.
+       out[1] = 0. */
+
+    static uint32_t bswap32(uint32_t x)
+    {
+        return (x >> 24) | ((x >> 8) & 0x0000FF00u) | ((x << 8) & 0x00FF0000u) | (x << 24);
+    }
+
+    /* One step: shift left, XOR the polynomial if the bit shifted out was 1.
+       Branch-free, so the model runs in constant time. */
+    #define MSB64_STEP(r) ((r) = ((r) << 1) ^ (0x42F0E1EBA9EA3693ull & ((uint64_t)0 - ((r) >> 63))))
+
+    void crc64_f8l_model(const uint32_t in[2], uint32_t out[2])
+    {
+        /* M0 enters first, so it is the most significant byte. */
+        uint64_t r = ((uint64_t)bswap32(in[0]) << 32) | (uint64_t)bswap32(in[1]);
+        /* 64 steps. Each pass is one cycle of the 8-bit-per-cycle datapath. */
+        for (int i = 0; i < 8; i++) {
+            MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r);
+            MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r); MSB64_STEP(r);
+        }
+        out[0] = bswap32((uint32_t)r);
+        out[1] = 0;
+    }
+  encoding: 0000001 rs2 rs1 010 rd 0101011
+  form: reg
+  funct3: '010'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crc64.f8l
+  name: crc64.f8l
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    P = 0x42F0E1EBA9EA3693            // 64-bit
+    bswap32(v) = v[7:0] << 24 | v[15:8] << 16 | v[23:16] << 8 | v[31:24]
+    r[0] = zext64(bswap32(x[rs1])) << 32 | zext64(bswap32(x[rs2]))   // M0 in bits 63:56 ... M7 in bits 7:0
+    for i in 0..63: r[i+1] = (r[i] << 1)[63:0] XOR (r[i][63] == 1 ? P : 0)
+    x[rd] = bswap32(r[64][31:0])
+  reads_state: []
+  replaces: crc_64_ecma::byte_loop
+  semantics: |
+    Low half of the same computation as crc64.f8h: a non-reflected (MSB-first)
+    64-bit CRC with polynomial 0x42F0E1EBA9EA3693, over 8 message bytes,
+    starting from an all-zero register.
+    Operands: in[0] = x[rs1] holds message bytes M0..M3 and in[1] = x[rs2] holds
+    M4..M7, with Mi in bits 8i+7..8i.
+    Bytes are consumed in order M0..M7, each MSB first.
+    Result: out[0] -> x[rd] is register bits 31..0 in message byte order:
+    x[rd][7:0] = R[31:24], x[rd][15:8] = R[23:16], x[rd][23:16] = R[15:8],
+    x[rd][31:24] = R[7:0]. out[1] is always 0.
+    Caller sequence: see crc64.f8h. Both halves take the same pre-XORed operands
+    m0 = w0 ^ s0 and m1 = w1 ^ s1, so f8h's rd must not overwrite m0 or m1
+    before f8l reads them. crc64.f8l s1,m0,m1 produces the new s1.
+    invocations: 16384 bytes per profiled crc_64_ecma call and 8 bytes per
+    invocation give 2048. It runs alongside crc64.f8h, so the pair is 4096
+    instruction executions per call, and Gate 3 charges both.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    static uint32_t bswap32_(uint32_t v) {
+      return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+    }
+    void crc64_f8l_iss(const uint32_t in[2], uint32_t out[2]) {
+      const uint64_t P = 0x42F0E1EBA9EA3693ull;
+      uint64_t r = ((uint64_t)bswap32_(in[0]) << 32) | (uint64_t)bswap32_(in[1]);
+      for (int i = 0; i < 64; i++) r = (r << 1) ^ ((0ull - (r >> 63)) & P);
+      out[0] = bswap32_((uint32_t)r);
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* crcsick.w -> crcsick_w_model. Four steps of libcrc's CRC-SICK byte
+       recurrence (polynomial 0x8005). in[0] = x[rs1] = state: bits 15..0 =
+       crc, bits 23..16 = p (previous message byte), bits 31..24 ignored.
+       in[1] = x[rs2] = message bytes M0..M3 (Mi = bits 8i+7..8i).
+       out[0] -> x[rd] = (p' << 16) | crc', bits 31..24 zero; out[1] = 0. */
+    void crcsick_w_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = in[0] & 0xFFFFu;
+        uint32_t p = (in[0] >> 16) & 0xFFu;
+        for (int i = 0; i < 4; i++) {
+            uint32_t b = (in[1] >> (8 * i)) & 0xFFu;
+            uint32_t m = (uint32_t)0 - (r >> 15);   /* all-ones iff bit 15 set */
+            r = ((r << 1) ^ (0x8005u & m)) & 0xFFFFu;
+            r ^= b | (p << 8);
+            p = b;
+        }
+        out[0] = (p << 16) | r;
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 011 rd 0101011
+  form: reg
+  funct3: '011'
+  funct7: '0000000'
+  group: compute
+  imm_bits: 0
+  invocations: 4096
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: crcsick.w
+  name: crcsick.w
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    r[0] = x[rs1][15:0]
+    p[0] = x[rs1][23:16]
+    for i in 0..3:
+      m[i]   = x[rs2][8*i+7 : 8*i]
+      u[i]   = (r[i] << 1)[15:0] XOR (r[i][15] == 1 ? 0x8005 : 0x0000)
+      r[i+1] = u[i] XOR (p[i] << 8 | m[i])          // 16-bit
+      p[i+1] = m[i]
+    x[rd] = zext32(p[4] << 16 | r[4])                // bits 31:24 = 0
+  reads_state: []
+  replaces: crc_sick::byte_loop
+  semantics: |
+    Four steps of libcrc's CRC-SICK byte recurrence (polynomial 0x8005). Each
+    step does one 1-bit register shift with a conditional polynomial XOR, then
+    XORs in the current byte and the previous byte.
+    CRC-SICK is not a byte-aligned CRC. The register advances one bit per byte,
+    so the state is never consumed by the message and cannot be folded into
+    it. The state therefore travels in a register.
+    Operands: in[0] = x[rs1] is the packed state. Bits 15:0 are crc, bits 23:16
+    are p (the previous message byte, i.e. libcrc's short_p >> 8), and bits
+    31:24 are ignored. in[1] = x[rs2] holds message bytes M0..M3, with Mi in bits
+    8i+7..8i (what an lw of a 4-byte chunk produces).
+    For i = 0..3 in order:
+      1. If bit 15 of crc is 1, crc = ((crc << 1) AND 0xFFFF) XOR 0x8005.
+         Otherwise crc = (crc << 1) AND 0xFFFF. The test uses crc before the
+         shift.
+      2. crc = crc XOR (Mi | (p << 8)).
+      3. p = Mi.
+    Result: out[0] -> x[rd] = (p << 16) | crc, with bits 31:24 = 0. This is the
+    same packing as rs1, so the result feeds straight back as the next rs1.
+    out[1] is always 0.
+    The four steps equal 4 iterations of crc_sick's loop body with
+    short_p = p << 8.
+    Caller sequence: s = 0, from CRC_START_SICK = 0 and short_p = 0. Per aligned
+    word: lw w,0(p); crcsick.w s,s,w; addi p,p,4. At exit, crc = s & 0xFFFF,
+    then crc_sick's byte-swap epilogue in C. If head bytes ran in software,
+    pack s = (prev_byte << 16) | crc before the first instruction.
+    invocations: one profiled crc_sick call processes 16384 bytes (trip_count;
+    180,233 host instructions per call = 11 per byte). At 4 bytes per invocation
+    that is 16384 / 4 = 4096.
+    No memory access, no state, no traps. Latency does not depend on operand
+    values. rd may alias rs1/rs2, and rd = x0 discards the result.
+  spike_model: |-
+    void crcsick_w_iss(const uint32_t in[2], uint32_t out[2]) {
+      uint32_t r = in[0] & 0xFFFFu;
+      uint32_t p = (in[0] >> 16) & 0xFFu;
+      for (int i = 0; i < 4; i++) {
+        uint32_t mi = (in[1] >> (8 * i)) & 0xFFu;
+        uint32_t u = ((r << 1) & 0xFFFFu) ^ ((0u - ((r >> 15) & 1u)) & 0x8005u);
+        r = (u ^ ((p << 8) | mi)) & 0xFFFFu;
+        p = mi;
+      }
+      out[0] = (p << 16) | r;
+      out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+link1_vectors: 100000
+name: RED-Xcrcfold
+passes_gate2: true
+passes_link1: true
+rationale: |
+  S2a: patterns and Amdahl. The ten mined loops cover 85.5% of the profile. Every
+  loop is a byte-serial recurrence that is linear over GF(2). There are four
+  shapes:
+    (1) reflected, table-driven CRC: crc_32 (0xEDB88320), crc_16 + crc_modbus (0xA001),
+        crc_kermit (0x8408), crc_dnp (0xA6BC). 39.4% of cycles.
+    (2) MSB-first 16-bit, table-driven: crc_xmodem, crc_ccitt_1d0f, crc_ccitt_ffff,
+        all through crc_ccitt_generic (0x1021). 27.0%.
+    (3) MSB-first 64-bit, table-driven: crc_64_ecma (0x42F0E1EBA9EA3693). 6.75%.
+        The unmined crc_64_we runs the identical loop for another 6.75%.
+    (4) CRC-SICK, bit-serial: one shift + conditional 0x8005 per byte, plus a
+        byte-pair XOR. 12.4%.
+  On this core one table step is lbu + xor + andi + slli + add + lw/lhu +
+  srli/slli + xor + loop overhead. That is about 40-60 cycles per byte, because
+  there is no barrel shifter and loads cost 5 cycles. CRC-64 is worse: its
+  64-bit state needs two-word shifts on RV32. The work the base ISA is bad at is
+  the shift/XOR recurrence itself. Seven distinct recurrences carry all ten
+  loops. The extension has one instruction per recurrence (two for CRC-64).
+
+  Gate 3 credits each instruction against exactly one mined loop, so the credited
+  coverage is 59.6%: crc_sick, crc_ccitt_1d0f, crc_16, crc_kermit, crc_dnp,
+  crc_32, crc_64_ecma. The Amdahl ceiling on that is 2.48x. These instructions
+  are not credited for crc_modbus (crc16.f8), crc_xmodem and crc_ccitt_ffff
+  (crcccitt.f8) or crc_64_we (crc64.f8h/l), but those functions run on them
+  unchanged. Only a start value or an epilogue differs, and both stay in C. That
+  is another 32.6% of the application. The extension does not add a
+  duplicate-semantics opcode for any of them just to collect credit. Only crc_8
+  (5.6%, unmined) and the update_crc_* streaming calls (about 1.3%) stay in
+  software.
+
+  S2b: why this shape.
+  * Register form, not block. All operands fit in two registers, so nothing
+    addresses memory. There is no operand traffic, no bus mastering, and busy
+    stays 0. This is the Zbkb/Zknh pattern: the instruction does the step the
+    base ISA is bad at, and the loop stays in C.
+  * 8 bytes per instruction. Two source registers carry at most 64 fresh message
+    bits, which is the most work a two-register instruction can be handed. The
+    28-cycle-class issue overhead is therefore amortised over 8 bytes, against
+    the roughly 320-480 cycles the table loop spends on them.
+  * No state operand. A CRC whose register is at most 64 bits wide is fully
+    consumed by 8 message bytes. Running it from state S over M0..M7 equals
+    running it from zero over M0..M7 with S XORed into the first bytes. So the
+    caller folds the running CRC into the first word(s) with one xor. The
+    instruction stays pure, needs no CRC register file, CSR or context-switch
+    story, and can be tested alone.
+  * Results in message byte order. For MSB-first CRCs the register's top byte
+    meets the next message byte. A natural-order result would force a byte swap
+    in software for every chunk. RV32IM has no rev8, so that would be about 10
+    instructions with 8-24-bit shifts at 4-9 cycles each. crcccitt.f8 and
+    crc64.f8h/l return the register byte-reversed, which is free wiring in
+    hardware. The software state is then directly XOR-able into the next lw.
+    The one byte swap happens once per call, in the epilogue.
+  * One opcode per polynomial, not a polynomial operand. rs2 is needed for data,
+    and a polynomial CSR would add architectural state. The fixed polynomials are
+    a 7-entry constant ROM in front of one shared engine.
+  * CRC-64 as a pair (crc64.f8h, crc64.f8l). One rd cannot hold a 64-bit result.
+    Each half recomputes the full 64-step pass from the same two inputs, so the
+    pair costs two engine passes. Latching the low half in a hidden register
+    would save one pass, but it adds undeclared state between instructions, so
+    it was rejected.
+  * CRC-SICK is not a byte-aligned CRC. The register shifts only one bit per
+    byte, so a byte never consumes the state, and the fold does not apply. The
+    24-bit state (crc plus previous byte) therefore threads through rs1 -> rd, and
+    rs2 carries four message bytes.
+
+  Reference datapath, informative. One shift-register engine in red_accel has a
+  64-bit register, a 64-bit message shifter and 8 unrolled steps. Each step is a
+  shift plus an AND-XOR with the selected polynomial. Width, direction and
+  polynomial are selected by funct3/funct7, and reflected/MSB-first conversion is
+  input/output bit and byte wiring. The engine advances 8 message bits per cycle:
+  8 cycles for a .f8 instruction, and 1 cycle for crcsick.w (four 1-bit steps).
+  The cost is about 140 flops plus about 8x64 AND/XOR. It has no multiplier, so
+  fast_mul is not duplicated, and no buffers. Every instruction has a fixed
+  latency independent of operand values. The unit asserts pcpi_wait on accept,
+  raises pcpi_ready+pcpi_wr with the result, then waits for pcpi_valid to drop
+  (S_WAIT). It never asserts busy, so the bus mux stays on the CPU. The C models
+  are written with one loop pass per engine cycle.
+
+  Software use per aligned 8-byte chunk: lw, lw, xor (two for CRC-64), the
+  instruction (or the f8h/f8l pair), addi, bne. That is about 25 base cycles
+  plus the instruction. Head and tail: lw needs 4-byte alignment, because
+  misaligned loads trap with CATCH_MISALIGN=1. The caller therefore runs the
+  existing table loop on the first (-p)&3 bytes and on the trailing bytes that
+  do not fill a chunk. For the profiled 16384-byte static buffer that is 0 bytes
+  of each. marshal_words is 0 for every instruction because the operands are the
+  application's own words, loaded in place.
+
+  S2c: critic rounds.
+  * Ambiguity: byte order (Mi = bits 8i+7..8i of its register), bit order within
+    a byte (LSB-first for reflected, MSB-first otherwise) and output byte order
+    are all stated in the pseudocode. Upper output bits are defined as 0.
+  * Totality: every input is legal. Bits 31..24 of crcsick.w's rs1 are ignored.
+    Nothing traps.
+  * Collisions: all eight sit in custom-1 (0101011) with distinct
+    (funct3, funct7) pairs. custom-0 is avoided, although it is free in this
+    build (ENABLE_IRQ=0): earlier reviews objected to it because of PicoRV32's
+    IRQ ops, and red_accel decodes the opcode itself, so custom-1 reaches it
+    unchanged. Nothing is in OP/funct7=0000001, so there is no clash with
+    fast_mul or div in the PCPI result mux.
+  * Unassigned custom-1 encodings get no answer from red_accel, so they time out
+    and trap as illegal instructions. The baseline build (ENABLE_ACCEL=0) traps
+    on all of them, so the baseline binary uses only the table code.
+register_files: []
+state_note: 'No architectural state. Every instruction is a pure function of x[rs1] and x[rs2] that writes only x[rd], so there is nothing to save across a context switch or trap. The running CRC lives in an ordinary integer register owned by the caller. No instruction accesses memory, raises an exception or depends on any CSR. rd may equal rs1 or rs2, because both sources are read before rd is written, and rd = x0 discards the result. Latency is fixed per instruction and independent of operand values. red_accel decodes pcpi_insn[6:0] = 0101011 with the exact funct3/funct7 listed and ignores the rd/rs fields for decode. It stays silent on every other encoding: the unassigned custom-1 points, custom-0, and OP/funct7=0000001 (MUL/DIV). It never asserts busy. This decode replaces the micro-ecc custom-0 decode in the current rtl/red_accel.v.'
+tests:
+- 'link1: coverage 85.53% >= 80%; 8/8 C models built and survived 100,000 vectors under ASan+UBSan'
+- 'gate2: 8/8 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+version: 1.0.0

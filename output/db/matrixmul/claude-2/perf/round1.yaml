@@ -1,0 +1,33 @@
+app_speedup: 1.711264835072478
+covered_share: 0.68310178147337
+detail: |-
+  covers 68.3% of profiled cycles; predicted whole-application speedup 1.71x
+    xfmac.s: 31 cyc (0 beats, 1 MAC, 0.25 MAC/word, x682 per call) vs 87 cyc of software = 2.81x
+    xfmacr.s: 31 cyc (0 beats, 1 MAC, 0.25 MAC/word, x69 per call) vs 862 cyc of software = 27.80x
+measurement_error: ''
+per_instruction:
+- beats: 0
+  cycles: 31.0
+  invocations: 682
+  mac_ops: 1
+  marshal_cycles: 0.0
+  mnemonic: xfmac.s
+  note: ''
+  replaced_cycles: 87.18382729142229
+  replaces: multiply::ijk_matmul
+  speedup: 2.812381525529751
+  unverified: ''
+  words: 2
+- beats: 0
+  cycles: 31.0
+  invocations: 69
+  mac_ops: 1
+  marshal_cycles: 0.0
+  mnemonic: xfmacr.s
+  note: ''
+  replaced_cycles: 861.7300030833334
+  replaces: multiply::ijk_matmul
+  speedup: 27.79774203494624
+  unverified: ''
+  words: 2
+unverified: []

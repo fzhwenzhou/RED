@@ -64,3 +64,25 @@ You have ${MAX_ROUNDS} rounds. Spend the first one reading, not guessing.
 ## Current status
 
 ${STATUS}
+
+## Your tools are the only tools
+
+This turn runs with a **sealed tool surface**: the MCP tools listed for you
+and nothing else. There is no shell, no `Bash`, no filesystem access, no
+network. A call to a tool outside the list is denied, and the denial costs
+you one of a finite number of turns — an agent that keeps retrying a denied
+shell command spends its whole budget and the turn ends with
+`error_max_turns`, having produced nothing. Two micro-ecc runs were lost
+exactly that way.
+
+To read the sources, use the tools you have:
+
+- `list_sources` — every project and core file you may open.
+- `grep_source(pattern, path="", context=2)` — regular-expression search
+  across those files, returning `path:line: text` with surrounding lines.
+  **This is what to reach for instead of a shell.** The interesting files are
+  large; searching one for `uECC_vli_mult` beats reading four thousand lines.
+- `read_source(path)` — the whole file, once you know which part you want.
+
+If something you need genuinely is not reachable through these, say so in
+your reply. Do not try to work around it.

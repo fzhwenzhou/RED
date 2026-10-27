@@ -1,0 +1,4 @@
+counterexample: null
+detail: '6/6 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+gate: gate2
+passed: true

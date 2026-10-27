@@ -225,7 +225,12 @@ __marimo__/
 # Claude Code
 .claude
 
-# RED run artifacts: output/work (driver scratch) + output/db (durable store)
+# RED run artifacts. output/db is the durable store -- the specs, gates,
+# metrics and summaries a run is kept for -- and it is tracked. output/work
+# is the driver's scratch: build trees, Spike harnesses, object files and
+# per-round intermediates, tens of megabytes per sweep, regenerable, and
+# deleted between batches by the loop itself. It is not worth versioning.
+output/work/
 # output/
 
 # Evaluation harness build products (RTL sims, firmware images, synthesis logs)

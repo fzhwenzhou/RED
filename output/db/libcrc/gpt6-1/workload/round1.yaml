@@ -1,0 +1,19 @@
+api:
+- crc_32
+- crc_64_ecma
+- main
+- call_weak_fn
+detail: 1,745,300,026 instructions, 100.0% in the project's own code, 0.00% run-to-run drift
+drift: 0.0
+dynamic_ir: 1745300026
+entry: /home/naonao/RED/output/work/libcrc/20261026-022303-943b21/workload/r1/_red_workload.c
+exit_code: 0
+name: ''
+passes_gate0: true
+project: /home/naonao/RED/target_project/libcrc
+project_ir: 1745162294
+project_share: 0.999921084055493
+rationale: ''
+runs:
+- 1745300026
+- 1745300026

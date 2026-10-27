@@ -20,7 +20,7 @@ application call it, does it return what callers need, is it faster — because
 eval/ showed a fully verified spec can still be slower than the code it
 replaces. Their findings are the loop's feedback edge back to the designer.
 
-Every artifact is persisted as typed JSON (HotLoopReport / ISASpec) and
+Every artifact is persisted as typed YAML (HotLoopReport / ISASpec) and
 mirrored to the durable DB sweep as it is produced.
 
 Everything runs on one machine. The mechanical edges are ordinary function
@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import datetime
 import io
-import json
 import os
 import re
 import sys
@@ -55,11 +54,12 @@ import time
 
 import concurrent.futures as cf
 
-from red import (cost, db_node, graph, nodes, review, security, state_def,
-                 workload as workload_mod)
+from red import (cost, db_node, graph, modelcfg, nodes, review, rsi, security,
+                 state_def, structure, workload as workload_mod)
 from red.constants import (
     COVERAGE_TARGET,
     CRITIC_MAX_ROUNDS,
+    core_source_roots,
     DB_ROOT,
     EXAMPLE_CFLAGS,
     EXAMPLE_CORE,
@@ -68,6 +68,7 @@ from red.constants import (
     EXAMPLE_WORKLOAD,
     GATE2_VECTORS,
     LINK1_VECTORS,
+    AGENT_EFFORT,
     AGENT_MAX_PARALLEL,
     AGENT_MODEL,
     LLM_PROMPTS_DIR,
@@ -86,7 +87,7 @@ from red.constants import (
     WORKLOAD_DETERMINISM,
     find_sources,
 )
-from red.backend import ClaudeCodeLLM, QueryResult
+from red.backend import QueryResult, make_router
 from red.localtool import quiet_servers
 from red.tools import DesignerTool, IssTool, SecurityTool, WorkloadTool
 
@@ -186,8 +187,32 @@ _POOL = cf.ThreadPoolExecutor(max_workers=AGENT_MAX_PARALLEL,
                               thread_name_prefix="red-agent")
 
 
+def _model_tag(llm) -> str:
+    """How the run should name the thing that produced it.
+
+    The effort level changes the output as much as the model does, and under a
+    routing file different stages run on different models, so neither "opus"
+    nor one effort level describes a run on its own. Name the default and say
+    where the rest came from; the full table is in the run log and the file is
+    on disk.
+    """
+    cfg = getattr(llm, "models", None)
+    if cfg is None:
+        return ""
+    label = cfg.fallback.label()
+    routed = [r for r in cfg.routed.values() if r != cfg.fallback]
+    if cfg.source and routed:
+        extra = ""
+        others = [b for b in cfg.backends if b != cfg.fallback.backend]
+        if others:
+            extra = f", also {'/'.join(others)}"
+        return (f"{label} + {len(routed)} stage overrides{extra} "
+                f"({cfg.source})")
+    return label
+
+
 def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
-                  log_path: str | None = None):
+                  log_path: str | None = None, role: str = ""):
     """Run one agent turn, synchronously. None-safe (used by --mechanical runs).
 
     A failed turn comes back as ``QueryResult(success=False)`` rather than an
@@ -203,9 +228,10 @@ def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
     if llm is None:
         return None
     res = None
+    _started = time.monotonic()
     for attempt in range(LLM_RATE_LIMIT_RETRIES + 1):
         try:
-            res = llm.prompt(message, tools)
+            res = llm.prompt(message, tools, role=role)
         except Exception as exc:                              # noqa: BLE001
             res = QueryResult(returncode=-1, success=False,
                               stderr=f"{type(exc).__name__}: {exc}")
@@ -220,10 +246,18 @@ def _dispatch_llm(llm, message: str, tools, tag: str = "agent",
               f"{LLM_RATE_LIMIT_RETRIES + 1}) — waiting {wait:.0f}s")
         time.sleep(wait)
     _record(res, tag, log_path)
+    # Every agent turn in the run passes through here, so this is the one
+    # place that can say what a run cost. red.rsi reads it to decide whether
+    # a change to the prompts made the next run cheaper.
+    rsi.record_turn(tag=tag, role=role, model=_model_tag(llm),
+                    seconds=time.monotonic() - _started,
+                    ok=bool(res and res.success),
+                    reply_chars=len((res.result or "") if res else ""))
     return res
 
 
-def _dispatch_async(llm, message: str, tag: str = "agent", tools=()):
+def _dispatch_async(llm, message: str, tag: str = "agent", tools=(),
+                    role: str = ""):
     """Start an agent turn without waiting for it.
 
     Used wherever turns are independent: the four reviewers (toolless — their
@@ -235,7 +269,7 @@ def _dispatch_async(llm, message: str, tag: str = "agent", tools=()):
     """
     if llm is None:
         return None
-    return _POOL.submit(_dispatch_llm, llm, message, tools, tag, None)
+    return _POOL.submit(_dispatch_llm, llm, message, tools, tag, None, role)
 
 
 def _resolve(fut, tag: str, log_path: str | None = None):
@@ -291,7 +325,8 @@ def _dispatch_iss(llm, iss_tools, log_path: str, tag: str):
         READ_KNOWLEDGE=itm.get("read_knowledge", ""))
     previous, llm.system_message = llm.system_message, ""
     try:
-        return _dispatch_llm(llm, message, iss_tools, tag=tag, log_path=log_path)
+        return _dispatch_llm(llm, message, iss_tools, tag=tag, role="iss",
+                             log_path=log_path)
     finally:
         llm.system_message = previous
 
@@ -310,11 +345,11 @@ def _parse_core_profile(core: str, res) -> state_def.CoreProfile | None:
     start, end = text.find("{"), text.rfind("}")
     if start >= 0 and end > start:
         try:
-            profile = state_def.from_json(text[start:end + 1], state_def.CoreProfile)
+            profile = state_def.from_yaml(text[start:end + 1], state_def.CoreProfile)
             profile.name = profile.name or name
             state_def.validate_core_profile(profile)
             return profile
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             print(f"[red] A0: unusable core profile ({exc}); "
                   "the designer will work without it")
     return None
@@ -323,8 +358,8 @@ def _parse_core_profile(core: str, res) -> state_def.CoreProfile | None:
 def _read_artifact(path: str, cls, fallback=None):
     if os.path.exists(path):
         try:
-            return state_def.from_json(open(path).read(), cls)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            return state_def.from_yaml(open(path).read(), cls)
+        except (TypeError, ValueError):
             pass
     return fallback
 
@@ -339,8 +374,8 @@ def _read_findings(path: str) -> list:
         return []
     try:
         with open(path) as f:
-            items = json.load(f)
-    except (json.JSONDecodeError, OSError):
+            items = state_def.loads(f.read())
+    except (ValueError, OSError):
         return []
     out = []
     for it in items if isinstance(items, list) else []:
@@ -369,10 +404,10 @@ def _spec_digest(spec: state_def.ISASpec) -> str:
     return "\n".join(lines)
 
 
-def _write_json(path: str, obj) -> None:
+def _write_artifact(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
-        f.write(state_def.to_json(obj))
+        f.write(state_def.to_yaml(obj))
 
 
 # ---------------------------------------------------------------------------
@@ -533,10 +568,10 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
     for d in (profile_dir, llm_logs_dir):
         os.makedirs(d, exist_ok=True)
 
-    core_path = os.path.join(work_root, "CoreProfile.json")
-    profile_path = os.path.join(work_root, "profile.json")
-    report_path = os.path.join(work_root, "HotLoopReport.json")
-    spec_path = os.path.join(work_root, "ISASpec.json")
+    core_path = os.path.join(work_root, "CoreProfile.yaml")
+    profile_path = os.path.join(work_root, "profile.yaml")
+    report_path = os.path.join(work_root, "HotLoopReport.yaml")
+    spec_path = os.path.join(work_root, "ISASpec.yaml")
     status_path = os.path.join(work_root, "status.md")
     knowledge_path = os.path.join(work_root, "knowledge.md")
     sentinel_path = os.path.join(work_root, "finished")
@@ -549,7 +584,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # (see red/tools.py). The split that does exist is by what an agent is
         # allowed to see, not by artifact.
         tools = [DesignerTool(
-            name=f"red_dsn_{tag}", source_roots=[project, core],
+            name=f"red_dsn_{tag}",
+            source_roots=[project, *core_source_roots(core)],
             profile_path=profile_path, report_path=report_path,
             spec_path=spec_path, status_path=status_path,
             knowledge_path=knowledge_path, sentinel_path=sentinel_path,
@@ -582,8 +618,11 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
     # recorded from its first stage; every call is a no-op when Neo4j is not
     # running, so a design run never depends on it.
     run_started = time.monotonic()
+    # Per-run telemetry: a batch runs several projects in one process,
+    # so the turn log has to start empty for each.
+    rsi.reset_turns()
     graph.start_run(workload, run_id, project, core,
-                    model=(getattr(llm, "model", "") or "claude-code"),
+                    model=_model_tag(llm) or "claude-code",
                     harness=harness, cflags=cflags)
 
     gate0, gate1, gate2 = None, None, None
@@ -638,7 +677,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                                 if workload_spec else
                                 "Nothing has been measured yet — this is the "
                                 "first round.")),
-                        wl_tools, tag=f"AW workload {round_}",
+                        wl_tools, tag=f"AW workload {round_}", role="workload",
                         log_path=transcript_path)
                 finally:
                     llm.system_message = designer_charter
@@ -650,12 +689,12 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 raw = nodes.workload_check(
                     project, harness_source,
                     os.path.join(wl_dir, f"r{round_}"), cflags, exclude)
-                workload_spec = state_def.from_json(raw, state_def.WorkloadSpec)
+                workload_spec = state_def.from_yaml(raw, state_def.WorkloadSpec)
                 gate0 = nodes.gate0(raw)
                 with open(wl_status, "w") as f:
                     f.write(workload_mod.render(workload_spec))
-                _mirror(f"workload/round{round_}.json",
-                        state_def.to_json(workload_spec))
+                _mirror(f"workload/round{round_}.yaml",
+                        state_def.to_yaml(workload_spec))
                 _mirror(f"workload/round{round_}.md",
                         workload_mod.render(workload_spec))
                 print(f"[{run_id}] Gate 0 round {round_}: "
@@ -681,7 +720,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
             for t in wl_tools:
                 t.stop()
             wl_tools.clear()
-            _mirror("gates/gate0.json", state_def.to_json(gate0))
+            _mirror("gates/gate0.yaml", state_def.to_yaml(gate0))
             if not gate0.passed:
                 # Profiling an unrepresentative workload does not produce a
                 # worse extension, it produces a meaningless one: the mined
@@ -705,13 +744,13 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     project, workload, os.path.join(profile_dir, f"run{i}"),
                     cflags, harness, exclude, synthesized),
                 (1, 2)))
-        _write_json(profile_path, prof1)
-        _mirror("profile.json", state_def.to_json(prof1))
+        _write_artifact(profile_path, prof1)
+        _mirror("profile.yaml", state_def.to_yaml(prof1))
 
         total_a = sum(v for k, v in prof1.get("cycle_counts", {}).items() if k != "__total__")
         total_b = sum(v for k, v in prof2.get("cycle_counts", {}).items() if k != "__total__")
         gate1 = nodes.gate1(total_a, total_b)
-        _mirror("gates/gate1.json", state_def.to_json(gate1))
+        _mirror("gates/gate1.yaml", state_def.to_yaml(gate1))
 
         # ---------------- A0 core analysis, alongside A1 mining -------------
         # A2 used to design for an abstract RISC-V: it specified memory-operand
@@ -726,16 +765,18 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         core_msg = _load_prompt(
             "core.md",
             LIST_SOURCES=tm.get("list_sources", ""), READ_SOURCE=tm.get("read_source", ""))
-        mine_ref = _dispatch_async(llm, mine_msg, "A1 mining", tools)
-        core_ref = _dispatch_async(llm, core_msg, "A0 core analysis", tools)
+        mine_ref = _dispatch_async(llm, mine_msg, "A1 mining", tools,
+                                   role="mine")
+        core_ref = _dispatch_async(llm, core_msg, "A0 core analysis", tools,
+                                   role="core")
         _resolve(mine_ref, "A1 mining", transcript_path)
         core_res = _resolve(core_ref, "A0 core analysis", transcript_path)
 
         core_profile = _parse_core_profile(core, core_res)
         graph.record_core_profile(core, core_profile)
         if core_profile is not None:
-            _write_json(core_path, core_profile)
-            _mirror("CoreProfile.json", state_def.to_json(core_profile))
+            _write_artifact(core_path, core_profile)
+            _mirror("CoreProfile.yaml", state_def.to_yaml(core_profile))
             print(f"[{run_id}] A0: {core_profile.name} {core_profile.isa}, "
                   f"{core_profile.coprocessor} "
                   f"(memory access: {core_profile.coprocessor_memory_access}), "
@@ -745,8 +786,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         report = _merge_mechanical(report, prof1,
                                    source_roots=[project, core])
         report.passes_gate1 = gate1.passed
-        _write_json(report_path, report)
-        _mirror("HotLoopReport.json", state_def.to_json(report))
+        _write_artifact(report_path, report)
+        _mirror("HotLoopReport.yaml", state_def.to_yaml(report))
         graph.record_gate(workload, run_id, gate1)
         graph.record_hot_loops(workload, run_id, report)
         # Freeze it: from here on the report is the measurement A2's design is
@@ -784,7 +825,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                        "finish. Attack the current draft (ambiguity, non-totality, encoding "
                        "collisions), revise it, and call finish when clean.")
                 res = _dispatch_llm(llm, msg, tools, tag=f"A2 round {r}",
-                                    log_path=transcript_path)
+                                    role="design", log_path=transcript_path)
                 consecutive_failures = (consecutive_failures + 1
                                         if res is not None and not getattr(res, "success", True)
                                         else 0)
@@ -807,18 +848,18 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # link-1 status is the loop's to record, never the agent's to claim.
         spec.passes_link1 = False
         spec.link1_vectors = 0
-        _write_json(spec_path, spec)
-        _mirror("ISASpec.draft.json", state_def.to_json(spec))
-        report_json = state_def.to_json(report)
-        spec_json = state_def.to_json(spec)
+        _write_artifact(spec_path, spec)
+        _mirror("ISASpec.draft.yaml", state_def.to_yaml(spec))
+        report_yaml = state_def.to_yaml(report)
+        spec_yaml = state_def.to_yaml(spec)
 
         # ---------------- link 1, with a bounded agentic repair edge --------
         link1_dir = os.path.join(work_root, "link1")
 
-        def _run_link1(sjson: str) -> state_def.GateResult:
-            return nodes.link1(report_json, sjson, link1_dir)
+        def _run_link1(stext: str) -> state_def.GateResult:
+            return nodes.link1(report_yaml, stext, link1_dir)
 
-        l1 = _run_link1(spec_json)
+        l1 = _run_link1(spec_yaml)
         # A failing link 1 is a concrete counterexample (a compile error, a
         # sanitizer report, a non-pure model). Hand it back to the agent through
         # the sealed status tool and let it revise — capped, then escalate.
@@ -827,7 +868,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 break
             print(f"[{run_id}] link1 FAILED — repair round {repair}/{REPAIR_MAX_ROUNDS}")
             _publish_status(status_path, l1, f"link 1 repair round {repair}")
-            _mirror(f"gates/link1.repair{repair}.json", state_def.to_json(l1))
+            _mirror(f"gates/link1.repair{repair}.yaml", state_def.to_yaml(l1))
             iters += 1
             _dispatch_llm(llm, _load_prompt(
                 "debug.md",
@@ -838,13 +879,14 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
                 VERDICT=f"{l1.gate}: {l1.detail}",
                 COUNTEREXAMPLE=l1.counterexample or "(none)"),
-                tools, tag=f"link1 repair {repair}", log_path=transcript_path)
+                tools, tag=f"link1 repair {repair}", role="repair",
+                log_path=transcript_path)
             revised = _read_artifact(spec_path, state_def.ISASpec)
             if revised is None:
                 break
             spec = revised
-            spec_json = state_def.to_json(spec)
-            l1 = _run_link1(spec_json)
+            spec_yaml = state_def.to_yaml(spec)
+            l1 = _run_link1(spec_yaml)
 
         # ---------------- Gate 3: is it actually faster? --------------------
         # The gates above establish that an instruction means what it says.
@@ -854,11 +896,12 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # the RTL those numbers came from. A design that cannot beat the
         # software it replaces goes back to the designer with the arithmetic.
         perf = None
+        ship_bar = 0.0   # the bar gate 3 finally judged at (for metrics.yaml)
         plat = cost.Platform.from_core(core_profile)
         # A redesign is not guaranteed to be an improvement — one run went
         # 1.64x, then 0.96x, then 8.33x. Keep the best spec seen so the loop
         # never hands on a design worse than one it already had.
-        best_spec_json, best_perf = None, None
+        best_spec_yaml, best_perf = None, None
         # Which Gate 3 round the loop actually reached. The shipped re-price is
         # judged at the bar that was in force then, not at the most relaxed bar
         # the schedule would ever have offered — otherwise the final check is
@@ -872,7 +915,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 # 512-iteration reduction.
                 measured = cost.measure_ops(spec, os.path.join(work_root, "gate3"))
                 perf = cost.estimate(spec, report, core_profile, measured)
-                _mirror(f"perf/round{round_}.json", state_def.to_json(perf))
+                _mirror(f"perf/round{round_}.yaml", state_def.to_yaml(perf))
                 graph.record_spec(workload, run_id, spec, stage=f"gate3.{round_}")
                 graph.record_perf(workload, run_id, perf, round_)
                 _mirror(f"perf/round{round_}.md",
@@ -901,20 +944,20 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                       + (f" — worse than round {round_ - 1}'s "
                          f"{best_perf.app_speedup:.2f}x" if regressed else ""))
                 if best_perf is None or perf.app_speedup > best_perf.app_speedup:
-                    best_spec_json, best_perf = spec_json, perf
+                    best_spec_yaml, best_perf = spec_yaml, perf
                 if perf.meets_target(bar):
                     break
                 if round_ == PERF_MAX_ROUNDS:
                     # Hand on the best design, not the most recent one.
-                    if best_spec_json is not None and best_perf is not perf:
+                    if best_spec_yaml is not None and best_perf is not perf:
                         print(f"[{run_id}] Gate 3 budget spent; keeping round "
                               f"{best_perf.app_speedup:.2f}x over the final "
                               f"{perf.app_speedup:.2f}x")
-                        spec = state_def.from_json(best_spec_json, state_def.ISASpec)
-                        spec_json = best_spec_json
+                        spec = state_def.from_yaml(best_spec_yaml, state_def.ISASpec)
+                        spec_yaml = best_spec_yaml
                         perf = best_perf
-                        _write_json(spec_path, spec)
-                        l1 = _run_link1(spec_json)
+                        _write_artifact(spec_path, spec)
+                        l1 = _run_link1(spec_yaml)
                     print(f"[{run_id}] Gate 3 budget spent at "
                           f"{perf.app_speedup:.2f}x — escalating")
                     break
@@ -935,14 +978,15 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                                 f"{best_perf.app_speedup:.2f}x. Reconsider it "
                                 f"rather than continuing in this direction.\n"
                                 if regressed else ""))),
-                    tools, tag=f"Gate 3 redesign {round_}", log_path=transcript_path)
+                    tools, tag=f"Gate 3 redesign {round_}", role="redesign",
+                    log_path=transcript_path)
                 revised = _read_artifact(spec_path, state_def.ISASpec)
                 if revised is None:
                     break
                 spec = revised
-                spec_json = state_def.to_json(spec)
-                l1 = _run_link1(spec_json)
-                _mirror(f"gates/link1.perf{round_}.json", state_def.to_json(l1))
+                spec_yaml = state_def.to_yaml(spec)
+                l1 = _run_link1(spec_yaml)
+                _mirror(f"gates/link1.perf{round_}.yaml", state_def.to_yaml(l1))
             final_bar, final_why = (
                 cost.target_for(min(round_, PERF_MAX_ROUNDS), perf.covered_share)
                 if perf else (SPEEDUP_TARGET, ""))
@@ -955,7 +999,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         if perf else "not run"),
                 counterexample=None if (perf and perf.meets_target(final_bar))
                 else (perf.detail if perf else None))
-            _mirror("gates/gate3.json", state_def.to_json(gate3))
+            _mirror("gates/gate3.yaml", state_def.to_yaml(gate3))
 
         # ---------------- Gate 4: is it safe to build into the machine? -----
         # The gates above ask whether the extension means what it says and
@@ -977,18 +1021,18 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         sec_report, gate4 = None, None
         sec_dir = os.path.join(work_root, "security")
         security_md = os.path.join(sec_dir, "report.md")
-        agent_findings_path = os.path.join(sec_dir, "agent_findings.json")
-        core_json = state_def.to_json(core_profile) if core_profile else ""
+        agent_findings_path = os.path.join(sec_dir, "agent_findings.yaml")
+        core_yaml = state_def.to_yaml(core_profile) if core_profile else ""
         os.makedirs(sec_dir, exist_ok=True)
         security_revisions = 0
 
-        def _scan(sjson: str, where: str) -> state_def.SecurityReport:
-            raw = nodes.security_scan(sjson, core_json, where)
-            return state_def.from_json(raw, state_def.SecurityReport)
+        def _scan(stext: str, where: str) -> state_def.SecurityReport:
+            raw = nodes.security_scan(stext, core_yaml, where)
+            return state_def.from_yaml(raw, state_def.SecurityReport)
 
         if llm is not None:
             for round_ in range(1, SECURITY_MAX_ROUNDS + 1):
-                sec_report = _scan(spec_json,
+                sec_report = _scan(spec_yaml,
                                    os.path.join(sec_dir, f"round{round_}"))
                 with open(security_md, "w") as f:
                     f.write(security.render(sec_report))
@@ -1018,15 +1062,15 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         PROBE_VECTOR=stm.get("probe_vector", ""),
                         REPORT_FINDINGS=stm.get("report_findings", ""),
                         MAX_PROBES=str(SECURITY_MAX_PROBES)),
-                        sec_tools, tag=f"security agent {round_}",
+                        sec_tools, tag=f"security agent {round_}", role="security",
                         log_path=transcript_path)
                 finally:
                     llm.system_message = designer_charter
                 sec_report = security.merge(sec_report,
                                             _read_findings(agent_findings_path))
                 gate4 = security.verdict(sec_report)
-                _mirror(f"security/round{round_}.json",
-                        state_def.to_json(sec_report))
+                _mirror(f"security/round{round_}.yaml",
+                        state_def.to_yaml(sec_report))
                 _mirror(f"security/round{round_}.md", security.render(sec_report))
                 graph.record_security(workload, run_id, sec_report, round_)
                 n_hard = len(sec_report.mechanical_blocking())
@@ -1057,18 +1101,18 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
                     FINISH=tm.get("finish", ""),
                     FINDINGS=security.render(sec_report)),
-                    tools, tag=f"security revision {round_}",
+                    tools, tag=f"security revision {round_}", role="security_repair",
                     log_path=transcript_path)
                 revised = _read_artifact(spec_path, state_def.ISASpec)
                 if revised is None:
                     break
                 spec = revised
-                spec_json = state_def.to_json(spec)
+                spec_yaml = state_def.to_yaml(spec)
                 # The models changed, so their meaning has to be re-established
                 # before anything downstream trusts them again.
-                l1 = _run_link1(spec_json)
-                _mirror(f"gates/link1.security{round_}.json",
-                        state_def.to_json(l1))
+                l1 = _run_link1(spec_yaml)
+                _mirror(f"gates/link1.security{round_}.yaml",
+                        state_def.to_yaml(l1))
 
             # A branch-free rewrite is not free: it changes what the model
             # executes, and Gate 3 priced the model it was given. Re-price the
@@ -1085,7 +1129,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                             f"{SPEEDUP_TARGET:.2f}x, re-priced after "
                             f"{security_revisions} security revision(s))"),
                     counterexample=None if perf.meets_target() else perf.detail)
-                _mirror("gates/gate3.json", state_def.to_json(gate3))
+                _mirror("gates/gate3.yaml", state_def.to_yaml(gate3))
                 graph.record_perf(workload, run_id, perf, PERF_MAX_ROUNDS + 1)
                 print(f"[{run_id}] Gate 3 re-priced after security: "
                       f"{perf.app_speedup:.2f}x")
@@ -1105,7 +1149,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # regression because it handed on the *latest* spec instead of the best
         # one. Ranked by blocking findings first, then link 1, then total
         # findings -- never by anything the designer asserts about itself.
-        best_review = None       # (rank, spec_json, review_report, l1)
+        best_review = None       # (rank, spec_yaml, review_report, l1)
         if llm is not None:
             for round_ in range(1, REVIEW_MAX_ROUNDS + 1):
                 # Clear the A2 charter first: a reviewer told it is the designer
@@ -1115,14 +1159,32 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 designer_charter, llm.system_message = llm.system_message, ""
                 try:
                     review_report = review.review_spec(
-                        llm, spec_json, report_json, core,
-                        dispatch=lambda msg, tag_: _dispatch_async(llm, msg, tag_),
+                        llm, spec_yaml, report_yaml, core,
+                        dispatch=lambda msg, tag_: _dispatch_async(
+                            llm, msg, tag_, role="review"),
                         core_profile=core_profile, prior=review_report,
                         perf=perf, security=sec_report)
                 finally:
                     llm.system_message = designer_charter
-                _mirror(f"review/round{round_}.json",
-                        state_def.to_json(review_report))
+                # The structural check runs on the same spec the reviewers
+                # saw and merges into their report, so the revise round acts
+                # on it the same way. It is mechanical: it measures operand
+                # blocks and declared state rather than judging taste, which
+                # is why its blocking findings are not negotiable the way a
+                # reviewer's opinion is.
+                struct = structure.check(spec, core_profile)
+                if struct:
+                    review_report.findings.extend(struct)
+                    if structure.REVIEWER not in review_report.reviewers:
+                        review_report.reviewers.append(structure.REVIEWER)
+                    order = {"blocking": 0, "major": 1, "minor": 2}
+                    review_report.findings.sort(
+                        key=lambda f: order.get(f.severity, 3))
+                print(f"[{run_id}] structure: {structure.summary(spec)}"
+                      + (f" — {sum(1 for f in struct if f.severity == 'blocking')} "
+                         f"blocking, {len(struct)} finding(s)" if struct else " — clean"))
+                _mirror(f"review/round{round_}.yaml",
+                        state_def.to_yaml(review_report))
                 graph.record_spec(workload, run_id, spec, stage=f"review.{round_}")
                 graph.record_review(workload, run_id, review_report, round_)
                 _mirror(f"review/round{round_}.md", review.render(review_report))
@@ -1150,7 +1212,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                       + (f" — worse than the best so far "
                          f"({best_review[2].blocking()} blocking)" if regressed else ""))
                 if best_review is None or rank < best_review[0]:
-                    best_review = (rank, spec_json, review_report, l1,
+                    best_review = (rank, spec_yaml, review_report, l1,
                                    round_perf)
                 # Clearing the findings is not the goal; shipping something
                 # worth building is. A revision that answers every reviewer by
@@ -1176,12 +1238,12 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         print(f"[{run_id}] review budget spent; keeping the round "
                               f"with {best_review[2].blocking()} blocking finding(s) "
                               f"over the final {n_block}")
-                        spec_json = best_review[1]
-                        spec = state_def.from_json(spec_json, state_def.ISASpec)
+                        spec_yaml = best_review[1]
+                        spec = state_def.from_yaml(spec_yaml, state_def.ISASpec)
                         review_report = best_review[2]
-                        _write_json(spec_path, spec)
-                        l1 = _run_link1(spec_json)
-                        _mirror("gates/link1.review_best.json", state_def.to_json(l1))
+                        _write_artifact(spec_path, spec)
+                        l1 = _run_link1(spec_yaml)
+                        _mirror("gates/link1.review_best.yaml", state_def.to_yaml(l1))
                         n_block = review_report.blocking()
                     print(f"[{run_id}] review budget spent with {n_block} "
                           "blocking finding(s) outstanding — escalating to the "
@@ -1223,16 +1285,17 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                                  f"Make the smallest change that answers the "
                                  f"findings above and change nothing else.\n"
                                  if regressed and best_review else ""))),
-                    tools, tag=f"designer revision {round_}", log_path=transcript_path)
+                    tools, tag=f"designer revision {round_}", role="revise",
+                    log_path=transcript_path)
                 revised = _read_artifact(spec_path, state_def.ISASpec)
                 if revised is None:
                     break
                 spec = revised
-                spec_json = state_def.to_json(spec)
+                spec_yaml = state_def.to_yaml(spec)
                 # The spec changed under it, so link 1 must be re-established
                 # before the revised models can be trusted.
-                l1 = _run_link1(spec_json)
-                _mirror(f"gates/link1.review{round_}.json", state_def.to_json(l1))
+                l1 = _run_link1(spec_yaml)
+                _mirror(f"gates/link1.review{round_}.yaml", state_def.to_yaml(l1))
 
         # ---------------- Gate 2: the ISS implementer, then the diff --------
         gate2_dir = os.path.join(work_root, "gate2")
@@ -1243,8 +1306,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 name=f"red_iss_{tag}", spec_path=spec_path,
                 status_path=status_path, knowledge_path=knowledge_path))
 
-        def _run_gate2(sjson: str) -> state_def.GateResult:
-            return nodes.gate2(sjson, gate2_dir)
+        def _run_gate2(stext: str) -> state_def.GateResult:
+            return nodes.gate2(stext, gate2_dir)
 
         gate2 = None
         for attempt in range(REPAIR_MAX_ROUNDS + 1):
@@ -1257,15 +1320,15 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                     f"ISS implementer (attempt {attempt + 1})") is None:
                 break
             spec = _read_artifact(spec_path, state_def.ISASpec) or spec
-            spec_json = state_def.to_json(spec)
-            gate2 = _run_gate2(spec_json)
+            spec_yaml = state_def.to_yaml(spec)
+            gate2 = _run_gate2(spec_yaml)
             if gate2.passed or llm is None or attempt == REPAIR_MAX_ROUNDS:
                 break
             # A divergence means the two implementers read the same words
             # differently: the spec was ambiguous. Send it back to be sharpened.
             print(f"[{run_id}] gate2 FAILED — repair round "
                   f"{attempt + 1}/{REPAIR_MAX_ROUNDS}: {gate2.detail}")
-            _mirror(f"gates/gate2.repair{attempt + 1}.json", state_def.to_json(gate2))
+            _mirror(f"gates/gate2.repair{attempt + 1}.yaml", state_def.to_yaml(gate2))
             _publish_status(status_path, gate2)
             iters += 1
             _dispatch_llm(llm, _load_prompt(
@@ -1277,21 +1340,21 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                 APPEND_KNOWLEDGE=tm.get("append_knowledge", ""),
                 VERDICT=f"{gate2.gate}: {gate2.detail}",
                 COUNTEREXAMPLE=gate2.counterexample or "(none)"),
-                tools, tag=f"gate2 repair {attempt + 1}")
+                tools, tag=f"gate2 repair {attempt + 1}", role="repair")
             spec = _read_artifact(spec_path, state_def.ISASpec) or spec
             # The spec changed, so the previous Spike models are stale — the
             # next round re-implements them from the revised wording.
             for ins in spec.instructions:
                 ins.spike_model = ""
-            _write_json(spec_path, spec)
+            _write_artifact(spec_path, spec)
 
         if gate2 is None:
-            gate2 = _run_gate2(state_def.to_json(spec))
-        l2 = nodes.link2(state_def.to_json(gate2))
-        _mirror("gates/gate2.json", state_def.to_json(gate2))
+            gate2 = _run_gate2(state_def.to_yaml(spec))
+        l2 = nodes.link2(state_def.to_yaml(gate2))
+        _mirror("gates/gate2.yaml", state_def.to_yaml(gate2))
 
         chain = [l1, l2]
-        _mirror("gates/chain.json", state_def.to_json(chain))
+        _mirror("gates/chain.yaml", state_def.to_yaml(chain))
 
         # ---------------- finalize the ISASpec (RED's deliverable) ----------
         spec = _read_artifact(spec_path, state_def.ISASpec) or spec
@@ -1303,8 +1366,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         spec.tests = [f"link1: {l1.detail}", f"gate2: {gate2.detail}"] + (
             [f"counterexample: {l1.counterexample}"] if l1.counterexample else []) + (
             [f"counterexample: {gate2.counterexample}"] if gate2.counterexample else [])
-        _write_json(spec_path, spec)
-        _mirror("ISASpec.json", state_def.to_json(spec))
+        _write_artifact(spec_path, spec)
+        _mirror("ISASpec.yaml", state_def.to_yaml(spec))
 
         # Gate 4, on the spec that actually ships. The review may have revised
         # the design after the security stage passed it, and a revision made for
@@ -1315,7 +1378,7 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
         # a compile and a few hundred vectors per model, and what it is guarding
         # is the only version anyone will ever build.
         if llm is not None:
-            final_sec = _scan(state_def.to_json(spec),
+            final_sec = _scan(state_def.to_yaml(spec),
                               os.path.join(sec_dir, "final"))
             # Carry the agent's advisory findings across before the verdict is
             # taken: they cannot change pass or fail, but the verdict's one-line
@@ -1359,19 +1422,20 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         FINISH=tm.get("finish", ""),
                         FINDINGS=security.render(final_sec)),
                         tools, tag=f"final security repair {fix_round}",
+                        role="security_repair",
                         log_path=transcript_path)
                     revised = _read_artifact(spec_path, state_def.ISASpec)
                     if revised is None:
                         break
                     spec = revised
-                    spec_json = state_def.to_json(spec)
+                    spec_yaml = state_def.to_yaml(spec)
                     # The models changed under every downstream verdict, so
                     # re-establish them rather than shipping a spec whose
                     # link 1 and Gate 2 describe the previous version.
-                    l1 = _run_link1(spec_json)
-                    _mirror(f"gates/link1.finalsec{fix_round}.json",
-                            state_def.to_json(l1))
-                    final_sec = _scan(spec_json,
+                    l1 = _run_link1(spec_yaml)
+                    _mirror(f"gates/link1.finalsec{fix_round}.yaml",
+                            state_def.to_yaml(l1))
+                    final_sec = _scan(spec_yaml,
                                       os.path.join(sec_dir, f"final{fix_round}"))
                     gate4 = security.verdict(final_sec)
                     print(f"[{run_id}] final security repair {fix_round}: "
@@ -1381,25 +1445,25 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         # the shipped spec's verdict is about the shipped spec.
                         for ins in spec.instructions:
                             ins.spike_model = ""
-                        _write_json(spec_path, spec)
+                        _write_artifact(spec_path, spec)
                         if _dispatch_iss(llm, iss_tools, transcript_path,
                                          "ISS implementer (after security repair)"):
                             spec = _read_artifact(spec_path,
                                                   state_def.ISASpec) or spec
-                            spec_json = state_def.to_json(spec)
-                            gate2 = _run_gate2(spec_json)
-                            l2 = nodes.link2(state_def.to_json(gate2))
+                            spec_yaml = state_def.to_yaml(spec)
+                            gate2 = _run_gate2(spec_yaml)
+                            l2 = nodes.link2(state_def.to_yaml(gate2))
                             chain = [l1, l2]
-                            _mirror("gates/gate2.json", state_def.to_json(gate2))
-                            _mirror("gates/chain.json", state_def.to_json(chain))
+                            _mirror("gates/gate2.yaml", state_def.to_yaml(gate2))
+                            _mirror("gates/chain.yaml", state_def.to_yaml(chain))
                             print(f"[{run_id}] Gate 2 re-verified after the "
                                   f"security repair: "
                                   f"{'PASS' if gate2.passed else 'FAIL'}")
                         break
             sec_report = final_sec
-            _mirror("security/final.json", state_def.to_json(sec_report))
+            _mirror("security/final.yaml", state_def.to_yaml(sec_report))
             _mirror("security/final.md", security.render(sec_report))
-            _mirror("gates/gate4.json", state_def.to_json(gate4))
+            _mirror("gates/gate4.yaml", state_def.to_yaml(gate4))
             graph.record_security(workload, run_id, sec_report, 0)
 
         # Gate 3, on the spec that actually ships. Every other gate in the loop
@@ -1439,8 +1503,8 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
                         + (f"; {ship_why}" if ship_why else "")
                         + ", priced on the shipped spec)"),
                 counterexample=None if perf.meets_target(ship_bar) else perf.detail)
-            _mirror("gates/gate3.json", state_def.to_json(gate3))
-            _mirror("perf/shipped.json", state_def.to_json(perf))
+            _mirror("gates/gate3.yaml", state_def.to_yaml(gate3))
+            _mirror("perf/shipped.yaml", state_def.to_yaml(perf))
             _mirror("perf/shipped.md", cost.render_feedback(perf, platform=plat))
             graph.record_perf(workload, run_id, perf, PERF_MAX_ROUNDS + 2)
 
@@ -1466,11 +1530,52 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
             wallclock=time.monotonic() - run_started, blocking=blocking,
             speedup=(perf.app_speedup if perf else 0.0))
 
+        # What this run cost and what it produced, for red.rsi. The round
+        # counts are read back from the artifacts the loop mirrored rather
+        # than threaded through every stage: the artifacts are written as
+        # each round finishes, so a count taken from them is a count of
+        # rounds that actually happened.
+        def _rounds(sub: str, stem: str = "round") -> int:
+            d = os.path.join(work_root, sub)
+            if not os.path.isdir(d):
+                return 0
+            return sum(1 for n in os.listdir(d)
+                       if n.startswith(stem) and n.endswith(".yaml"))
+
+        gates_seen = [g for g in (gate0, gate1, gate2, gate3, gate4)
+                      if g is not None]
+        metrics = rsi.collect_turn_metrics(rsi.RunMetrics(
+            workload=workload, run_id=run_id,
+            started=datetime.datetime.now().astimezone().isoformat(
+                timespec="seconds"),
+            model_label=_model_tag(llm),
+            frozen_fingerprint=rsi.frozen_fingerprint(_REPO_ROOT),
+            converged=converged,
+            gates_passed=sum(1 for g in gates_seen if g.passed),
+            gates_total=len(gates_seen),
+            coverage=float(report.coverage if report else 0.0),
+            predicted_speedup=float(perf.app_speedup if perf else 0.0),
+            speedup_bar=float(ship_bar or 0.0),
+            blocking_findings=blocking,
+            structure_blocking=sum(
+                1 for f in (review_report.findings if review_report else [])
+                if f.reviewer == structure.REVIEWER and f.severity == "blocking"),
+            instructions=len(spec.instructions) if spec else 0,
+            wallclock_seconds=round(time.monotonic() - run_started, 1),
+            review_rounds=_rounds("review"),
+            redesign_rounds=_rounds("perf"),
+            repair_rounds=sum(1 for n in os.listdir(os.path.join(work_root, "gates"))
+                              if n.startswith("link1.repair")) if os.path.isdir(
+                                  os.path.join(work_root, "gates")) else 0,
+            critic_rounds=int(spec.critic_rounds or 0) if spec else 0))
+        _mirror("metrics.yaml", state_def.to_yaml(metrics))
+        print(f"[{run_id}] metrics: {metrics.summary()}")
+
         return REDResult(workload, converged, iters, gate0=gate0, gate1=gate1,
                          gate2=gate2, gate3=gate3, gate4=gate4, chain=chain,
                          report=report, spec=spec, review=review_report,
                          security=sec_report, workload_spec=workload_spec,
-                         model=getattr(llm, "model", "") or "")
+                         model=_model_tag(llm))
     finally:
         # A run that returned early or died must not sit at status='running'.
         # finish_run has already fired on the normal path; this only catches the
@@ -1497,14 +1602,24 @@ def run_red_loop(project: str, core: str, workload: str, cflags: str,
 # CLI
 # ---------------------------------------------------------------------------
 
-def _render_summary(r: REDResult, run_n: int) -> str:
+def _render_summary(r: REDResult, run_n: int, run_name: str = "") -> str:
     def mark(g):
         return "PASS" if g and g.passed else "FAIL" if g else "—"
     chain_lines = "\n".join(f"- {mark(g)} {g.gate}: {g.detail}" for g in r.chain)
     coverage = f"{r.report.coverage:.2%} ({COVERAGE_TARGET:.0%} target)" if r.report else "n/a"
     instrs = "\n".join(
-        f"  - `{i.mnemonic}` ({i.opcode}, {i.words}x32b): {i.semantics}"
+        f"  - `{i.mnemonic}` ({i.opcode}, {i.form}, {i.words}x32b, {i.group}): "
+        f"{i.semantics}"
         for i in (r.spec.instructions if r.spec else []))
+    state_lines = []
+    for rf in (r.spec.register_files if r.spec else []):
+        state_lines.append(f"  - register file `{rf.name}`: {rf.count} x "
+                           f"{rf.width_bits} bits — {rf.purpose}")
+    for csr in (r.spec.csrs if r.spec else []):
+        state_lines.append(f"  - CSR `{csr.name}` @ {csr.address} "
+                           f"({csr.access}) — {csr.purpose}")
+    state_block = ("\n".join(state_lines) + "\n") if state_lines else ""
+    shape_line = structure.summary(r.spec) if r.spec else "no spec"
     if r.review is None:
         review_line = "not run"
     elif not r.review.findings:
@@ -1537,9 +1652,11 @@ def _render_summary(r: REDResult, run_n: int) -> str:
                               f"{f_.finding}\n")
         for skipped in r.security.checks_skipped[:4]:
             security_line += f"    - NOT CHECKED — {skipped}\n"
-    return (f"# RED run_{run_n} — {r.workload}\n\n"
-            f"- backend: Claude Code"
-            + (f" (`{r.model}`)" if r.model else "") + "\n"
+    return (f"# RED {run_name or f'run_{run_n}'} — {r.workload}\n\n"
+            # The backend is whatever the routing resolved to, which since
+            # per-stage routing arrived is frequently more than one of them.
+            # Naming a fixed vendor here reported a Codex run as Claude Code.
+            f"- backend: {r.model or 'unspecified'}\n"
             f"- result: **{'converged (A1+A2)' if r.converged else 'NOT converged'}**\n"
             f"- A2 rounds: {r.iterations}\n"
             f"- Gate 0 (workload): {mark(r.gate0)} "
@@ -1557,7 +1674,9 @@ def _render_summary(r: REDResult, run_n: int) -> str:
             f"- spec review: {review_line}\n"
             f"- verification edges:\n{chain_lines}\n"
             f"- ISASpec: {r.spec.name if r.spec else 'none'} "
-            f"({len(r.spec.instructions) if r.spec else 0} instructions)\n{instrs}\n")
+            f"({len(r.spec.instructions) if r.spec else 0} instructions)\n"
+            f"- shape: {shape_line}\n"
+            f"{state_block}{instrs}\n")
 
 
 def _parse_args():
@@ -1581,6 +1700,10 @@ def _parse_args():
                         "main). They stay readable by the agents; they are just "
                         "not linked.")
     p.add_argument("--run-id", default=None)
+    p.add_argument("--run-prefix", default="run",
+                   help="name the durable run directory <prefix>-<N> instead "
+                        "of run_<N>, so a model sweep is legible on disk "
+                        "(e.g. --run-prefix opus-5.5-run)")
     p.add_argument("--work-root", default=None)
     p.add_argument("--mechanical", action="store_true",
                    help="run the mechanical edges only — profile, Gate 1, the "
@@ -1588,6 +1711,17 @@ def _parse_args():
     p.add_argument("--model", default=AGENT_MODEL,
                    help="model for the agent turns (default: whatever your "
                         "Claude Code install is configured to use)")
+    p.add_argument("--effort", default=AGENT_EFFORT,
+                   choices=["", "low", "medium", "high", "xhigh", "max"],
+                   help="how hard the model thinks per turn, for stages the "
+                        "routing file does not name")
+    p.add_argument("--backend", default=modelcfg.DEFAULT_BACKEND,
+                   choices=list(modelcfg.BACKENDS),
+                   help="agent CLI for stages the routing file does not name")
+    p.add_argument("--models-config", default=None,
+                   help="per-stage model routing (default: models.toml beside "
+                        "the repo, or RED_MODELS_CONFIG). Pass '' to disable "
+                        "it and run every stage on --model/--effort.")
     return p.parse_args()
 
 
@@ -1601,9 +1735,18 @@ def main() -> int:
     # --mechanical runs the gates with no agents at all: the profile, Gate 1
     # and the typed artifacts, so the toolchain can be checked without spending
     # anything on a model.
-    llm = None if args.mechanical else ClaudeCodeLLM(model=args.model)
+    router = make_router("" if args.models_config is None else args.models_config,
+                         model=args.model, effort=args.effort,
+                         backend=args.backend)
+    models = router.models
+    llm = None if args.mechanical else router
+    if not args.mechanical:
+        # Print the resolved table, not the file. A routing surprise is the
+        # kind of thing that is invisible in a result and obvious in a log.
+        print(models.render())
 
-    run_n, sweep_path = db_node.claim_run(args.workload, DB_ROOT)
+    run_n, sweep_path = db_node.claim_run(args.workload, DB_ROOT,
+                                          prefix=args.run_prefix)
     try:
         result = run_red_loop(args.project, args.core, args.workload, args.cflags,
                               run_id, work_root, archive_dir=sweep_path,
@@ -1614,7 +1757,8 @@ def main() -> int:
         traceback.print_exc()
         result = REDResult(args.workload, False, 0)
 
-    summary = _render_summary(result, run_n)
+    summary = _render_summary(result, run_n,
+                              os.path.basename(sweep_path))
     db_node.write_text(sweep_path, "summary.md", summary, workload=args.workload)
     print(f"\n{summary}\nartifacts -> {sweep_path}")
     _POOL.shutdown(wait=False)

@@ -22,41 +22,60 @@ application your design covers. Two consequences worth acting on:
   declaration to clear the bar. The gate checks `mac_ops` against your own C
   model and `invocations` against the profile.
 
-## The one thing that decides this
+## The two things that decide this
 
-An instruction's operand traffic is fixed by its `words`: it moves `2 x words`
-32-bit words, at 2 cycles each, plus 28 cycles of issue overhead, every single
-invocation. So the question is not "is my datapath fast" — it is **how much
-arithmetic does one invocation do for the words it moves**.
+A `block` instruction moves `2 x words` 32-bit words, at 2 cycles each, plus 28
+cycles of issue overhead, every single invocation. A `reg` or `reg_imm`
+instruction moves **none** — its operands are already in the register file —
+but still pays the 28 cycles.
 
-| design | words | MACs | cycles | MAC per word moved |
+| design | form | words | MACs | cycles |
 |---|---|---|---|---|
-| one 32x32 multiply-accumulate | 5 | 1 | 49 | 0.10 |
-| a 256-bit add | 16 | 0 | 92 | 0.00 |
-| a full 256x256 -> 512 multiply | 16 | 64 | 156 | **2.00** |
+| one 32x32 multiply-accumulate | block | 5 | 1 | 49 |
+| a 256-bit add | block | 16 | 0 | 92 |
+| a full 256x256 -> 512 multiply | block | 16 | 64 | 156 |
+| a two-register primitive | reg | 2 | 1 | 29 |
 
-The last one costs three times the first and does sixty-four times the work.
-That is the whole game. The software it replaces costs ~9,000 cycles, so it is a
-~58x win on that kernel; the first is a *loss* once the caller has marshalled
-its operands.
+So there are two ways to lose, and avoiding one is how designs fall into the
+other:
+
+- **Too wide.** The arithmetic does not bury the operand traffic, and the
+  instruction loses to the software it replaces.
+- **Too small.** The instruction replaces six base-ISA instructions, about 30
+  cycles, and the 28-cycle issue overhead eats the win.
+
+The target is the middle: an instruction that replaces an **inner loop body**,
+tens of base-ISA instructions' worth of work, with operands that either fit in
+two registers or sit in a layout the caller already has.
 
 ## What to change
 
 Do not tune the spec you have — **redesign it**.
 
-1. **Move up a level.** Find the largest unit of work in the mined loops that
-   has a small, well-defined operand block: a whole multi-word multiply, a whole
-   modular reduction, a whole squaring. Replace the *loop*, not the loop body.
-2. **Check `invocations`.** If your instruction must run 64 times per call of
-   the kernel it replaces, it pays the 28-cycle overhead 64 times. One
-   invocation per call is the target.
-3. **Drive `marshal_words` to 0.** Pick an operand layout the application
+1. **Ask first whether the operands have to be in memory at all.** If one
+   invocation consumes a couple of words and produces one, use `form: reg` and
+   the traffic disappears entirely. This is the move to try before widening
+   anything.
+2. **If it does need a block, widen the work, not the block.** Keep `words`
+   where the caller's existing layout puts it and find more arithmetic to do
+   on the words already being moved.
+3. **Check `invocations`.** If your instruction must run 64 times per call of
+   the kernel it replaces, it pays the 28-cycle overhead 64 times.
+4. **Drive `marshal_words` to 0.** Pick an operand layout the application
    already has in memory. If the caller must copy words in, that is 10 cycles
    per word before your instruction even issues.
-4. **Go where the cycles are.** Amdahl caps you at the share you cover; the
-   HotLoopReport (`${READ_REPORT}`) gives each loop's share.
-5. **Fewer, bigger instructions.** Two instructions that each replace a whole
-   hot kernel beat six that each replace an inner statement.
+5. **Go where the cycles are.** Amdahl caps you at the share you cover; the
+   HotLoopReport (`${READ_REPORT}`) gives each loop's share. Covering a second
+   hot loop with a second instruction moves the whole-application number more
+   than making one instruction faster.
+
+**Do not reach for one instruction that swallows the kernel.** A `block` wider
+than 64 words is rejected mechanically — it holds more state than the core's
+whole register file — and a wide single-instruction extension is a major
+finding whatever speedup it predicts. If the work genuinely needs persistent
+state, declare it in `register_files` and give the extension the configuration
+and load/store instructions that make it reachable, the way a real matrix
+extension does.
 
 Declare honestly, per instruction: `words`, `mac_ops` (32x32 multiplies one
 invocation performs — it must match your `c_model`), `replaces` (the `loop_id`

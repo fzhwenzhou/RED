@@ -1,0 +1,39 @@
+blocking_findings: 0
+converged: true
+coverage: 0.8552812281064902
+critic_rounds: 1
+failed_turns: 0
+frozen_fingerprint: 7975e90fb726941f
+gates_passed: 5
+gates_total: 5
+instructions: 8
+model_label: 'claude: claude-sonnet-5-5 (effort=high) + 8 stage overrides (models.toml)'
+predicted_speedup: 2.187617717963778
+redesign_rounds: 1
+rejected_drafts: 0
+repair_rounds: 0
+review_rounds: 1
+run_id: 20261026-113336-541d29
+seconds_by_role:
+  core: 152.6
+  design: 943.7
+  iss: 101.9
+  mine: 74.7
+  review: 371.3
+  security: 103.4
+  workload: 25.2
+speedup_bar: 1.8584813764778008
+started: '2026-10-26T11:58:58-04:00'
+structure_blocking: 0
+turn_seconds: 1772.73
+turns: 10
+turns_by_role:
+  core: 1
+  design: 1
+  iss: 1
+  mine: 1
+  review: 4
+  security: 1
+  workload: 1
+wallclock_seconds: 1521.6
+workload: libcrc

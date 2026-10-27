@@ -393,17 +393,17 @@ makes Gate 2's independence mechanical rather than a promise.
 Everything lands in `output/db/<workload>/run_<N>/`:
 
 ```
-CoreProfile.json        A0 — the target core as read from its RTL
-profile.json            A1 — per-function cost and call counts
-HotLoopReport.json      A1 — ranked loops, shares, coverage
-ISASpec.draft.json      A2 — before verification
-perf/round<N>.{json,md} Gate 3 — the cost arithmetic, per round
-security/round<N>.{json,md} Gate 4 — every check, what it found, what it
+CoreProfile.yaml        A0 — the target core as read from its RTL
+profile.yaml            A1 — per-function cost and call counts
+HotLoopReport.yaml      A1 — ranked loops, shares, coverage
+ISASpec.draft.yaml      A2 — before verification
+perf/round<N>.{yaml,md} Gate 3 — the cost arithmetic, per round
+security/round<N>.{yaml,md} Gate 4 — every check, what it found, what it
                         could not run, and the sub-agent's probes
-security/final.{json,md}   Gate 4 re-run on the spec that actually ships
-review/round<N>.{json,md}  the reviewers' findings, per round
+security/final.{yaml,md}   Gate 4 re-run on the spec that actually ships
+review/round<N>.{yaml,md}  the reviewers' findings, per round
 gates/                  gate1, gate3, gate4, gate2, chain, and every repair round
-ISASpec.json            the deliverable
+ISASpec.yaml            the deliverable
 llm_logs/transcript.log every agent turn, in order
 summary.md              the run, in one page
 ```
@@ -688,3 +688,30 @@ discipline that found them is the reason they are.
 - **RED's operand ABI is fixed** (`rs1` = &input block, `rs2` = &output block).
   It is what lets any instruction be harnessed mechanically, and it is also the
   constraint that makes fine-grained instructions unprofitable.
+
+---
+
+## The structural check, and self-improvement
+
+Two additions that sit outside the gate chain.
+
+**`red/structure.py`** asks whether what the loop produced is an ISA extension
+at all. A spec can pass every gate — agreement with Spike on 10^5 vectors, a
+6x predicted speedup over 99% coverage, no blocking review finding — and still
+be one opcode with a kernel behind it. matrixmul shipped exactly that: a
+single `fmmac.s` reading a 200-word block, performing a complete 5x10x10
+binary32 matrix multiply-accumulate, and writing 200 words back, with no
+declared architectural state. The check measures operand width, declared
+state and instruction count against the core's own register file and emits
+ordinary `ReviewFinding`s under the reviewer name `structure`, so the existing
+revise round acts on them. Its thresholds and their calibration are in
+[ISASPEC_FORMAT.md](ISASPEC_FORMAT.md) §9.
+
+**`red/rsi.py`** closes the loop around RED itself. Each run writes a
+`metrics.yaml` — what it cost, what it produced — and an improver agent reads
+that and proposes changes to RED's own prompts and loop knobs. The constraint
+that makes it safe is that everything which *scores* a run is frozen: the
+gates, the cost model, the security and structural checks, the schema
+validators, the thresholds, the tests, and the guard itself. A fingerprint
+over those files is checked before an apply, after the file is written, and
+again after the test suite has run. See [RSI.md](RSI.md).

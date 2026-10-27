@@ -1,0 +1,27 @@
+api:
+- crc_sick
+- crc_ccitt_1d0f
+- crc_ccitt_ffff
+- crc_xmodem
+- crc_dnp
+- crc_kermit
+- crc_16
+- crc_modbus
+- crc_32
+- crc_64_we
+- crc_64_ecma
+- crc_8
+detail: 364,004,779 instructions, 100.0% in the project's own code, 0.00% run-to-run drift
+drift: 0.0
+dynamic_ir: 364004779
+entry: /home/naonao/RED/output/work/libcrc/20261026-113336-541d29/workload/r1/_red_workload.c
+exit_code: 0
+name: ''
+passes_gate0: true
+project: /home/naonao/RED/target_project/libcrc
+project_ir: 363867027
+project_share: 0.9996215654080739
+rationale: ''
+runs:
+- 364004779
+- 364004779

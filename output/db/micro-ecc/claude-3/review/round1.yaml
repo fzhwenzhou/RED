@@ -1,0 +1,138 @@
+findings:
+- evidence: The spec says Gate 2 'sees only zeros from mac2, red, subm and str'. The C models read static volatile state that no vector seeds, so out[] is always 0 and any two implementations agree. gate2_vectors=0 and link1_vectors=0. The 'run the sequence against uECC_vli_modMult_fast' step is left to reviewers and is not a mechanical check. I hand-checked the fold coefficients (+T[j] - T[j-3] - T[j-6] + T[j-7]), the Horner digit order and the 2^288 entry bound, and they look right. A wrong carry or limb index in the RTL would still ship undetected.
+  finding: Gate 2 and link 1 can only exercise mac2, red, subm and str from reset state (FA=ACC=0), so none of the arithmetic that carries the 8.26x is checked by anything, and every instruction has an empty spike_model.
+  fix: 'Add a stateful differential test for the sequences lda;(lw,lw,mac2,red)x4;str and lda;ldr;subm;str. Run them in RTL (or Spike) against uECC_vli_modMult_fast and uECC_vli_modSub on random and corner vectors: p-1, 2^256-1, 2^128, 0, left=right, 0-1. Alternatively seed FA/ACC inputs in the Gate 2 and link 1 harness.'
+  instruction: p256.mac2
+  reviewer: implementability
+  severity: major
+- evidence: The spec's own text says Gate 2 runs each instruction alone from reset, where FA = ACC = 0. From that state, mac2 returns ACC = 0, red of 0 is 0, subm of 0 and 0 is 0, and str stores zeros. Every one of them would pass with a no-op RTL. The semantics tell the 'reviewers' to run the modMult and modSub sequences, but nothing in the loop does. The mac2 'rotate' wording versus the C model's 'drop limbs 9 and 10' is exactly the kind of RTL/model split this blind spot hides.
+  finding: Gate 2 and link 1 cannot check the four stateful instructions (mac2, red, subm, str), and spike_model is empty for every instruction, so their correctness rests on a hand-run sequence.
+  fix: Add composite checks that Gate 2 and link 1 can see. Test (a) lda, 4x(mac2, red), str against uECC_vli_modMult_fast, and (b) lda, ldr, subm, str against uECC_vli_modSub. Use the edge vectors the spec already lists, plus a seeded run of mac2 twice with no red between, which puts ACC at or above 2^288 and makes the RTL's shift behaviour visible. Give the Spike model a FA/ACC state.
+  instruction: p256.mac2
+  reviewer: callability
+  severity: major
+- evidence: 'These four instructions always return x[rd] = 0 and change only hidden state, so a test that looks at the instruction''s output can never see a wrong multiply, fold, subtract or select. The spec says as much: Gate 2 ''sees only zeros from mac2, red, subm and str'', and these are ''verified by the sequences in their semantics'', which no gate runs. All the speedup (8.26x) rests on them.'
+  finding: The arithmetic of mac2, red, subm and str is invisible to Gate 2 and to any single-instruction RTL differential test. Gate 2 runs each instruction from reset, where FA = ACC = 0. The spec also has empty spike_model fields, no tests, and gate2_vectors and link1_vectors both 0.
+  fix: Add a mandatory sequence-level differential test, run on the RTL and on the C models, before shipping. It compares lda; 4x(lw,lw,mac2,red); str against uECC_vli_modMult_fast, and lda; ldr; subm; str against uECC_vli_modSub. Use the edge vectors already listed (p-1, 2^256-1, 2^128, 0, p, K-1) plus about 10^5 random pairs, and include the aliasing cases result==left and result==right. Add a Spike model per instruction, with hidden state read out through str, so the C model and the RTL are checked against each other.
+  instruction: p256.mac2
+  reviewer: benefit
+  severity: major
+- evidence: 'The semantics and C model compute t = ACC*2^64 mod 2^352, which zero-fills the bottom and discards ACC[9..10]. The ''Hardware'' paragraph says the 2-limb shift is a rotate of the limb index, so a rotate would wrap ACC[9..10] into limbs 0 and 1. The two diverge whenever ACC >= 2^288 on entry. A legal sequence reaches that: ldr, mac2, mac2 with no red between leaves ACC up to about 2^321, so limb 10 can be nonzero. The Gate 4 advisory notes the C-model/RTL disagreement. The prose is still self-contradictory, and Gate 2 starts from ACC = 0, so it never exercises this case.'
+  finding: The mac2 C model and the hardware description disagree on what happens to ACC limbs 9 and 10 in the 2-limb shift. The C model drops them; the hardware note says the shift is 'a rotate of the limb index'.
+  fix: State that the RTL shifts in zeros and discards limbs 9 and 10; do not rotate. Add a directed RTL test that seeds ACC with limbs 9 and 10 non-zero and compares against the C model. Alternatively, document ACC < 2^288 as a precondition and add the test anyway.
+  instruction: p256.mac2
+  reviewer: benefit+legality
+  severity: major
+- evidence: 'Every C model reads or writes file-scope volatile state (p256_fa, p256_acc). Gate 2 runs each instruction alone from reset, with FA = ACC = 0, as the spec itself says. mac2 then computes 0, red and subm compute 0 mod p, and str stores zeros. The 10^5-vector agreement and the sanitizer runs therefore say nothing about the carry logic, the K-fold identity or the mask select. The spec also has tests: [], gate2_vectors: 0, link1_vectors: 0, and spike_model: '''' on all six instructions. I checked the fold bounds by hand and found them consistent. The fold limb weights (+T at limbs 0 and 7, -T at limbs 3 and 6) match K = 2^224 - 2^192 - 2^96 + 1. Each fold is at most 2^321, 2^290, 2^259, and then below 2^256 + 7*2^224, so one conditional subtract of p suffices. The mac2 64-bit accumulate fits exa'
+  finding: The mechanical gates cannot see the arithmetic of p256.mac2, p256.red, p256.subm or p256.str. The spec's only coverage for them is a prose request that the reviewers run the sequences.
+  fix: 'Make the stateful instructions testable. Put the composite sequences into `tests` with expected values and run them through the model: (lda A; ldr B; subm; str) and (lda; 4x(mac2, red); str), compared against a reference mod-p implementation. Cover left = right = p-1 (gives 1), 2^256-1, 2^128, left = 0, and red seeded with p (gives 0), p-1 (unchanged) and 2^256-1 (gives K-1). Alternatively expose FA and ACC as seedable inputs to the Gate 2 and Spike harness.'
+  instruction: ''
+  reviewer: legality
+  severity: major
+- evidence: Entering with X0 < 2^321 gives T < 2^65, so X1 < 2^290. Then T < 2^34, so X2 < 2^259. Then T <= 7, so X3 < 2^256 + 7*2^224, which one subtraction of p canonicalizes. The 4th fold is needed only for ACC up to 2^352, which software cannot create without violating the mac2 entry contract. Each fold is 11 limb steps, and red runs 4 times per multiply, so 4 x 11 = 44 of ~450 cycles (about 10%).
+  finding: red runs 4 folds, but in the only way the application drives it (ACC < 2^321 after mac2 on a canonical ACC) 3 folds already reach the final bound 2^256 + 7*2^224, so about 11 of its ~55 cycles are dead.
+  fix: Define red's contract as ACC < 2^321 (or < 2^288 on entry to mac2) and use 3 folds. Alternatively keep 4 folds and accept the ~10% cost to stay total. State which one is chosen, since the C model and RTL must match.
+  instruction: p256.red
+  reviewer: implementability
+  severity: minor
+- evidence: fold() reads the 3-limb high part T (x[8..10]) at limbs j=0..9 while it overwrites x[8..10] at j=8..10, so the hardware needs a 96-flop T snapshot. It also needs a ~34-bit signed carry, and either a 256-bit W buffer for the subtract-then-select step or a second 8-cycle pass. By its loop counts, red is 4x11 fold steps + 9 subtract steps + 8 select steps = about 61 cycles if serial. That is not 55, though still under pcpi_wait limits because pcpi_wait is raised in cycle 1.
+  finding: The area estimate of 608 flops omits red's working storage, and the latency of about 55 cycles is not consistent with the model's loop counts.
+  fix: Say that the subtract is run as two passes (borrow first, then a conditional write) to avoid a W buffer, include the T snapshot in the flop count, and quote ~60 cycles.
+  instruction: p256.red
+  reviewer: implementability
+  severity: minor
+- evidence: 'State is FA 256 + ACC 352 + T 96 + carry/borrow/counters ~50 + bus-master addr/wdata/rdata 96 + FSM = ~860, against red_accel''s 1,024 buffer flops plus the same bus master. Added logic: one 32x32 multiplier (limb_product; the core''s fast_mul cannot be shared while the CPU is stalled on pcpi_wait), a 32-bit adder and a 4-input signed limb adder, and an 11:1 limb mux on ACC and an 8:1 mux on FA unless they are built as rotating shift registers. The estimate is scaled from the stated +74% and is not a measurement.'
+  finding: Realistic area for Xp256, as a replacement for red_accel, is about 850-900 state flops, roughly 25% fewer than red_accel's 1,150. Expect about +50% core area rather than +74%, but it still carries a second 32x32 array.
+  fix: Implement ACC and FA as limb-rotating shift registers to avoid the wide muxes. Re-measure area once the RTL exists, and state that the unit replaces red_accel rather than adding to it.
+  instruction: ''
+  reviewer: implementability
+  severity: minor
+- evidence: Pass 1 is 8 multiply-adds + 3 carry limbs, and pass 2 is the same, giving 22 steps. The gate itself charges 25 sequential steps. The 16 multiplies need at least 16 cycles, and the carry tails add 6 unless they are overlapped with the next row.
+  finding: The claim of ~18 cycles for mac2 is optimistic. The C model has two 8-limb multiply rows plus two 3-limb carry tails, which is 22 sequential steps on one 32x32 multiplier.
+  fix: Quote 22-25 cycles, or overlap the carry-out tail of pass 1 with the start of pass 2. Either way it stays within the 16-cycle pcpi_wait rule because pcpi_wait is raised in cycle 1.
+  instruction: p256.mac2
+  reviewer: implementability
+  severity: minor
+- evidence: Each mover costs 2 x (8 read + 8 write) = 32 cycles + guard, as the spec says (~34). With rs2 = rs1 (the canonical use) the writes only restore the same SRAM words. One modMult has 1 lda and one modSub has lda + ldr, so about 16-32 cycles of ~450/~110 are spent on dead stores.
+  finding: 'The copy-through write-back makes lda and ldr half operand traffic that returns nothing: 16 of lda''s 34 cycles are 8 write beats of unchanged data.'
+  fix: Keep the block ABI, but have the hardware skip write beats when rs1 == rs2 (the result is architecturally the same for RAM). This saves 16 cycles per lda or ldr. Document the MMIO/ROM exception, or leave it as is.
+  instruction: p256.lda
+  reviewer: implementability
+  severity: minor
+- evidence: A real modMult is lda 34 + 4x(2 lw ~12 + mac2 18-25 + red 55-61) + str 18, about 400-450 cycles. Red alone is about 220-245 of that, roughly half, so latency here is dominated by arithmetic rather than operand traffic. The rationale's 408 cycles omits the digit loads. On the other side, the gate prices red at 264 cycles and 28 invocations, about 5x the real hardware cost, so 8.26x is conservative for this RTL.
+  finding: The declared mac_ops=0 and the per-instruction cost of 28 in the rationale understate the real arithmetic latency, which is 55-61 cycles for red and about 18 for subm. Red is the largest single contributor to a modMult.
+  fix: Update the rationale's cycle table to the ~450-cycle figure, and keep mac_ops as it is (the gate overrides it anyway).
+  instruction: p256.red
+  reviewer: implementability
+  severity: minor
+- evidence: Callgrind records mmod at 530,948 calls against 3,694,592 mult calls, which is 6.96 reductions per recorded call. Each reduction needs 4 reds (one per mac2 digit pair), so 4 x 6.96 = 27.8. The 8,168-instruction vs 1,694-instruction ratio compares one recorded call (about 7 true reductions) with one invocation, not a like-for-like pair.
+  finding: The gate's 'invocations ~5 implied' for red conflicts with the declared 28, but the declaration is consistent with the data volume.
+  fix: Keep 28 and state in the rationale that the recorded mmod call covers ~7 reductions, so that the UNVERIFIED flag can be audited.
+  instruction: p256.red
+  reviewer: implementability
+  severity: minor
+- evidence: The spec says other moduli keep the software path. The baseline build (ENABLE_ACCEL=0) times out and traps on unknown custom-1 opcodes, so the extension code must sit behind a compile-time or build-time switch. The pointer comparison and the bypass of vli_mult + mmod_fast in modMult_fast/modSquare_fast are application changes, small but not free.
+  finding: The software call sites are not drop-in. modSub and modMult callers must test for modulus == secp256r1 p, and the baseline binary must not contain the custom opcodes.
+  fix: 'Add an #ifdef in modSub, modMult_fast and modSquare_fast that selects the p256.* sequence, guarded by a pointer comparison against curve_secp256r1.p.'
+  instruction: p256.subm
+  reviewer: implementability
+  severity: minor
+- evidence: The semantics say the result is exact if ACC < 2^256 on entry. The real condition for nothing being dropped is ACC*2^64 < 2^352, i.e. ACC < 2^288. A rotate would wrap limbs 9 and 10 into limbs 0 and 1 instead of discarding them. Because mac2 followed by mac2 with no red reaches ACC above 2^288, this path is reachable by a caller, yet no test covers it.
+  finding: The mac2 precondition is stated too loosely, and the hardware description ('a rotate of the limb index') contradicts the C model's mod-2^352 truncation.
+  fix: State the precondition as ACC < 2^288 and say that limbs 0 and 1 are zero-filled after the shift and limbs 9 and 10 are discarded. Cover the mac2, mac2 sequence in the composite test above.
+  instruction: p256.mac2
+  reviewer: callability
+  severity: minor
+- evidence: lda is about 34 cycles and ldr about 34. Only 8 reads are needed, which is about 18 cycles, as for str. lda runs 7.63M times and ldr 3.94M times, so the waste is about 16 x 11.6M = 185M cycles. The accelerated runtime is about 3.69M x 450 + 3.94M x 110 = 2.1G cycles, so this is roughly 9% of it. The gate prices 16 beats regardless, so its 8.26x is unaffected, but real silicon pays for the writes. The same writes also force a writable rs2.
+  finding: The copy-through writes cost 8 beats (16 cycles) per lda and per ldr, and in the canonical use (rs2 == rs1) they rewrite memory with the values just read.
+  fix: Make the hardware skip the write phase when x[rs2] equals x[rs1]. Memory is unchanged either way, so the architectural result is identical. Keep the writes only for rs2 != rs1, the explicit copy case. Update the timing text to about 18 cycles for the canonical use.
+  instruction: p256.lda
+  reviewer: callability
+  severity: minor
+- evidence: Reductions are 3,694,592 over 530,948 recorded calls, which is 6.96 per call. Each reduction needs 4 reds, one after each mac2, so 4 x 6.96 = 27.8. The 8,168 host instructions per recorded call are therefore about 1,170 per reduction, which is consistent with mult's 1,028. For lda and str, 7,633,920 / 3,939,328 = 1.94. The total is not double-counted, because mult and mmod carry no mover cost and modSub carries all of it. The per-instruction 'vs software' ratios the gate prints for lda and str (6x, 7x) are artefacts of this attribution, but the application total is sound.
+  finding: The invocations=28 and 2 declarations that the gate marks UNVERIFIED hold up on arithmetic. The gate's ~5 and ~1 implied counts compare one instruction to a whole recorded call and miss the 7x callgrind undercount.
+  fix: No change to the numbers. Add one line to the rationale saying the gate's invocation check ignores the call-count undercount, so a reader of the report does not discount the 28.
+  instruction: p256.red
+  reviewer: callability
+  severity: minor
+- evidence: lda reads 8 words and then writes the same 8 words back. That is 16 of its ~34 real cycles. ldr has the same overhead. In a modSub (lda 34 + ldr 34 + subm 18 + str 18 = ~104 real cycles), ~32 cycles are redundant stores. The gate prices lda at 99 and ldr at 92, so modSub comes out at 538 vs 1,204 software cycles, a ratio of only 2.2x. That is still above 1.0, but modSub is the weakest row and covers 6.2% of cycles. lda also writes to the operand's memory, which would fail on read-only data if the target ever had any.
+  finding: The mandatory write-back half of the block-form movers wastes about half of their latency.
+  fix: No blocking change. Keep rs2 = rs1 in the canonical sequences. If the structural check ever permits a load-only 'move' with an empty output block, use it for lda and ldr, which would take modSub from about 104 to about 70 real cycles.
+  instruction: p256.lda
+  reviewer: benefit
+  severity: minor
+- evidence: 'All 7.63M lda and str executions are charged to the modSub loop at 1.94 per call, so mult and mmod carry no mover cost. Per modMult, the gate''s own charges are lda 99 + 4x70 + 4x264 + str 84, about 1,520 cycles. That is against 8,748 + 9,978 = 18.7K software cycles, a ratio of about 12x. The 8 lw of right''s digits (~48 cycles, plus address arithmetic) are not priced, which adds about 3-5% on that total. Amdahl: the three loops cover 97.2%, so the ceiling is ~35x. The predicted 8.26x is consistent with roughly 12x on 91% of cycles, ~2.2x on 6.2%, and the 2.8% uncovered remainder. The claimed ~55-cycle red hardware against the gate''s 264 charge is upside only.'
+  finding: The per-instruction rows understate the modMult cost and skew the per-loop attribution. The whole-application figure is still sound, and no instruction has a ratio at or below 1.0.
+  fix: No change to the verdict. Report the speedup per modMult and per modSub, not per loop, in the summary. Keep the red latency at or below the 264 the gate charges, which a 1-limb-per-cycle fold (about 4x11 + 9 + 9 cycles) meets.
+  instruction: ''
+  reviewer: benefit
+  severity: minor
+- evidence: 'Data volume: one red folds a 352-bit ACC, and 4 reds (one per 64-bit digit of the 256-bit multiplier) replace one 512-to-256 reduction. That gives 4 per reduction, and 4 x 3,694,592 / 530,948 = 27.8 per recorded call. The 8,168 host instructions per recorded call cover ~7 reductions, i.e. ~1,170 instructions or ~9,978 RV32 cycles each. That agrees with the gate''s 2,483 cycles per red x 4. The 1,694 instructions in the C model reflect a sequential software emulation of the fold, not the data volume of one invocation. If the 7:1 ratio were wrong, red''s credit would shrink, but at 9.4x per instruction the verdict would not change.'
+  finding: invocations=28 depends entirely on the 6.96 reductions-per-recorded-call factor, and the gate's '~5 implied' warning compares unlike implementations. The structure of the count is sound, but state what it rests on.
+  fix: Keep 28. Add one line to the rationale saying the 6.96 factor comes from callgrind undercounting mmod's indirect calls, so a later reviewer does not re-derive it as ~5.
+  instruction: p256.red
+  reviewer: benefit
+  severity: minor
+- evidence: 'The rationale says ''Xp256 is meant to replace red_accel'' and puts FA+ACC at 608 flops against red_accel''s 1,024. Xp256 uses custom-1, and red_accel decodes custom-0. If both units remain in rtl/red_core.v, area is additive: red_accel''s +74% plus 608 flops plus the fold adder. The 4-input limb adder and the signed-carry fold hardware are new logic that is not shared with the existing 32-bit adder.'
+  finding: The area claim assumes red_accel is deleted from the RTL, but this is not enforced anywhere.
+  fix: State in the spec that the Xp256 unit replaces red_accel's decode, buffers and bus master in red_core.v. The bus master keeps red_accel's mem_issued guard. Report area against the baseline core after the replacement.
+  instruction: ''
+  reviewer: benefit
+  severity: minor
+- evidence: 'mac2 reads FA (8 limbs) and ACC (11 limbs) and writes ACC (11 limbs). red, subm, ldr and str also have non-empty reads_state or writes_state. All six declare state_words: 0 alongside words: 2 for the register forms. A checker that uses state_words to count what an instruction touches sees none of the 608 state bits.'
+  finding: state_words is 0 on every instruction, including those that read and write the 8-limb FA and the 11-limb ACC.
+  fix: Set state_words to the number of 32-bit state words each instruction reads or writes, for example 19 read and 11 written for mac2. Or state in the spec that state_words counts only operand-block state and is 0 by design here.
+  instruction: p256.mac2
+  reviewer: legality
+  severity: minor
+- evidence: Copy-through writes out[i] = FA[i] to MEM[x[rs2] & ~3]. The semantics call out 'point rs2 at an 8-word scratch buffer' for read-only operands. The hardware does 16 beats (about 34 cycles) where 8 would load. A pointer at MMIO such as 0x10000004 would store to the exit port. The fixed block ABI forces the write-back and the cost is priced. The addresses it touches and the double-credited invocation rounding (1.94 declared as 2) are only worth noting.
+  finding: lda and ldr are pure operand loads, but they are defined with a mandatory 8-word write-back. That adds 8 beats, makes the load non-idempotent on MMIO, and forces a scratch buffer for read-only operands.
+  fix: Keep the block form. Document that rs2 must be a writable RAM block and that rs1 = rs2 is the canonical use. Note that the write-back rewrites the same values, so it is idempotent on RAM only.
+  instruction: p256.lda
+  reviewer: legality
+  severity: minor
+reviewers:
+- implementability
+- callability
+- benefit
+- legality

@@ -30,10 +30,18 @@ Read the current draft with `${READ_SPEC}` and the mined loops with
   should be replaced by one that is not, or dropped: a smaller extension that
   wins is worth more than a larger one that does not.
 - The reviewers know the platform's measured costs. If a finding says an
-  instruction's latency is dominated by moving its operands, the fix is usually
-  to make the instruction do **more work per operand word** — fuse the
-  surrounding computation into it so the same data movement buys more — or to
-  choose an operand width the caller already has laid out.
+  instruction's latency is dominated by moving its operands, there are two
+  fixes and the first one is usually better: **remove the traffic** by moving
+  to `form: reg`, if one invocation's operands fit in two registers; or keep
+  the block and find more arithmetic to do on the words it already moves.
+  Widening the block is not on that list — it is what the structural check
+  rejects.
+- **Findings from the `structure` reviewer are mechanical.** They are computed
+  from your own fields — operand width, declared state, instruction count —
+  not judged. Arguing with one in your reply does not clear it; changing the
+  design does. A blocking structural finding means the spec has an operand
+  block larger than the core's register file, and the fix is to decompose the
+  instruction or to declare the state it holds.
 - If you believe a finding is wrong, say so in your reply with your reasoning
   and leave that instruction alone. Do not silently ignore it.
 - **Do not churn on fields the loop measures.** The performance gate prices your

@@ -1,6 +1,0 @@
-{
-  "counterexample": null,
-  "detail": "runs 8944335839 vs 8944515537 cycles (0.00% vs \u00b15%)",
-  "gate": "gate1",
-  "passed": true
-}

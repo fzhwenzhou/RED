@@ -1,0 +1,34 @@
+# Security review (Gate 4)
+
+Checks run: encoding.collision, encoding.fields, encoding.opcode, latency.interrupt_bound, memory.bounds, memory.input_mutation, memory.output_residue, model.forbidden_call, model.impure, model.includes, timing.data_dependent, timing.secret_branch, timing.taint_scan
+Vectors per model: 512
+
+**Checks that could NOT run** (not the same as passing):
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+- timing.secret_branch: memcheck could not run — valgrind:  Fatal error at startup: a function redirection
+
+**No mechanically confirmed blocking findings** — the gate passes.
+
+## [MAJOR] `p256.str` — agent.residue
+*the security reviewer's reading — advisory*
+
+**Finding.** FA and ACC are never cleared, so the secret value from one operation survives it. A later caller can read the last product or difference with one p256.str and no setup, and can read the last p256.lda operand (FA) with p256.ldr from zeros, then p256.subm, then p256.str.
+
+```
+The spec says p256.str leaves FA and ACC unchanged, and reads_state is ACC for str. The state_note calls FA and ACC caller-saved scratch with 'nothing is live after it', but that is a software convention, not a hardware rule. The str model reads p256_acc and never clears it. With ACC = 0 (from ldr of zeros), the subm model gives D = FA - 0 with bw = 0 and no p addend, so ACC = FA raw, and str writes it out. The OS preemption note says FA is not saved, so a context switch hands the previous task's FA to the next. The mechanical output_residue check looks only at each model's output block in isolation, so it cannot see state kept between instructions. The probe harness starts every model from zero state (probe p256.mac2 with ffffffffffffffff returned 0), so this cross-instruction read cannot
+```
+**Required change.** p256.str zeroes ACC[0..10] and FA[0..7] after its eight write beats. Every sequence ends in str, and the clear adds no beats. Check that the modMult and modSub sequences still work with this, and state that an OS or trap handler must clear both on any mid-sequence exit.
+
+## [MAJOR] `p256.mac2` — agent.arithmetic
+*the security reviewer's reading — advisory*
+
+**Finding.** mac2 is correct mod p only when ACC < 2^288 on entry. Its 2-limb shift drops limbs 9 and 10 (weights 2^352 and up), and 2^352 is not 0 mod p, so when those limbs are set the result is silently wrong mod p. The hardware note says the shift is a rotate, which gives a different wrong value, so the C model that Gate 2 verifies and the RTL disagree on this path.
+
+```
+Input: p256.lda with left = 2^256-1, then p256.mac2 with digit 2^64-1 and no p256.red after it. That gives ACC = (2^256-1)(2^64-1) = 2^320 - 2^256 - 2^64 + 1, so limbs 8 and 9 are nonzero. The next p256.mac2 with any digit shifts those limbs up and drops limb 9, so its result differs from (ACC*2^64 + FA*b) mod p by a multiple of 2^352, which is nonzero mod p. The spec's 'nothing is dropped' only covers ACC < 2^256. The rotate in the hardware note moves limbs 9 and 10 into limbs 0 and 1, which is a different wrong value. A glitch that skips one p256.red in a multiply produces this state for most operands, which makes it a fault-attack primitive, not just a precondition note. I derived this by hand from the spec's definitions. The exact-integer check of this path and of the red fold did not
+```
+**Required change.** Make mac2 exact mod p for any 352-bit ACC. Compute the exact sum, then fold the part at weight 2^352 and above back into the low limbs with 2^352 mod p = K*2^96 (mod p), instead of dropping it. Then state the same semantics in the C model and in the RTL, and add a Gate 2 vector with ACC >= 2^288 on entry.

@@ -12,8 +12,9 @@ requires-python = ">=3.10"
 # CLI (`claude`, installed separately — it is not a Python package), and its
 # tools are in-process MCP servers on loopback. That leaves two dependencies.
 dependencies = [
-    "mcp>=1.0",      # the four sealed tool servers (red/localtool.py)
+    "mcp>=1.0",       # the four sealed tool servers (red/localtool.py)
     "uvicorn>=0.27",  # serves them over streamable HTTP on 127.0.0.1
+    "PyYAML>=6.0",    # the typed artifacts (red/state_def.py); YAML 1.1
 ]
 
 [project.optional-dependencies]

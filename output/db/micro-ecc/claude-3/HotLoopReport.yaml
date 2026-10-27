@@ -1,0 +1,108 @@
+coverage: 0.9718466943994009
+loops:
+- body: |
+    /* t */
+    uECC_vli_set(result, product, num_words_secp256r1);
+    /* s1 */
+    tmp[0] = 0;
+    tmp[1] = product[5] & 0xffffffff00000000ull;
+    tmp[2] = product[6];
+    tmp[3] = product[7];
+    carry = (int)uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);
+    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);
+    /* s2 */
+    tmp[1] = product[6] << 32;
+    tmp[2] = (product[6] >> 32) | (product[7] << 32);
+    tmp[3] = product[7] >> 32;
+    carry += uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);
+    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);
+    /* s3, s4 */ carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);
+    /* d1..d4 */ carry -= uECC_vli_sub(result, result, tmp, num_words_secp256r1);
+    if (carry < 0) {
+        do {
+            carry += uECC_vli_add(result, result, curve_secp256r1.p, num_words_secp256r1);
+        } while (carry < 0);
+    } else {
+        while (carry || uECC_vli_cmp_unsafe(curve_secp256r1.p, result, num_words_secp256r1) != 1) {
+            carry -= uECC_vli_sub(result, result, curve_secp256r1.p, num_words_secp256r1);
+        }
+    }
+  calls: 530948
+  cycle_share: 0.4848935241844995
+  dynamic_cycles: 4336923207
+  function: vli_mmod_fast_secp256r1
+  ir: ''
+  loop_id: vli_mmod_fast_secp256r1::reduction
+  operand_stats: |-
+    - 'NIST P-256 fast reduction: 512-bit product (8x64-bit words, or 16x32-bit) reduced to 256 bits mod p'
+    - straight-line sequence of 4 shifted/masked 256-bit word-permutation builds plus 2x doubling (s1, s2) and 4 add/4 sub accumulations (s1..s4, d1..d4) over 4 limbs each
+    - word shuffling uses 32-bit half-word extract/merge (>>32, <<32, & 0xffffffff) on 64-bit limbs
+    - signed int carry accumulator in [-4,+5] followed by a short data-dependent correction loop (add p while carry<0, else subtract p while carry or result>=p)
+    - called once per modular multiply/square (~531K calls); in profile exclusive cost ~8.2K cycles per call; inner uECC_vli_add/sub are inlined
+    - 'read-only inputs: product[8], p; output: result[4]; tmp[4] stack temporary; no loop-carried memory dependence across calls'
+  rank: 1
+  source_file: micro-ecc/curve-specific.inc
+  trip_count: 0
+- body: |
+    for (k = 0; k < num_words; ++k) {
+        for (i = 0; i <= k; ++i) {
+            muladd(left[i], right[k - i], &r0, &r1, &r2);
+        }
+        result[k] = r0;
+        r0 = r1;
+        r1 = r2;
+        r2 = 0;
+    }
+    for (k = num_words; k < num_words * 2 - 1; ++k) {
+        for (i = (k + 1) - num_words; i < num_words; ++i) {
+            muladd(left[i], right[k - i], &r0, &r1, &r2);
+        }
+        result[k] = r0;
+        r0 = r1;
+        r1 = r2;
+        r2 = 0;
+    }
+    result[num_words * 2 - 1] = r0;
+  calls: 3694592
+  cycle_share: 0.4246432763485098
+  dynamic_cycles: 3798040576
+  function: uECC_vli_mult
+  ir: ''
+  loop_id: uECC_vli_mult::product_scanning
+  operand_stats: |-
+    - 'product-scanning (Comba) multiplication of two 256-bit vlis (num_words=4 on 64-bit, 8 on 32-bit): 16 muladd steps per call on 64-bit words, 64 on 32-bit'
+    - 'muladd: word x word -> double-word product accumulated into a 3-word accumulator (r0,r1,r2) with carry propagation; loop-carried recurrence through r0/r1/r2'
+    - 'memory access: left[i] ascending, right[k-i] descending (reverse stride), each operand read repeatedly; result[] written sequentially one word per outer iteration'
+    - triangular inner trip count (1..num_words then num_words-1..1); outer trip count 2*num_words-1
+    - called ~3.69M times (also the squaring path via uECC_vli_modSquare_fast with left==right); exclusive ~1K cycles per call
+  rank: 2
+  source_file: micro-ecc/uECC.c
+  trip_count: 16
+- body: |
+    uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);
+    if (l_borrow) {
+        /* In this case, result == -diff == (max int) - diff. Since -x % d == d - x,
+           we can get the correct result from result + mod (with overflow). */
+        uECC_vli_add(result, result, mod, num_words);
+    }
+  calls: 3939328
+  cycle_share: 0.06230989386639156
+  dynamic_cycles: 557304256
+  function: uECC_vli_modSub
+  ir: ''
+  loop_id: uECC_vli_modSub::sub_borrow_fixup
+  operand_stats: |-
+    - '256-bit modular subtraction: multi-limb subtract with borrow chain followed by a conditional add of the modulus p to fix up on borrow'
+    - limb count num_words=4 (64-bit) or 8 (32-bit); borrow is a loop-carried recurrence across limbs
+    - sequential unit-stride loads of left/right (and mod on fixup), unit-stride store of result
+    - the fixup branch is data-dependent (taken when left<right)
+    - 'most frequent vli primitive: ~3.94M calls, mainly from XYcZ_add/XYcZ_addC point-addition formulas; ~141 cycles per call'
+  rank: 3
+  source_file: micro-ecc/uECC.c
+  trip_count: 4
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/micro-ecc/20261026-174116-689455/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/micro-ecc/20261026-174116-689455/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 8944073267
+workload: micro-ecc

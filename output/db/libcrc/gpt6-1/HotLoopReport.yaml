@@ -1,0 +1,44 @@
+coverage: 0.9998107087713004
+loops:
+- body: "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n\t}"
+  calls: 8192
+  cycle_share: 0.5383541965514747
+  dynamic_cycles: 939589632
+  function: crc_32
+  ir: ''
+  loop_id: crc_32::byte_update
+  operand_stats: |-
+    observations:
+    - Unsigned 32-bit CRC state (uint32_t); input elements are unsigned char bytes, cast to uint32_t before XOR.
+    - Input pointer advances by one byte per iteration; sequential read-only input traversal with no per-iteration stores.
+    - Data-dependent read from const uint32_t crc_tab32[], indexed by the low 8 bits of crc XOR the current byte (index range 0..255).
+    - 'Loop-carried recurrence: crc_next = (crc >> 8) XOR table[(crc XOR byte) AND 0xFF]; each table index depends on the previous CRC.'
+    - size_t induction variable a increments by one and is compared against num_bytes; loop is guarded by ptr != NULL.
+    - Profile supplies per-function counts, not separate loop counts; this is the function's only loop. Runtime num_bytes is not supplied, so trip_count is unknown.
+  rank: 1
+  source_file: libcrc/src/crc32.c
+  trip_count: 0
+- body: "\tif ( ptr != NULL ) for (a=0; a<num_bytes; a++) {\n\n\t\tcrc = (crc << 8) ^ crc_tab64[ ((crc >> 56) ^ (uint64_t) *ptr++) & 0x00000000000000FFull ];\n\t}"
+  calls: 8192
+  cycle_share: 0.4614565122198257
+  dynamic_cycles: 805380096
+  function: crc_64_ecma
+  ir: ''
+  loop_id: crc_64_ecma::byte_update
+  operand_stats: |-
+    observations:
+    - Unsigned 64-bit CRC state (uint64_t); input elements are unsigned char bytes, cast to uint64_t before XOR.
+    - Input pointer advances by one byte per iteration; sequential read-only input traversal with no per-iteration stores.
+    - Data-dependent read from const uint64_t crc_tab64[], indexed by the high CRC byte XOR the current byte, masked to 8 bits (index range 0..255).
+    - 'Loop-carried recurrence: crc_next = (crc << 8) XOR table[((crc >> 56) XOR byte) AND 0xFF]; each table index depends on the previous CRC.'
+    - size_t induction variable a increments by one and is compared against num_bytes; loop is guarded by ptr != NULL.
+    - Profile supplies per-function counts, not separate loop counts; this is the function's only loop. Runtime num_bytes is not supplied, so trip_count is unknown.
+  rank: 2
+  source_file: libcrc/src/crc64.c
+  trip_count: 0
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/libcrc/20261026-022303-943b21/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/libcrc/20261026-022303-943b21/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 1745300098
+workload: libcrc

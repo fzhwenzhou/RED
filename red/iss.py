@@ -90,24 +90,32 @@ def _bitfield(value: str, width: int, what: str, mnemonic: str) -> int:
 def match_mask(ins: state_def.InstructionSpec) -> tuple[int, int]:
     """The (match, mask) pair Spike decodes this instruction with.
 
-    R-type: funct7 in 31:25, rs2 24:20, rs1 19:15, funct3 14:12, rd 11:7,
-    opcode 6:0. The mask pins funct7 + funct3 + opcode and leaves the three
-    register fields free."""
+    R-type (``reg`` and ``block``): funct7 in 31:25, rs2 24:20, rs1 19:15,
+    funct3 14:12, rd 11:7, opcode 6:0. The mask pins funct7 + funct3 + opcode
+    and leaves the three register fields free.
+
+    I-type (``reg_imm``): bits 31:20 are the immediate, so there is no funct7
+    to decode on. The mask pins funct3 + opcode only, which is why an
+    immediate form costs a whole funct3 slot rather than one funct7 of one."""
     if ins.opcode not in CUSTOM_OPCODES:
         raise ValueError(f"instruction {ins.mnemonic!r}: opcode must be one of "
                          f"{sorted(CUSTOM_OPCODES)}, got {ins.opcode!r}")
     op = CUSTOM_OPCODES[ins.opcode]
     f3 = _bitfield(ins.funct3, 3, "funct3", ins.mnemonic)
+    if state_def.normalize_form(ins.form) == "reg_imm":
+        return (f3 << 12) | op, 0x0000707F
     f7 = _bitfield(ins.funct7, 7, "funct7", ins.mnemonic)
     return (f7 << 25) | (f3 << 12) | op, 0xFE00707F
 
 
 def encoding_slots(spec: state_def.ISASpec) -> dict[tuple[str, str, str], list[str]]:
-    """Map each (opcode, funct3, funct7) slot to the mnemonics claiming it —
-    the raw material for the collision check."""
+    """Map each encoding slot to the mnemonics claiming it — the raw material
+    for the collision check. An I-type form claims every funct7 of its funct3,
+    so its slot key carries ``"*"`` there."""
     slots: dict[tuple[str, str, str], list[str]] = {}
     for ins in spec.instructions:
-        slots.setdefault((ins.opcode, ins.funct3, ins.funct7), []).append(ins.mnemonic)
+        f7 = "*" if state_def.normalize_form(ins.form) == "reg_imm" else ins.funct7
+        slots.setdefault((ins.opcode, ins.funct3, f7), []).append(ins.mnemonic)
     return slots
 
 
@@ -243,9 +251,37 @@ static reg_t red_exec_$ident(processor_t* p, insn_t insn, reg_t pc)
 }
 ''')
 
+# Register forms touch no memory at all: the operands arrive in x[rs1]/x[rs2]
+# (or an immediate) and the single result goes back to x[rd]. The model
+# signature is the same one the block form uses, so link 1, the vector
+# generator and the differential test do not know the difference.
+_EXT_EXEC_REG = Template(r'''
+static reg_t red_exec_$ident(processor_t* p, insn_t insn, reg_t pc)
+{
+  uint32_t in[2], out[2];
+
+  in[0] = (uint32_t)RS1;
+  in[1] = (uint32_t)($second);
+  memset(out, 0, sizeof(out));
+
+  red_$ident::$fn(in, out);
+
+  WRITE_RD(sext32(out[0]));
+  return pc + 4;
+}
+''')
+
 
 def render_extension(spec: state_def.ISASpec) -> str:
-    """The C++ source of the Spike extension implementing every instruction."""
+    """The C++ source of the Spike extension implementing every instruction.
+
+    When the spec declares architectural state, the extension object owns it:
+    one zero-initialised array that every instruction body is handed and that
+    persists across instructions, which is what makes a register file a
+    register file rather than an operand block. The native side allocates the
+    same array and both sides start it at zero, so the differential test
+    compares two machines that began in the same architectural state and were
+    driven by the same instruction sequence."""
     models, execs, descs, disasms = [], [], [], []
     for ins in spec.instructions:
         ident = state_def.c_identifier(ins.mnemonic)
@@ -253,7 +289,16 @@ def render_extension(spec: state_def.ISASpec) -> str:
         match, mask = match_mask(ins)
         models.append(_EXT_MODEL.substitute(mnemonic=ins.mnemonic, words=ins.words,
                                             ident=ident, model=ins.spike_model))
-        execs.append(_EXT_EXEC.substitute(ident=ident, words=ins.words, fn=fn))
+        form = state_def.normalize_form(ins.form) or "block"
+        if form in state_def.REGISTER_FORMS:
+            # reg_imm takes its second operand from the I-type immediate
+            # field; a one-source reg form leaves in[1] zero so the model
+            # still sees the array shape it was written against.
+            second = ("insn.i_imm()" if form == "reg_imm"
+                      else ("RS2" if ins.src_regs == 2 else "0"))
+            execs.append(_EXT_EXEC_REG.substitute(ident=ident, fn=fn, second=second))
+        else:
+            execs.append(_EXT_EXEC.substitute(ident=ident, words=ins.words, fn=fn))
         f = f"red_exec_{ident}"
         descs.append(f"      {{0x{match:08x}, 0x{mask:08x}, "
                      + ", ".join([f] * 8) + "},")
@@ -312,7 +357,7 @@ static void red_fill(long i, uint32_t *seed, uint32_t *in) {
   } else {
     for (w = 0; w < RED_WORDS; w++) in[w] = red_xs32(seed);
   }
-}
+$mask1}
 
 static uint32_t red_hash(uint32_t h, const uint32_t *v, int n) {
   int w, b;
@@ -354,7 +399,7 @@ int main(void) {
     red_fill(i, &seed, in);
     memset(out, 0, sizeof out);
     $fn(in, out);
-    h = red_hash(h, out, RED_WORDS);
+$post    h = red_hash(h, out, RED_WORDS);
 $emit
   }
   return 0;
@@ -399,15 +444,7 @@ int main(void) {
   for (i = 0; i < RED_NVEC; i++) {
     red_fill(i, &seed, red_in);
     for (w = 0; w < RED_WORDS; w++) red_out[w] = 0;
-    {
-      uint32_t rd_val;
-      const uint32_t *src = red_in;
-      uint32_t *dst = red_out;
-      /* <mnemonic> rd, rs1, rs2  with rs1 = &in, rs2 = &out */
-      __asm__ __volatile__(".insn r $opcode_hex, $funct3_hex, $funct7_hex, %0, %1, %2"
-                           : "=r"(rd_val) : "r"(src), "r"(dst) : "memory");
-      (void)rd_val;
-    }
+$issue
     h = red_hash(h, (const uint32_t *)red_out, RED_WORDS);
 $emit
   }
@@ -452,9 +489,21 @@ SECTIONS
 '''
 
 
-def _vector_gen() -> str:
+def _vector_gen(ins: state_def.InstructionSpec | None = None) -> str:
+    """The vector generator both harnesses share, verbatim.
+
+    For a ``reg_imm`` instruction ``in[1]`` is not a runtime operand -- it is
+    the immediate *field of the encoding*. Narrowing it here, in the one
+    generator both sides compile, is what keeps the C model and the firmware
+    looking at the same value: the firmware can only issue an immediate it can
+    name at assembly time, so a random 32-bit ``in[1]`` would be a vector the
+    two sides could never agree on."""
+    mask1 = ""
+    if ins is not None and state_def.normalize_form(ins.form) == "reg_imm":
+        mask1 = (f"  in[1] &= 0x{(1 << ins.imm_bits) - 1:x}u;"
+                 f"   /* imm is {ins.imm_bits} bits of the encoding */\n")
     return Template(_VECTOR_GEN).substitute(
-        corners=", ".join(f"0x{c:08x}u" for c in CORNER_WORDS))
+        corners=", ".join(f"0x{c:08x}u" for c in CORNER_WORDS), mask1=mask1)
 
 
 def _emit_blocks(target: str) -> str:
@@ -481,24 +530,102 @@ def _emit_detail(target: str, dfrom: int, dto: int) -> str:
             f"    if (i >= {dfrom} && i < {dto}) {{\n{body}\n    }}")
 
 
+def _native_post(ins: state_def.InstructionSpec) -> str:
+    """What the host runner does to ``out[]`` before hashing it.
+
+    A register-form instruction has exactly one result, ``out[0]`` -> x[rd].
+    The model array is two words wide because the *input* needs two, so
+    ``out[1]`` is not architecturally visible and a model is free to scribble
+    on it. The hardware side cannot produce it at all, so the host side drops
+    it; otherwise Gate 2 would report a disagreement about a word neither the
+    instruction nor the caller can observe."""
+    if state_def.normalize_form(ins.form) in state_def.REGISTER_FORMS:
+        return ("    for (w = 1; w < RED_WORDS; w++) out[w] = 0;"
+                "   /* only out[0] -> x[rd] is architectural */\n")
+    return ""
+
+
 def render_native(ins: state_def.InstructionSpec, nvec: int, emit: str) -> str:
+    """The host-side run of one instruction's C model.
+
+    When the extension declares architectural state, the harness allocates it
+    once, zeroed, outside the vector loop and hands the same array to every
+    invocation. That is the whole difference between a register file and an
+    operand block: the array survives the call. The Spike side does exactly
+    the same thing in the extension object, so both machines start in the same
+    architectural state and see the same instruction sequence."""
     return _NATIVE_C.substitute(
         mnemonic=ins.mnemonic, words=ins.words, nvec=nvec, ncorner=N_CORNERS,
         block=GATE2_BLOCK, model=ins.c_model,
         fn=f"{state_def.c_identifier(ins.mnemonic)}_model",
-        vector_gen=_vector_gen(), seed=f"0x{PRNG_SEED:x}", emit=emit)
+        vector_gen=_vector_gen(ins), seed=f"0x{PRNG_SEED:x}", emit=emit,
+        post=_native_post(ins))
+
+
+_ISSUE_BLOCK = """    {
+      uint32_t rd_val;
+      const uint32_t *src = red_in;
+      uint32_t *dst = red_out;
+      /* %(mnemonic)s rd, rs1, rs2  with rs1 = &in, rs2 = &out */
+      __asm__ __volatile__(".insn r %(op)s, %(f3)s, %(f7)s, %%0, %%1, %%2"
+                           : "=r"(rd_val) : "r"(src), "r"(dst) : "memory");
+      (void)rd_val;
+    }"""
+
+_ISSUE_REG = """    {
+      uint32_t rd_val;
+      uint32_t a = red_in[0], b = %(second)s;
+      /* %(mnemonic)s rd, rs1, rs2 — operands in registers, result in rd */
+      __asm__ __volatile__(".insn r %(op)s, %(f3)s, %(f7)s, %%0, %%1, %%2"
+                           : "=r"(rd_val) : "r"(a), "r"(b));
+      for (w = 0; w < RED_WORDS; w++) red_out[w] = 0;
+      red_out[0] = rd_val;
+    }"""
+
+
+def _issue_reg_imm(ins, op: str, f3: str) -> str:
+    """An immediate has to be a literal at assembly time, so every value the
+    field can take gets its own ``.insn i``. That is why ``imm_bits`` is
+    capped: the differential test covers the immediate exhaustively, and it
+    can only do that by enumerating it."""
+    nl = chr(10)
+    cases = []
+    for v in range(1 << ins.imm_bits):
+        cases.append(
+            '      case %d: __asm__ __volatile__(".insn i %s, %s, %%0, %%1, %d"%s'
+            '                     : "=r"(rd_val) : "r"(a)); break;' % (v, op, f3, v, nl))
+    mask = (1 << ins.imm_bits) - 1
+    body = [
+        "    {",
+        "      uint32_t rd_val = 0;",
+        "      uint32_t a = red_in[0];",
+        "      switch (red_in[1] & 0x%xu) {" % mask,
+        nl.join(cases),
+        "        default: break;",
+        "      }",
+        "      for (w = 0; w < RED_WORDS; w++) red_out[w] = 0;",
+        "      red_out[0] = rd_val;",
+        "    }",
+    ]
+    return nl.join(body)
 
 
 def render_rv32(ins: state_def.InstructionSpec, nvec: int, emit: str,
                 sig_words: int) -> str:
-    op, f3, f7 = (CUSTOM_OPCODES[ins.opcode],
-                  _bitfield(ins.funct3, 3, "funct3", ins.mnemonic),
-                  _bitfield(ins.funct7, 7, "funct7", ins.mnemonic))
+    form = state_def.normalize_form(ins.form) or "block"
+    op = f"0x{CUSTOM_OPCODES[ins.opcode]:02x}"
+    f3 = f"0x{_bitfield(ins.funct3, 3, 'funct3', ins.mnemonic):x}"
+    if form == "reg_imm":
+        issue = _issue_reg_imm(ins, op, f3)
+    else:
+        f7 = f"0x{_bitfield(ins.funct7, 7, 'funct7', ins.mnemonic):02x}"
+        tmpl = _ISSUE_REG if form == "reg" else _ISSUE_BLOCK
+        issue = tmpl % {"mnemonic": ins.mnemonic, "op": op, "f3": f3, "f7": f7,
+                        "second": "red_in[1]" if ins.src_regs == 2 else "0u"}
     return _RV32_C.substitute(
         mnemonic=ins.mnemonic, words=ins.words, nvec=nvec, ncorner=N_CORNERS,
-        block=GATE2_BLOCK, vector_gen=_vector_gen(), seed=f"0x{PRNG_SEED:x}",
-        emit=emit, sig_words=sig_words, sig_last=sig_words - 1,
-        opcode_hex=f"0x{op:02x}", funct3_hex=f"0x{f3:x}", funct7_hex=f"0x{f7:02x}")
+        block=GATE2_BLOCK, vector_gen=_vector_gen(ins), seed=f"0x{PRNG_SEED:x}",
+        emit=emit, sig_words=sig_words, sig_last=sig_words - 1, issue=issue)
 
 
 # ---------------------------------------------------------------------------
@@ -571,12 +698,20 @@ def _first_difference(a: list[str], b: list[str]) -> int:
 def differential_test(ins: state_def.InstructionSpec, work_dir: str, so: str,
                       vectors: int) -> tuple[bool, str, str | None]:
     """Run one instruction's C model and its Spike implementation over the same
-    *vectors* and compare. Returns (passed, detail, counterexample)."""
+    *vectors* and compare. Returns (passed, detail, counterexample).
+
+    With architectural state, this tests one instruction's state transition
+    repeated over the whole vector sequence, starting from reset. It does not
+    test a *family* composing -- a load, then a compute, then a store, in that
+    order -- because each instruction is tested alone in its own machine. A
+    disagreement about how two instructions interact through the register file
+    is therefore outside what Gate 2 can see, and belongs to the reviewers."""
     os.makedirs(work_dir, exist_ok=True)
     nblocks = (vectors + GATE2_BLOCK - 1) // GATE2_BLOCK
 
     # -- phase 1: per-block checksums ---------------------------------------
-    native, err = _run_native(ins, work_dir, vectors, _emit_blocks("native"), "blocks")
+    native, err = _run_native(ins, work_dir, vectors, _emit_blocks("native"),
+                              "blocks")
     if native is None:
         return False, err, None
     iss, err = _run_spike(ins, work_dir, vectors, _emit_blocks("rv32"), nblocks,

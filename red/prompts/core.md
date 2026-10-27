@@ -11,6 +11,53 @@ List the sources with `${LIST_SOURCES}` and read the core's Verilog with
 tell you the ISA options, the coprocessor interface and the memory interface —
 then the coprocessor examples the core ships, then the memory state machine.
 
+**Find the instantiation, not just the module.** A parameterised core's
+default parameter values are almost never the configuration being built. Search
+the listed sources for where the core module is *instantiated* — a wrapper, an
+SoC top level, a testbench — and read the parameter overrides there. Those
+overrides are the machine; the module's own defaults are a different machine
+that nobody is building.
+
+Several files usually instantiate the core and they disagree, because the
+vendor's repository ships testbenches for configurations nobody here builds.
+Prefer the instantiation that belongs to **this** project rather than to the
+vendor's own directory, and prefer the one wired to the accelerator or
+coprocessor the extension will attach to — that is the design under test. If
+two candidates still disagree, say which you took and why in `evidence`.
+
+This is not a hypothetical. A run analysing PicoRV32 read `picorv32.v` alone,
+reported the defaults (`ENABLE_MUL=0`, `ENABLE_FAST_MUL=0`, `ENABLE_DIV=0`,
+`ENABLE_PCPI=0`) and wrote "no target instantiation specified" in the core
+name. The actual wrapper in this repository sets `ENABLE_FAST_MUL=1` and
+`ENABLE_DIV=1` and adds a separate bus-master port for the accelerator. The
+designer was therefore told the core had no multiplier it could collide with
+and no way to reach memory at all — both false, and both load-bearing for
+every instruction it then designed. If you genuinely cannot find an
+instantiation, say which files you searched, and say that the numbers are
+module defaults, in the `name` *and* in `evidence`.
+
+## Your tools are the only tools
+
+This turn runs with a **sealed tool surface**: the MCP tools listed for you
+and nothing else. There is no shell, no `Bash`, no filesystem access, no
+network. A call to a tool outside the list is denied, and the denial costs
+you one of a finite number of turns — an agent that keeps retrying a denied
+shell command spends its whole budget and the turn ends with
+`error_max_turns`, having produced nothing. Two micro-ecc runs were lost
+exactly that way.
+
+To read the sources, use the tools you have:
+
+- `list_sources` — every project and core file you may open.
+- `grep_source(pattern, path="", context=2)` — regular-expression search
+  across those files, returning `path:line: text` with surrounding lines.
+  **This is what to reach for instead of a shell.** The interesting files are
+  large; searching one for `uECC_vli_mult` beats reading four thousand lines.
+- `read_source(path)` — the whole file, once you know which part you want.
+
+If something you need genuinely is not reachable through these, say so in
+your reply. Do not try to work around it.
+
 ## What the designer needs from you, and why
 
 Answer from the RTL, not from what a RISC-V core usually does. Every claim needs

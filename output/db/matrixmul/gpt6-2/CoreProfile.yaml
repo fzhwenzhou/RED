@@ -1,0 +1,43 @@
+area_note: 'Generic Yosys synthesis of the instantiated configuration counted 1,969 CPU flip-flop bits: 1,636 in picorv32, 133 in fast_mul, 200 in div; excludes SRAM and accelerator. red_accel adds 1,181 bits. A 512-bit buffer is about 26% of CPU sequential storage and half its declared register-file capacity: substantial. These are storage counts, not technology-mapped area.'
+constraints:
+- Memory access requires the separate accelerator master port and existing bus mux; PCPI alone cannot access memory.
+- CPU execution stalls during a PCPI instruction; acc_busy grants exclusive memory ownership and suppresses cpu_mem_ready.
+- Preserve the accelerator mem_issued/beat_done qualification when taking over the bus; registered ready can initially reflect a CPU transaction.
+- Hold memory requests stable until completion; use aligned 32-bit word addresses for accelerator buffers. Accelerator accesses bypass CPU misalignment checks.
+- 'Assert pcpi_wait promptly for long operations: the CPU has a 4-bit timeout counter for PCPI requests without wait.'
+- Decode instructions exclusively; simultaneous external and internal PCPI completion is not a supported sharing mechanism.
+- One instruction supplies at most two register operands and returns at most one register word; larger results require memory or multiple instructions.
+- The numeric costs assume red_soc_tb's registered SRAM. The 2-cycle word cost is accelerator bus throughput, not CPU load latency or a complete memory-to-memory copy.
+- Issue overhead is 1 cycle from asserted PCPI valid/operands to registered accelerator acceptance; CPU launch_next_insn to acceptance takes 2 cycles. Fetch, completion and writeback are additional.
+coprocessor: External PCPI supplies valid, 32-bit instruction and two 32-bit register operands; receives wait, ready, write-enable and result. PCPI itself cannot address memory. This project's red_accel additionally has a native memory-master port; red_core's acc_busy-controlled mux grants it the shared bus and blocks CPU acknowledgments.
+coprocessor_issue_overhead: 1
+coprocessor_memory_access: true
+coprocessor_result: One 32-bit pcpi_rd result to instruction rd when pcpi_ready and pcpi_wr assert; x0 discards writes. Existing red_accel returns zero and writes its 512-bit product through memory.
+custom_opcode_space:
+- '0x0B custom-0: available except funct3=0, funct7=0, already claimed by red_accel; CPU IRQ encodings are disabled.'
+- '0x2B custom-1, 0x5B custom-2 and 0x7B custom-3: unclaimed by current CPU and accelerator decoders; require accelerator decode additions.'
+- 'Do not overlap opcode 0x33, funct7=1: internal multiply/divide units claim these encodings.'
+cycles_per_alu_op: 4
+cycles_per_load: 7
+cycles_per_word_moved: 2
+evidence:
+- Selected rtl/red_soc_tb.v -> red_core -> picorv32 cpu because this is the project evaluation hierarchy wired to red_accel, rather than vendor testbenches. red_soc_tb defaults ENABLE_ACCEL=1; baseline uses 0.
+- 'rtl/red_core.v cpu overrides: ENABLE_COUNTERS=1, ENABLE_MUL=0, ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=ENABLE_ACCEL, ENABLE_IRQ=0, COMPRESSED_ISA=0.'
+- 'picorv32/picorv32.v inherited parameters: ENABLE_COUNTERS64=1, ENABLE_REGS_16_31=1, ENABLE_REGS_DUALPORT=1, TWO_STAGE_SHIFT=1, BARREL_SHIFTER=0, TWO_CYCLE_ALU=0, TWO_CYCLE_COMPARE=0, CATCH_MISALIGN=1, CATCH_ILLINSN=1.'
+- picorv32 ports, pcpi_rs1/rs2 assignments, cpuregs read/write logic, instr_trap, cpu_state_ld_rs1, pcpi_timeout_counter and pcpi_int_* selection establish operand/result limits, dispatch and timeout behavior.
+- picorv32_pcpi_mul, picorv32_pcpi_fast_mul and picorv32_pcpi_div implementations were read; generate selection chooses fast_mul and div, excluding the sequential shift-add multiplier.
+- picorv32 mem_state, mem_xfer, mem_done and cpu_state_ldmem establish load sequencing; rtl/red_soc_tb.v registers mem_ready under mem_valid && !mem_ready.
+- 'RTL simulation using the read sources and matching project SRAM measured launch_next_insn intervals: ADDI=4, LW=7, MUL=6, DIV=40; accelerator word completions are spaced 2 cycles apart.'
+- rtl/red_accel.v insn_any reserves custom-0/funct3=0/funct7=0; S_IDLE captures operands on the next clock, S_DONE returns zero, operands/product_words each hold 16 words, and mem_issued qualifies beat_done.
+- rtl/red_core.v acc_busy bus mux establishes accelerator memory access; generic Yosys synth -top red_core -noabc supplied the reported storage counts.
+existing_units:
+- 'picorv32_pcpi_fast_mul enabled: registered signed-extended 33x33 multiplication expression producing 64 bits; single multiplication stage with operand/result registers, not iterative shift-add. Physical mapping depends on synthesis.'
+- 'picorv32_pcpi_div enabled: iterative compare/subtract divider with shifting divisor and quotient mask, one quotient bit per iteration; supports DIV/DIVU/REM/REMU.'
+- Combinational integer add/subtract, comparisons and Boolean ALU; TWO_CYCLE_ALU=0 and TWO_CYCLE_COMPARE=0.
+- 'BARREL_SHIFTER=0, TWO_STAGE_SHIFT=1: iterative 4-bit/1-bit shifting.'
+- Existing red_accel already adds a separate 32x32 multiplier and 64-bit accumulation datapath, reused across 64 limb products, plus two 16-word buffers.
+isa: 'RV32IM: full multiply/divide, 32 integer registers, read-only 64-bit cycle/instruction counters. Compressed instructions and IRQs disabled; misalignment and illegal-instruction trapping enabled.'
+memory_interface: 'Unified instruction/data native valid/ready interface: 32-bit byte address, 32-bit read/write data, four byte-write strobes; one transaction at a time. CPU look-ahead outputs are unconnected in red_core. red_soc_tb provides 256 KiB SRAM with registered ready/data; sustained accelerator transfers take 2 cycles/word.'
+microarchitecture: 'Multi-cycle, single-issue FSM with instruction prefetch, not a conventional execution pipeline. Project-SRAM steady-state instruction costs: ordinary ALU 4 cycles, load 7, MUL 6, DIV 40. Shifts iterate by 4 or 1 bits per cycle.'
+name: 'RED red_soc_tb.core.cpu: PicoRV32 RV32IM with ENABLE_ACCEL=1, external red_accel and shared SRAM'
+register_file: 32 architectural 32-bit registers, x0 hardwired zero; cpuregs declares 32 words with 31 writable. Two combinational read ports and one synchronous write port. PCPI receives only rs1 and rs2; no third register operand or second register result.

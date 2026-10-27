@@ -26,7 +26,20 @@
 #   bash scripts/run_projects.sh                 # every project, once each
 #   bash scripts/run_projects.sh libcrc          # just these
 #   RED_RUNS=3 bash scripts/run_projects.sh      # three runs of each
-#   RED_MODEL=... bash scripts/run_projects.sh   # pin the agent model
+#   RED_MODEL=... bash scripts/run_projects.sh   # model for unrouted stages
+#   RED_EFFORT=high bash scripts/run_projects.sh # effort for unrouted stages
+#   RED_MODELS_CONFIG=other.toml ...             # a different per-stage routing
+#   RED_MODELS_CONFIG=/dev/null ...              # no routing: RED_MODEL everywhere
+#
+# Per-stage routing comes from models.toml (see red/modelcfg.py). RED_MODEL
+# and RED_EFFORT are the fallback for stages that file does not name, so to
+# compare two models fairly, disable the routing rather than setting RED_MODEL
+# and expecting it to win.
+#   RED_RUN_PREFIX=opus-5.5-run ...              # name the run dirs for a sweep
+#   RED_SKIP_DONE=1 ...                          # resume: skip finished runs
+#
+# A batch is long and gets interrupted. RED_SKIP_DONE=1 makes re-running the
+# same command finish what is missing instead of redoing what is done.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,6 +48,37 @@ PROJECTS_DIR="$REPO_ROOT/target_project"
 CORE="${RED_CORE:-$REPO_ROOT/target_cpu/picorv32}"
 RUNS="${RED_RUNS:-1}"
 LOGDIR="${RED_LOGDIR:-$REPO_ROOT/output/batch}"
+RUN_PREFIX="${RED_RUN_PREFIX:-run}"
+DB_ROOT="${RED_DB_ROOT:-$REPO_ROOT/output/db}"
+SKIP_DONE="${RED_SKIP_DONE:-0}"
+
+# Has <project> already produced a usable run of this sweep?
+#
+# Keyed on the artifact, not on the run number or the log. Two things made
+# the obvious tests wrong:
+#
+#   * a summary.md is written even when the loop gave up because the backend
+#     was rate limited, so its presence does not mean a run happened;
+#   * a retry does not reuse the failed run's directory -- db_node.claim_run
+#     allocates the next free number -- while the log filename is keyed to
+#     the sweep index and gets overwritten. So after one retry the stale
+#     failed <prefix>-1 sits next to the real result in <prefix>-2, and a
+#     check that reads the first against the second's log reports "done"
+#     about the wrong directory.
+#
+# An ISASpec.yaml is the thing a run exists to produce, it is per-directory,
+# and nothing writes one unless an agent turn actually succeeded. A run that
+# did not converge still has one and still counts; a run the vendor's API
+# killed does not and is redone.
+already_done() {
+    local proj="$1" sep="-"
+    [ "$RUN_PREFIX" = run ] && sep="_"
+    local d
+    for d in "$DB_ROOT/$proj/${RUN_PREFIX}${sep}"*/; do
+        [ -f "$d/ISASpec.yaml" ] && return 0
+    done
+    return 1
+}
 
 # project     | harness (empty => AW writes it) | cflags | exclude
 config_for() {
@@ -89,6 +133,10 @@ echo "=== RED multi-project batch $(date -Is)"
 echo "    core:     $CORE"
 echo "    projects: ${PROJECTS[*]}"
 echo "    runs each: $RUNS"
+echo "    fallback:  ${RED_MODEL:-<CLI default>}   effort: ${RED_EFFORT:-<CLI default>}"
+echo "    routing:   ${RED_MODELS_CONFIG:-$REPO_ROOT/models.toml}"
+_sep="-"; [ "$RUN_PREFIX" = run ] && _sep="_"
+echo "    run dirs:  $DB_ROOT/<project>/${RUN_PREFIX}${_sep}<N>"
 echo
 
 for proj in "${PROJECTS[@]}"; do
@@ -97,14 +145,21 @@ for proj in "${PROJECTS[@]}"; do
     config_for "$proj"
     prepare_project "$proj"
     for n in $(seq 1 "$RUNS"); do
-        log="$LOGDIR/${proj}_run${n}.log"
+        if [ "$SKIP_DONE" = 1 ] && already_done "$proj"; then
+            echo "=== PROJECT $proj RUN $n already complete, skipping"
+            continue
+        fi
+        log="$LOGDIR/${proj}_${RUN_PREFIX}${n}.log"
         echo "=== PROJECT $proj RUN $n starting $(date -Is)"
         echo "    harness: ${HARNESS:-<AW writes it>}   exclude: ${EXCLUDE:-none}"
         start=$(date +%s)
         "$VENV/bin/python" -u -m red.loop \
             --project "$dir" --core "$CORE" --workload "$proj" \
             --harness "$HARNESS" --cflags "$CFLAGS" --exclude "$EXCLUDE" \
+            --run-prefix "$RUN_PREFIX" \
             ${RED_MODEL:+--model "$RED_MODEL"} \
+            ${RED_EFFORT:+--effort "$RED_EFFORT"} \
+            ${RED_MODELS_CONFIG+--models-config "$RED_MODELS_CONFIG"} \
             > "$log" 2>&1
         rc=$?
         echo "=== PROJECT $proj RUN $n finished rc=$rc in $(( $(date +%s) - start ))s"

@@ -41,6 +41,20 @@ SPEC_DIR = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "spec")
 
 
+def _artifact(directory: str, stem: str) -> str:
+    """Path to an artifact in *directory*, whichever serialization it uses.
+
+    Runs recorded before the store moved to YAML are still on disk and still
+    worth re-pricing, so look for the current extension first and fall back.
+    Returns "" when neither is there.
+    """
+    for ext in (".yaml", ".json"):
+        path = os.path.join(directory, stem + ext)
+        if os.path.exists(path):
+            return path
+    return ""
+
+
 def _inputs(proj: str, runs_root: str) -> tuple:
     """(spec, report, core, provenance) for one project.
 
@@ -56,33 +70,33 @@ def _inputs(proj: str, runs_root: str) -> tuple:
     Falls back to the newest run directory when nothing is pinned, which is what
     you want while iterating on a workload that has no RTL yet.
     """
-    pinned_spec = os.path.join(SPEC_DIR, f"{proj}.json")
-    pinned_report = os.path.join(SPEC_DIR, f"{proj}.report.json")
-    pinned_core = os.path.join(SPEC_DIR, f"{proj}.core.json")
+    pinned_spec = os.path.join(SPEC_DIR, f"{proj}.yaml")
+    pinned_report = os.path.join(SPEC_DIR, f"{proj}.report.yaml")
+    pinned_core = os.path.join(SPEC_DIR, f"{proj}.core.yaml")
     if os.path.exists(pinned_spec) and os.path.exists(pinned_report):
-        spec = state_def.from_json(open(pinned_spec).read(), state_def.ISASpec)
-        report = state_def.from_json(open(pinned_report).read(),
+        spec = state_def.from_yaml(open(pinned_spec).read(), state_def.ISASpec)
+        report = state_def.from_yaml(open(pinned_report).read(),
                                      state_def.HotLoopReport)
-        core = (state_def.from_json(open(pinned_core).read(),
+        core = (state_def.from_yaml(open(pinned_core).read(),
                                     state_def.CoreProfile)
                 if os.path.exists(pinned_core) else None)
         return spec, report, core, "pinned"
 
     runs = sorted(glob.glob(os.path.join(runs_root, proj, "*")))
-    runs = [r for r in runs if os.path.exists(os.path.join(r, "ISASpec.json"))]
+    runs = [r for r in runs if _artifact(r, "ISASpec")]
     if not runs:
         return None, None, None, ""
     run = runs[-1]
-    spec = state_def.from_json(
-        open(os.path.join(run, "ISASpec.json")).read(), state_def.ISASpec)
-    report = state_def.from_json(
-        open(os.path.join(run, "HotLoopReport.json")).read(),
+    spec = state_def.from_yaml(
+        open(_artifact(run, "ISASpec")).read(), state_def.ISASpec)
+    report = state_def.from_yaml(
+        open(_artifact(run, "HotLoopReport")).read(),
         state_def.HotLoopReport)
-    core_path = os.path.join(run, "CoreProfile.json")
-    core = (state_def.from_json(open(core_path).read(), state_def.CoreProfile)
-            if os.path.exists(core_path) else None)
+    core_path = _artifact(run, "CoreProfile")
+    core = (state_def.from_yaml(open(core_path).read(), state_def.CoreProfile)
+            if core_path else None)
     if os.path.exists(pinned_spec):
-        pin = state_def.from_json(open(pinned_spec).read(), state_def.ISASpec)
+        pin = state_def.from_yaml(open(pinned_spec).read(), state_def.ISASpec)
         if {i.mnemonic for i in pin.instructions} != {i.mnemonic
                                                       for i in spec.instructions}:
             return spec, report, core, (

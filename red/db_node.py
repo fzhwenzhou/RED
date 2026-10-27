@@ -9,10 +9,10 @@ once the loop stopped being distributed.
 Layout produced under ``DB_ROOT``::
 
     <workload>/run_<run_id>/
-    ├── profile.json              # A1 mechanical profile
-    ├── HotLoopReport.json        # A1 output (typed)
-    ├── ISASpec.draft.json        # A2 output before the verification edges
-    ├── ISASpec.json              # A2 output, final — RED's deliverable
+    ├── profile.yaml              # A1 mechanical profile
+    ├── HotLoopReport.yaml        # A1 output (typed)
+    ├── ISASpec.draft.yaml        # A2 output before the verification edges
+    ├── ISASpec.yaml              # A2 output, final — RED's deliverable
     ├── gates/                    # gate1 / gate2 / link1 / link2 verdicts
     └── summary.md                # human-readable result table
 """
@@ -28,19 +28,29 @@ import tarfile
 from red.constants import DB_ROOT
 
 
-def claim_run(workload: str, db_root: str = "") -> tuple[int, str]:
-    """Allocate the next free ``run_<N>`` under <db_root>/<workload>/; returns
-    (N, abs_path). Atomic via mkdir; racing callers retry the next integer.
+def claim_run(workload: str, db_root: str = "",
+              prefix: str = "run") -> tuple[int, str]:
+    """Allocate the next free ``<prefix>-<N>`` under <db_root>/<workload>/;
+    returns (N, abs_path). Atomic via mkdir; racing callers retry the next
+    integer.
 
     The driver passes *db_root* so the store's location is decided in one
-    place and every later ``put`` targets the same absolute path."""
+    place and every later ``put`` targets the same absolute path.
+
+    *prefix* exists so a batch can be labelled by what produced it, e.g.
+    ``opus-5.5-run-1``. Numbering is per-prefix: a new prefix starts at 1
+    beside whatever is already there, which is what makes two model sweeps
+    comparable without one renumbering the other. The default keeps the
+    historical ``run_<N>`` spelling, underscore and all."""
     root = os.path.join(db_root or DB_ROOT, workload)
     os.makedirs(root, exist_ok=True)
+    sep = "_" if prefix == "run" else "-"
+    pat = re.compile(re.escape(prefix) + re.escape(sep) + r"(\d+)$")
     while True:
         used = [int(m.group(1)) for d in os.listdir(root)
-                if (m := re.match(r"run_(\d+)$", d))]
+                if (m := pat.match(d))]
         n = max(used, default=0) + 1
-        path = os.path.join(root, f"run_{n}")
+        path = os.path.join(root, f"{prefix}{sep}{n}")
         try:
             os.mkdir(path)
             return n, path

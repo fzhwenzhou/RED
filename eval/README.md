@@ -5,11 +5,11 @@ its pinned RED output:
 
 | Project | Pinned spec | Evaluation model |
 |---|---|---|
-| micro-ecc | [`spec/micro-ecc.json`](spec/micro-ecc.json) | synthesizable iterative multiplier RTL |
-| matrixmul | [`spec/matrixmul.json`](spec/matrixmul.json) | behavioral binary32 PCPI model |
-| libcrc | [`spec/libcrc.json`](spec/libcrc.json) | synthesizable iterative CRC RTL |
+| micro-ecc | [`spec/micro-ecc.yaml`](spec/micro-ecc.yaml) | synthesizable iterative multiplier RTL |
+| matrixmul | [`spec/matrixmul.yaml`](spec/matrixmul.yaml) | behavioral binary32 PCPI model |
+| libcrc | [`spec/libcrc.yaml`](spec/libcrc.yaml) | synthesizable iterative CRC RTL |
 
-See [`RESULTS.md`](RESULTS.md) and [`RESULTS.json`](RESULTS.json) for measured
+See [`RESULTS.md`](RESULTS.md) and [`RESULTS.yaml`](RESULTS.yaml) for measured
 correctness, cycles, speedup, and available synthesis results.
 
 This directory is also the only place RED's **performance gate** can be scored:
@@ -68,7 +68,7 @@ deterministic result signature before accepting the cycle counts.
 ## Layout
 
 ```
-spec/                       pinned ISASpec for every project (legacy ISASpec.json = micro-ecc)
+spec/                       pinned ISASpec for every project (legacy ISASpec.yaml = micro-ecc)
 projects/matrixmul/          float instruction model and matrix workload
 projects/libcrc/             CRC RTL and CRC workload
 rtl/                         shared PicoRV32 integration, SoC, and testbench

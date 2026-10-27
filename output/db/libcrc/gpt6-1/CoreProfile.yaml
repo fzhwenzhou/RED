@@ -1,0 +1,41 @@
+area_note: GPR storage is 992 writable bits; two 64-bit counters and five 32-bit PC/operand/result registers bring this subtotal to 1280 bits, before other state and mul/div registers. A 512-bit operand buffer is about half the GPR storage and is substantial. Existing accelerator arrays total 1024 bits. These are RTL storage counts, not synthesized cell area.
+constraints:
+- PCPI alone cannot access memory; retain the project's separate accelerator master and busy-controlled bus mux for memory operands.
+- Only one instruction executes at a time; accelerator execution stalls the CPU.
+- Assert pcpi_wait promptly and hold it during long operations; the core has a 4-bit unsupported-instruction timeout counter.
+- 'Decode exclusively: external PCPI and internal multiply/divide share completion selection.'
+- Preserve bus ownership and mem_issued acknowledgment guarding; CPU prefetch can leave an acknowledgment at accelerator takeover.
+- Use aligned word pointers for accelerator blocks; its direct memory port has no alignment checker.
+- The 2-cycle word cost is one read OR write; copying a word requires at least 4 bus cycles.
+- Issue overhead means one clock from asserted pcpi_valid/operands to red_accel accepting them; it excludes fetch/decode and completion/writeback.
+- Enabling IRQs later would introduce core custom-0 opcode conflicts.
+coprocessor: 'PCPI supplies a 32-bit instruction and two 32-bit register operands; wait stalls execution, ready completes it. PCPI itself has no memory signals. This project''s red_accel additionally has a memory-master port: red_core selects it using acc_busy and blocks CPU memory acknowledgments.'
+coprocessor_issue_overhead: 1
+coprocessor_memory_access: true
+coprocessor_result: One 32-bit pcpi_rd written to the instruction's rd when pcpi_ready and pcpi_wr are asserted; x0 discards it. Larger results require memory writes or multiple instructions. Existing red_accel writes a 512-bit product to memory and returns zero.
+custom_opcode_space:
+- 'custom-0 0x0B: funct3=0/funct7=0 is occupied by red_accel; other combinations are available in this configuration.'
+- custom-1 0x2B, custom-2 0x5B, custom-3 0x7B are unclaimed by the inspected decoder and accelerator.
+- 'Do not overlap standard M encodings: opcode 0x33/funct7=1 already reaches internal multiply/divide units.'
+cycles_per_alu_op: 4
+cycles_per_load: 7
+cycles_per_word_moved: 2
+evidence:
+- rtl/red_soc_tb.v instantiates red_core with ENABLE_ACCEL, default 1; rtl/red_core.v instantiates cpu with FAST_MUL=1, DIV=1, MUL=0, PCPI=ENABLE_ACCEL, IRQ=0 and COMPRESSED_ISA=0. This project evaluation hierarchy, wired to red_accel, takes precedence over vendor examples.
+- 'picorv32/picorv32.v module parameters supply unoverridden defaults: ENABLE_REGS_16_31=1, ENABLE_REGS_DUALPORT=1, ENABLE_COUNTERS64=1, BARREL_SHIFTER=0 and TWO_STAGE_SHIFT=1.'
+- picorv32 ports, pcpi_int_* selection, cpu_state_ld_rs1, pcpi_timeout_counter and cpuregs write/read logic establish operand, result and handshake limits.
+- picorv32_pcpi_mul, picorv32_pcpi_fast_mul and picorv32_pcpi_div were inspected; generate selection enables fast multiply and divide, not the sequential shift-add multiplier.
+- 'picorv32 mem_state/mem_xfer, cpu_state_exec/ldmem/shift and rtl/red_soc_tb.v registered memory always block establish timing. Icarus simulation of copied project RTL confirmed launch intervals: ADD/ADDI 4, LW 7, MUL 6, DIV 40 cycles.'
+- rtl/red_accel.v insn_any reserves custom-0/funct3=0/funct7=0; S_IDLE accepts PCPI, S_LOAD/S_STORE use beat_done=mem_valid&&mem_issued&&mem_ready. rtl/red_core.v acc_busy mux provides memory ownership.
+- picorv32 regfile_size/cpuregs, count_cycle/count_instr and reg_pc/reg_next_pc/reg_op1/reg_op2/reg_out declarations establish the storage subtotal.
+existing_units:
+- 32-bit combinational add/subtract, logic and comparisons; TWO_CYCLE_ALU=0 and TWO_CYCLE_COMPARE=0.
+- 'Fast MUL/MULH/MULHSU/MULHU: registered signed 33×33 multiplication expression, one multiplication stage; EXTRA_MUL_FFS=0. Measured MUL instruction cost: 6 cycles. Physical DSP/logic mapping depends on synthesis.'
+- 'DIV/DIVU/REM/REMU: iterative compare/subtract and right shift, 32 quotient steps; measured DIV instruction cost: 40 cycles.'
+- 'No barrel shifter: BARREL_SHIFTER=0, TWO_STAGE_SHIFT=1; shifts iterate by four bits or one bit.'
+- Existing red_accel adds a separate 32×32 multiplier and 64-bit accumulation datapath, reused for 64 limb products, plus sixteen-word operand and product arrays.
+isa: RV32IM; ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=1. Compressed instructions and IRQs disabled. 64-bit cycle/instruction counters enabled; limited counter-read CSR decoding.
+memory_interface: 'Unified instruction/data native bus: 32-bit byte address, 32-bit data, four byte write strobes, mem_valid/mem_ready handshake. CPU look-ahead ports are unconnected. red_soc_tb provides 256 KiB SRAM plus MMIO, with registered ready; accelerator streaming transfers cost 2 cycles per word per direction.'
+microarchitecture: Multi-cycle, in-order FSM with instruction prefetch, not an instruction pipeline. Project SRAM timing gives 4 cycles per ordinary ADD/ADDI/logic instruction and 7 per aligned load; shifts take additional iterative cycles.
+name: 'RED red_soc_tb → red_core.cpu: PicoRV32 with ENABLE_ACCEL=1'
+register_file: 32 architectural 32-bit registers, x0 fixed zero; 31 writable registers. Two combinational read ports and one clocked write port. No IRQ q-registers. PCPI receives at most two register operands.

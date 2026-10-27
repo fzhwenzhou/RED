@@ -1,0 +1,9 @@
+# Spec review
+
+Reviewers: implementability, callability, benefit, legality
+Findings: 0 blocking, 1 major, 0 minor
+
+## [MAJOR] spec-wide — benefit
+**Finding.** The gate's 4.62x prediction omits mandatory caller work, so it does not establish the whole-application speedup.
+**Evidence.** Using the gate-adjusted costs, xqpack2.s costs 38×20,000,000=760,000,000 cycles, xqdot4 costs 32×60,000,000=1,920,000,000, and xqto.s costs 37×20,000,000=740,000,000; marshaling adds zero. Their individual comparisons against the same calibrated region are approximately 21x, 8.35x and 22x, but these benefits cannot be added: the composed sequence costs 3.42 billion cycles. Per logical product that is 17,100 cycles. The spec additionally requires at least 1,060 CPU memory accesses, costing 7,420 cycles at its stated latency. Against approximately 80,200 baseline cycles, this limits region speedup to about 3.27x and whole-application speedup to about 3.24x by Amdahl's law with share 0.995706, before packing merges, rejection checks, accumulation ADDs and loop overhead. Useful acceleration re
+**Suggested fix.** Keep marshal_words=0 for these register forms, but include the complete software caller schedule in the performance estimate and validate it with an integrated RV32 implementation. Report the resulting application speedup separately from the instruction-only ceiling.

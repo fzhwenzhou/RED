@@ -1,0 +1,151 @@
+coverage: 0.8552812281064902
+loops:
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tshort_c = 0x00FF & (uint16_t) *ptr;\n\n\tif ( crc & 0x8000 ) crc = ( crc << 1 ) ^ CRC_POLY_SICK;\n\telse                crc =   crc << 1;\n\n\tcrc    ^= ( short_c | short_p );\n\tshort_p = short_c << 8;\n\n\tptr++;\n}\n"
+  calls: 250
+  cycle_share: 0.1237847514290407
+  dynamic_cycles: 45058250
+  function: crc_sick
+  ir: ''
+  loop_id: crc_sick::byte_loop
+  operand_stats: |-
+    - 'bit-serial CRC-16 (no table): one conditional shift/xor-poly step per input byte; data-dependent branch on crc bit 15'
+    - uint16_t crc state, uint8 input byte widened to uint16; short_p carries previous byte << 8
+    - loop-carried dependency on crc and short_p; sequential unit-stride byte loads from input_str
+    - no table loads; heaviest per-byte cost (about 11 instr/byte) of all CRC kernels
+  rank: 1
+  source_file: libcrc/src/crcsick.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc << 8) ^ crc_tabccitt[ ((crc >> 8) ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.09002971501607818
+  dynamic_cycles: 32771253
+  function: crc_ccitt_1d0f
+  ir: ''
+  loop_id: crc_ccitt_1d0f::ccitt_generic_byte_loop
+  operand_stats: |-
+    - 'table-driven CRC-16/CCITT (MSB-first): index = (crc>>8 ^ byte) & 0xFF into 256-entry uint16_t table (512 B)'
+    - loop body is static crc_ccitt_generic inlined into the wrapper; start value 0x1d0f
+    - 16-bit crc state, 8-bit data; loop-carried dependency through crc then a dependent table load
+    - sequential unit-stride byte loads from input_str; table lookup is data-dependent gather within a small table
+  rank: 2
+  source_file: libcrc/src/crcccitt.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc << 8) ^ crc_tabccitt[ ((crc >> 8) ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.09002970677442977
+  dynamic_cycles: 32771250
+  function: crc_ccitt_ffff
+  ir: ''
+  loop_id: crc_ccitt_ffff::ccitt_generic_byte_loop
+  operand_stats: |-
+    - same body as crc_ccitt_1d0f (shared crc_ccitt_generic, start value 0xffff); table-driven CRC-16 MSB-first
+    - 16-bit crc state, 8-bit data, 256x uint16_t table; loop-carried dependency through crc and table load
+    - sequential unit-stride byte loads
+  rank: 3
+  source_file: libcrc/src/crcccitt.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc << 8) ^ crc_tabccitt[ ((crc >> 8) ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.09002970677442977
+  dynamic_cycles: 32771250
+  function: crc_xmodem
+  ir: ''
+  loop_id: crc_xmodem::ccitt_generic_byte_loop
+  operand_stats: |-
+    - same body as crc_ccitt_1d0f (shared crc_ccitt_generic, start value 0x0000); table-driven CRC-16 MSB-first
+    - 16-bit crc state, 8-bit data, 256x uint16_t table; loop-carried dependency through crc and table load
+    - sequential unit-stride byte loads
+  rank: 4
+  source_file: libcrc/src/crcccitt.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc >> 8) ^ crc_tabdnp[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.07877918363236318
+  dynamic_cycles: 28676005
+  function: crc_dnp
+  ir: ''
+  loop_id: crc_dnp::byte_loop
+  operand_stats: |-
+    - 'table-driven reflected CRC-16 (LSB-first): index = (crc ^ byte) & 0xFF into 256-entry uint16_t table'
+    - 16-bit crc state, 8-bit data; loop-carried dependency through crc then dependent table load
+    - sequential unit-stride byte loads; table built lazily by init_crcdnp_tab (cold)
+    - 'epilogue after loop: bit-invert and byte-swap (not hot)'
+  rank: 5
+  source_file: libcrc/src/crcdnp.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc >> 8) ^ crc_tab[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.07877849408111322
+  dynamic_cycles: 28675754
+  function: crc_kermit
+  ir: ''
+  loop_id: crc_kermit::byte_loop
+  operand_stats: |-
+    - table-driven reflected CRC-16 (LSB-first), same shape as crc_dnp / crc_16 with a different polynomial table
+    - 16-bit crc state, 8-bit data, 256x uint16_t table; loop-carried dependency
+    - sequential unit-stride byte loads; epilogue byte-swap (not hot)
+  rank: 6
+  source_file: libcrc/src/crckrmit.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc >> 8) ^ crc_tab16[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.07877712047304557
+  dynamic_cycles: 28675254
+  function: crc_16
+  ir: ''
+  loop_id: crc_16::byte_loop
+  operand_stats: |-
+    - 'table-driven reflected CRC-16 (LSB-first): index = (crc ^ byte) & 0xFF into 256-entry uint16_t table (512 B)'
+    - 16-bit crc state, 8-bit data; loop-carried dependency through crc then dependent table load
+    - sequential unit-stride byte loads from input_str
+  rank: 7
+  source_file: libcrc/src/crc16.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc >> 8) ^ crc_tab16[ (crc ^ (uint16_t) *ptr++) & 0x00FF ];\n}\n"
+  calls: 250
+  cycle_share: 0.07877710948418103
+  dynamic_cycles: 28675250
+  function: crc_modbus
+  ir: ''
+  loop_id: crc_modbus::byte_loop
+  operand_stats: |-
+    - identical body to crc_16 (shares crc_tab16); only the start value differs (CRC_START_MODBUS)
+    - 16-bit crc state, 8-bit data; loop-carried dependency through crc and table load
+    - sequential unit-stride byte loads
+  rank: 8
+  source_file: libcrc/src/crc16.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc >> 8) ^ crc_tab32[ (crc ^ (uint32_t) *ptr++) & 0x000000FFul ];\n}\n"
+  calls: 250
+  cycle_share: 0.07877367546401189
+  dynamic_cycles: 28674000
+  function: crc_32
+  ir: ''
+  loop_id: crc_32::byte_loop
+  operand_stats: |-
+    - 'table-driven reflected CRC-32: index = (crc ^ byte) & 0xFF into 256-entry uint32_t table (1 KiB, precomputed static in gentab32.inc)'
+    - 32-bit crc state, 8-bit data; loop-carried dependency through crc then dependent table load
+    - sequential unit-stride byte loads; final xor with 0xFFFFFFFF after loop (not hot)
+  rank: 9
+  source_file: libcrc/src/crc32.c
+  trip_count: 16384
+- body: "for (a=0; a<num_bytes; a++) {\n\n\tcrc = (crc << 8) ^ crc_tab64[ ((crc >> 56) ^ (uint64_t) *ptr++) & 0x00000000000000FFull ];\n}\n"
+  calls: 250
+  cycle_share: 0.06752176497779695
+  dynamic_cycles: 24578250
+  function: crc_64_ecma
+  ir: ''
+  loop_id: crc_64_ecma::byte_loop
+  operand_stats: |-
+    - 'table-driven MSB-first CRC-64: index = (crc>>56 ^ byte) & 0xFF into 256-entry uint64_t table (2 KiB, precomputed static)'
+    - 64-bit crc state, 8-bit data; loop-carried dependency through crc then dependent table load
+    - sequential unit-stride byte loads; crc_64_we has an identical loop body with a different start value and final xor, about the same cost
+  rank: 10
+  source_file: libcrc/src/crc64.c
+  trip_count: 16384
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/libcrc/20261026-113336-541d29/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/libcrc/20261026-113336-541d29/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 364004851
+workload: libcrc

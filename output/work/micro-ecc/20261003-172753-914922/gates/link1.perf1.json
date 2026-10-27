@@ -1,6 +1,0 @@
-{
-  "counterexample": null,
-  "detail": "coverage 97.18% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan",
-  "gate": "link1",
-  "passed": true
-}

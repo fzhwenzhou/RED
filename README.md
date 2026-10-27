@@ -35,7 +35,7 @@ artifact those downstream nodes would consume.
 | **A1 — Kernel mining** | Build + profile the project's own workload harness (callgrind), rank hot loops to ≥80% cycle coverage. Agentic ranking over a mechanical profile. | **Implemented** |
 | **Gate 1** | Two independent profile runs must agree within ±5%. | **Implemented** |
 | **A0 — Core analysis** | A separate agent reads the target core's RTL and writes a typed `CoreProfile`: ISA, microarchitecture, what the coprocessor interface can reach, units that already exist, per-core cycle costs. Runs concurrently with A1. | **Implemented** |
-| **A2 — ISA synthesis** | S2a pattern analyzer → S2b instruction designer → S2c spec critic, emitting the `ISASpec`. Designs against the `CoreProfile`, not an abstract RISC-V. | **Implemented** |
+| **A2 — ISA synthesis** | S2a pattern analyzer → S2b instruction designer → S2c spec critic, emitting the `ISASpec` ([format reference](ISASPEC_FORMAT.md)). Designs against the `CoreProfile`, not an abstract RISC-V. | **Implemented** |
 | **Gate 3 — performance** | Costs every instruction against the target's *measured* platform model, handing the designer the arithmetic when it falls short (≤4 redesign rounds). The bar is **not fixed at 2×**: Amdahl caps an extension at `1/(1-coverage)`, so a design covering 47% of an application is held to a reachable bar rather than an impossible one, and the bar relaxes each redesign round to a 1.15× floor. Re-priced on the spec that actually ships, because the review can revise a design after the gate last ran. | **Implemented** |
 | **Gate 4 — security** | Runs each C model under ASan+UBSan on adversarial operand values in exactly-sized allocations, against two differently poisoned output blocks (an unwritten output word is a residue leak), and counts the instructions the model itself executes for several operand values (a difference is a timing side channel). Decodes the encoding bits, and taint-scans the model for secret-dependent control flow. A **security sub-agent** probes each model with operand values chosen from what the arithmetic *means*. Only mechanically confirmed findings can fail the gate (≤2 revision rounds). | **Implemented** |
 | **Spec review** | Four sub-agents examine the spec *concurrently* — implementability, callability, benefit, legality. Each sees its own findings from the previous round and must adjudicate them, so the review converges instead of redrawing; blocking findings go back to the designer (≤4 rounds). | **Implemented** |
@@ -149,12 +149,19 @@ red/
   db_node.py      durable artifact store (outlives the run directory)
   tools.py        sealed MCP tools the agents use (source/profile/report/spec/…)
   localtool.py    runs one of those tool servers in-process on a loopback port
-  backend.py      one agent turn = one `claude -p` subprocess over those tools
+  backend.py      one agent turn = one agent-CLI subprocess over those tools
+                  (Claude Code and Codex; both sealed to their own tools)
+  modelcfg.py     which backend and model run which stage, from models.toml
   nodes.py        mechanical edges: A1 profiling, Gate 1, link 1, Gate 2, link 2
   iss.py          Gate 2: Spike extension codegen, rv32 harness, the diff
   iss_selftest.py proves Gate 2 both passes agreeing models and fails others
   cost.py         Gate 3: the platform cost model and the speedup prediction
   security.py     Gate 4: the mechanical security checks (sanitizers, ctgrind…)
+  structure.py    the structural check: is this an ISA extension, or one
+                  opcode with a kernel behind it?
+  rsi.py          recursive self-improvement: run telemetry, proposals against
+                  RED's own prompts, and the guard that keeps the improver
+                  away from everything that scores a run
   workload.py     Gate 0: does a candidate harness measure anything?
   review.py       the four review sub-agents and their adjudication
   graph.py        the persistent Neo4j knowledge graph (writes + agent queries)
@@ -162,14 +169,23 @@ red/
   loop.py         the orchestration driver (AW → A1 → A2 → Gate 3/4 → review → Gate 2)
   prompts/        agent charters (workload.md, mine.md, core.md, system.md,
                   redesign.md, secure.md, security.md, revise.md, iss.md,
-                  debug.md, review/)
+                  debug.md, improve.md, review/)
 target_project/   the projects to design for (micro-ecc, libcrc, matrixmul)
                   — INPUTS, not hard-coded
+models.toml       per-stage model routing — an INPUT, not hard-coded
 target_cpu/       one example core (PicoRV32)      — an INPUT, not hard-coded
 scripts/          red_env.sh (set this machine up, check it), run_projects.sh
                   (every project in turn), setup_spike.sh (Gate 2 toolchain),
                   setup_neo4j.sh (knowledge graph)
+rsi/              tunables.toml (loop knobs the improver may retune) and
+                  proposals/ (every self-improvement proposal and its fate)
 ARCHITECTURE.md   the agent loop: agents, gates, feedback edges, flow charts
+ISASPEC_FORMAT.md the ISASpec format: operand forms, architectural state,
+                  the executable models, and what makes a spec an extension
+RSI.md            recursive self-improvement: what may change, what may not,
+                  and how "better" is decided
+ISASPEC_FORMAT.md the deliverable's format: every field, every validation
+                  rule, the fixed operand ABI, and a worked example
 SPIKE_SETUP.md    installing Spike for Gate 2 (what, where, why, verifying)
 NEO4J_SETUP.md    the knowledge graph: install, model, what the agents ask it
 eval/             does the extension actually pay off? RTL, area, end-to-end
@@ -221,9 +237,59 @@ bash scripts/red_env.sh status     # graph, toolchain, backend, runs on disk
 
 There is no bring-up and no teardown. `--mechanical` is the free path: it runs
 the profile, Gate 1 and the typed artifacts with no agent turns at all, which
-is what to run after changing anything mechanical. `--model` pins the model for
-the agent turns; without it RED uses whatever your Claude Code install is
-configured for.
+is what to run after changing anything mechanical.
+
+## One model per stage
+
+RED's agent turns are not equally important, so they do not have to run on the
+same model. `models.toml` maps each stage to a model and an effort level, and
+`red/modelcfg.py` resolves it. No model id appears anywhere in the code; a test
+enforces that.
+
+The split follows the same principle as the gates. **A stage whose output a
+program checks can run cheaper, because a weak answer costs a round rather
+than shipping.** AW writes a harness and Gate 0 decides by running it; the
+security sub-agent proposes operand values and only the ones that actually
+break a model under the sanitizers become findings; a repair turn gets the
+compiler diagnostic back and link 1 re-runs on the result. Those three are
+routed to a cheaper model. The designer, whose output *is* the deliverable,
+runs at the highest effort, as does the ISS implementer, since Gate 2 only
+means something if the independent side was written competently.
+
+```toml
+[default]
+model  = "<strong-model-id>"
+effort = "high"
+
+[roles.security]           # proposals a sanitizer adjudicates
+model  = "<cheaper-model-id>"
+effort = "medium"
+
+[roles.design]             # writes the deliverable
+effort = "xhigh"
+```
+
+An entry may also name a **`backend`**, which is how a stage runs on a
+different vendor's agent entirely: `claude` drives Claude Code, `codex` drives
+OpenAI's Codex CLI. The natural use is the ISS implementer, since Gate 2's
+independence argument gets stronger the less the two implementations share.
+Both backends seal the turn to its own tools, by different means (Claude:
+`--strict-mcp-config` plus `--allowedTools`; Codex: `--ignore-user-config`
+plus per-server `enabled_tools`), and a test asserts both halves are present
+in each. One asymmetry is worth knowing: Codex only permits MCP calls
+headlessly under `--dangerously-bypass-approvals-and-sandbox`, which also
+disables its shell sandbox, so a Codex-routed stage is a larger trust surface
+than a Claude-routed one. RED gives it a throwaway working directory;
+`red/backend.py` spells out the rest.
+
+Resolution per stage: `[roles.<name>]`, then `[default]`, then `--model` /
+`--effort` / `--backend`, then whatever the CLI is set to. Every run prints
+the table it resolved, so a routing surprise shows up in the log rather than
+in a result. `--models-config PATH` picks a different file, and
+`--models-config ''` turns routing off so one `--model` applies everywhere,
+which is what makes a model sweep a fair comparison. The eleven stage names
+are listed in `red/modelcfg.py`; an unknown name in the file is reported
+rather than silently ignored.
 
 `run_projects.sh` holds the per-project inputs that cannot be guessed from the
 sources — the harness (leave it empty and AW writes one), the cflags that define
@@ -231,8 +297,8 @@ the workload's configuration, and `--exclude` for directories belonging to a
 *different* program in the same repository, like libcrc's `precalc/` table
 generator. A project with no entry runs fully automatically.
 
-Artifacts land in `output/db/<workload>/run_<N>/`: `profile.json`,
-`HotLoopReport.json`, `ISASpec.draft.json`, `ISASpec.json` (the deliverable),
+Artifacts land in `output/db/<workload>/run_<N>/`: `profile.yaml`,
+`HotLoopReport.yaml`, `ISASpec.draft.yaml`, `ISASpec.yaml` (the deliverable),
 `gates/`, and `summary.md`.
 
 ## Designing for speed, not just correctness

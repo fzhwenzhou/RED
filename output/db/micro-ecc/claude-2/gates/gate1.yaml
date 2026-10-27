@@ -1,0 +1,4 @@
+counterexample: null
+detail: runs 8943908033 vs 8943969968 cycles (0.00% vs ±5%)
+gate: gate1
+passed: true

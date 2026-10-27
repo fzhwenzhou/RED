@@ -1,0 +1,13 @@
+# Loop knobs the self-improver may retune (red/rsi.py).
+# Each is clamped to its declared bounds on read; anything that
+# defines the bar a run is judged against is frozen, not here.
+
+[loop]
+# A2 self-critique rounds before the spec goes to the reviewers (1..6)
+CRITIC_MAX_ROUNDS = 3
+# Gate 3 redesign rounds before the bar relaxes (1..8)
+PERF_MAX_ROUNDS = 4
+# agentic repair attempts after a link-1 failure (1..6)
+REPAIR_MAX_ROUNDS = 3
+# review/revise rounds before the loop ships the best-scoring spec it has (1..8)
+REVIEW_MAX_ROUNDS = 4

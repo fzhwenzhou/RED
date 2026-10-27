@@ -30,7 +30,6 @@ general-purpose; nothing about any specific workload is hard-coded.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -302,7 +301,7 @@ def _parse_asm(text: str) -> dict:
 def workload_check(project: str, harness_source: str, work_dir: str,
                    cflags: str = "", exclude: str = "") -> str:
     """Build the candidate harness, run it twice under callgrind, and return a
-    measured ``WorkloadSpec`` as JSON.
+    measured ``WorkloadSpec`` as YAML.
 
     Takes the harness's **source text**, not a path — the agent writes it
     through a sealed tool that chooses where it lands, and this edge should not
@@ -318,10 +317,10 @@ def workload_check(project: str, harness_source: str, work_dir: str,
     with open(harness, "w") as f:
         f.write(harness_source)
     spec = workload.measure(project, harness, work_dir, cflags, exclude)
-    return state_def.to_json(spec)
+    return state_def.to_yaml(spec)
 
 
-def gate0(spec_json: str) -> state_def.GateResult:
+def gate0(spec_yaml: str) -> state_def.GateResult:
     """Gate 0: the workload does enough work, in the project's own code,
     reproducibly.
 
@@ -330,8 +329,8 @@ def gate0(spec_json: str) -> state_def.GateResult:
     ``printf`` fails the project-share condition however well it reads."""
     from red import workload
     try:
-        spec = state_def.from_json(spec_json, state_def.WorkloadSpec)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        spec = state_def.from_yaml(spec_yaml, state_def.WorkloadSpec)
+    except (TypeError, ValueError) as e:
         return state_def.GateResult(gate="gate0", passed=False,
                                     detail=f"invalid WorkloadSpec: {e}")
     return workload.verdict(spec)
@@ -508,7 +507,7 @@ def _stress_c_model(ins: state_def.InstructionSpec, work_dir: str,
     return True, run.stdout.strip()
 
 
-def link1(report_json: str, spec_json: str,
+def link1(report_yaml: str, spec_yaml: str,
           work_dir: str = "") -> state_def.GateResult:
     """Link 1: the mined kernels' coverage holds AND every instruction's C
     reference model is executable.
@@ -528,11 +527,11 @@ def link1(report_json: str, spec_json: str,
     it falsifies the model's executability and totality, not its equivalence to
     the kernel."""
     try:
-        report = state_def.from_json(report_json, state_def.HotLoopReport)
+        report = state_def.from_yaml(report_yaml, state_def.HotLoopReport)
         state_def.validate_hot_loop_report(report)
-        spec = state_def.from_json(spec_json, state_def.ISASpec)
+        spec = state_def.from_yaml(spec_yaml, state_def.ISASpec)
         state_def.validate_isa_spec(spec)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
+    except (TypeError, ValueError) as e:
         return state_def.GateResult(gate="link1", passed=False,
                                     detail=f"invalid artifact: {e}")
 
@@ -563,7 +562,7 @@ def link1(report_json: str, spec_json: str,
         counterexample="\n".join(failures) or None)
 
 
-def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
+def gate2(spec_yaml: str, work_dir: str = "") -> state_def.GateResult:
     """Gate 2: the ISASpec's C model and a patched Spike ISS must agree on
     GATE2_VECTORS random + corner vectors.
 
@@ -578,9 +577,9 @@ def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
     from the rv32 stream, its operands arrive in architectural registers and its
     memory traffic goes through the simulator's MMU."""
     try:
-        spec = state_def.from_json(spec_json, state_def.ISASpec)
+        spec = state_def.from_yaml(spec_yaml, state_def.ISASpec)
         state_def.validate_isa_spec(spec)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
+    except (TypeError, ValueError) as e:
         return state_def.GateResult(gate="gate2", passed=False,
                                     detail=f"invalid ISASpec: {e}")
 
@@ -595,10 +594,10 @@ def gate2(spec_json: str, work_dir: str = "") -> state_def.GateResult:
 # Gate 4 — the security bound (red.security)
 # ---------------------------------------------------------------------------
 
-def security_scan(spec_json: str, core_json: str = "",
+def security_scan(spec_yaml: str, core_yaml: str = "",
                   work_dir: str = "") -> str:
     """Run every mechanical security check on the spec; return a SecurityReport
-    as JSON.
+    as YAML.
 
     Needs a C compiler with the sanitizers, and valgrind for the constant-time
     checks. The verdict itself is :func:`gate4`, kept separate and pure so the
@@ -606,25 +605,25 @@ def security_scan(spec_json: str, core_json: str = "",
     shown to the agents, merged with the security sub-agent's findings, and only
     then turned into a pass or a fail.
 
-    Returns an empty-report JSON with the failure in ``checks_skipped`` rather
+    Returns an empty report with the failure in ``checks_skipped`` rather
     than raising, so a malformed draft cannot take the run down here."""
     from red import security                  # local: only this node needs it
     try:
-        spec = state_def.from_json(spec_json, state_def.ISASpec)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        return state_def.to_json(state_def.SecurityReport(
+        spec = state_def.from_yaml(spec_yaml, state_def.ISASpec)
+    except (TypeError, ValueError) as e:
+        return state_def.to_yaml(state_def.SecurityReport(
             checks_skipped=[f"every check: the ISASpec did not parse — {e}"]))
     core = None
-    if core_json:
+    if core_yaml:
         try:
-            core = state_def.from_json(core_json, state_def.CoreProfile)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            core = state_def.from_yaml(core_yaml, state_def.CoreProfile)
+        except (TypeError, ValueError):
             core = None
     work_dir = work_dir or os.path.join(OUTPUT_ROOT, "security")
-    return state_def.to_json(security.analyze(spec, core, work_dir))
+    return state_def.to_yaml(security.analyze(spec, core, work_dir))
 
 
-def gate4(report_json: str) -> state_def.GateResult:
+def gate4(report_yaml: str) -> state_def.GateResult:
     """Gate 4: the spec carries no mechanically confirmed security defect.
 
     Deliberately decided by the machine-established findings alone — a
@@ -636,16 +635,16 @@ def gate4(report_json: str) -> state_def.GateResult:
     which the loop then executes (see :func:`red.security.probe`)."""
     from red import security
     try:
-        report = state_def.from_json(report_json, state_def.SecurityReport)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        report = state_def.from_yaml(report_yaml, state_def.SecurityReport)
+    except (TypeError, ValueError) as e:
         return state_def.GateResult(gate="gate4", passed=False,
                                     detail=f"invalid SecurityReport: {e}")
     return security.verdict(report)
 
 
-def link2(gate2_json: str) -> state_def.GateResult:
+def link2(gate2_yaml: str) -> state_def.GateResult:
     """Link 2: C model <=> patched Spike agreement — mirrors Gate 2's verdict."""
-    g = state_def.from_json(gate2_json, state_def.GateResult)
+    g = state_def.from_yaml(gate2_yaml, state_def.GateResult)
     return state_def.GateResult(gate="link2", passed=g.passed, detail=g.detail,
                                 counterexample=g.counterexample)
 

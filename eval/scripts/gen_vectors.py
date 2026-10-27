@@ -9,15 +9,16 @@ Output (eval/build/vectors.txt), 36 hex words per vector:
 
     opcode  funct3  funct7  nwords  in[0..15]  expected_out[0..15]
 
-Usage:  python eval/scripts/gen_vectors.py [ISASpec.json] [--n 200]
+Usage:  python eval/scripts/gen_vectors.py [ISASpec.yaml] [--n 200]
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
+
+import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MAX_WORDS = 16          # tb_accel.v's buffer stride
@@ -78,8 +79,8 @@ def c_identifier(mnemonic: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("spec", nargs="?", default=os.path.join(REPO, "eval", "spec", "micro-ecc.json"),
-                    help="ISASpec.json (default: eval/spec/micro-ecc.json)")
+    ap.add_argument("spec", nargs="?", default=os.path.join(REPO, "eval", "spec", "micro-ecc.yaml"),
+                    help="ISASpec.yaml (default: eval/spec/micro-ecc.yaml)")
     ap.add_argument("--n", type=int, default=200, help="random vectors per instruction")
     ap.add_argument("--out", default=os.path.join(REPO, "eval", "build", "vectors.txt"))
     args = ap.parse_args()
@@ -87,7 +88,7 @@ def main() -> int:
     spec_path = args.spec
     if args.n < 0:
         ap.error("--n must be nonnegative")
-    spec = json.load(open(spec_path))
+    spec = yaml.safe_load(open(spec_path).read())
     print(f"spec: {spec_path}  ({spec['name']}, {len(spec['instructions'])} instructions)")
 
     instructions = spec["instructions"]

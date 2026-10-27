@@ -1,0 +1,173 @@
+# Which model runs which RED stage.
+#
+# Read by red/modelcfg.py; point RED_MODELS_CONFIG or --models-config
+# somewhere else to use a different routing, or delete this file to run every
+# stage on whatever --model says.
+#
+# THE RULE BEHIND THE SPLIT. RED is built so that agents propose and programs
+# decide. Where that holds, the model is cheap to downgrade: a weaker answer
+# costs a round, because a gate rejects it with a counterexample and the loop
+# tries again. Where it does not hold, the model's output *is* the result and
+# a weaker answer ships. So the split below is not "important vs unimportant",
+# it is "checked by a machine vs not".
+#
+# Fields are model and effort (low|medium|high|xhigh|max); either may be
+# omitted to inherit from [default]. Every run prints the table it resolved.
+
+# Each entry may also name a `backend`: "claude" (Claude Code) or "codex"
+# (OpenAI's Codex CLI). Routing a stage to another vendor is the same
+# mechanism as routing it to another model.
+
+# ---------------------------------------------------------------------------
+# THE GPT-6 FAMILY, AND WHAT EACH COSTS
+# ---------------------------------------------------------------------------
+#
+# Standard tier, USD per 1M tokens, from OpenAI's own pricing page
+# (developers.openai.com/api/docs/pricing, read 2026-10-24):
+#
+#   model          input   output   cached input
+#   gpt-6-astra    10.00    50.00     1.00     frontier
+#   gpt-6.1-sol     2.00    10.00     0.10     latest workhorse
+#   gpt-6-sol       2.00    10.00     0.20     previous-generation workhorse
+#   gpt-6-luna      0.10     0.50     0.01     fast and cheap
+#
+# Astra is 5x Sol and 100x Luna. `gpt-6.1-sol` is used rather than
+# `gpt-6-sol`: same headline price, a better cached-input rate, and the Codex
+# model list calls it the current workhorse against the other's "previous
+# generation". Model ids are the slugs the installed Codex CLI reports
+# (~/.codex/models_cache.json), not names taken from a blog post.
+#
+# The budget is set by what the last matrixmul run actually cost per stage,
+# from its transcript: design $3.56 (46 turns), core analysis $0.92 (25),
+# ISS $0.79 (13), mining $0.35, security $0.21, workload $0.12. Synthesis is
+# three quarters of the bill, so that is where Astra goes and nowhere else
+# except the one stage that constrains it.
+
+[default]
+backend = "codex"
+model   = "gpt-6.1-sol"
+effort  = "high"
+
+# ---------------------------------------------------------------------------
+# Stages a program checks, so a cheaper model costs at most a round
+# ---------------------------------------------------------------------------
+
+# The security sub-agent proposes operand values. Only vectors that actually
+# break a model under the sanitizers become findings; what it merely asserts
+# is capped at advisory and cannot fail Gate 4. Its job is to widen the
+# search, which is a job the cheapest model does acceptably.
+[roles.security]
+model  = "gpt-6-luna"
+effort = "medium"
+
+# Repairing a C model that failed to compile or tripped a sanitizer. The
+# compiler diagnostic or the failing vector comes back with the request and
+# link 1 re-runs on the result, so this is a bounded mechanical fix with the
+# answer largely in the prompt. High effort on the cheapest model costs less
+# than one Sol turn and keeps the repair loop from burning its three rounds.
+[roles.repair]
+model  = "gpt-6-luna"
+effort = "high"
+
+# AW writes a candidate harness. Gate 0 builds it, runs it twice, and requires
+# 50M+ instructions with 60%+ in the binary's own symbols, so nothing it
+# claims about its own harness is believed. It is still real C against an
+# unfamiliar library, and a harness that cannot clear Gate 0 fails the whole
+# run four rounds later, so this is Sol rather than Luna.
+[roles.workload]
+effort = "medium"
+
+# ---------------------------------------------------------------------------
+# Stages where judgment is the product
+# ---------------------------------------------------------------------------
+
+# A1 ranks hot loops. The profile is ground truth, but which regions are worth
+# hardening is a reading of the algorithm, and everything downstream inherits
+# the choice.
+[roles.mine]
+effort = "high"
+
+# A0 reads the core's RTL. Getting "the coprocessor interface cannot reach
+# memory" wrong makes every later design unbuildable, and the CoreProfile it
+# writes also supplies the cost model's per-cycle parameters — so an error
+# here is not caught by Gate 3, it is *believed* by Gate 3. One turn, and
+# every later decision is downstream of it: the cheapest place Astra buys
+# anything.
+[roles.core]
+backend = "codex"
+model   = "gpt-6-astra"
+effort  = "high"
+
+# A2 writes the deliverable. Nothing downstream can supply judgment it lacked:
+# the gates can reject a design but cannot invent a better one. This is also
+# where the structural discipline has to come from — the check in
+# red/structure.py rejects a 200-word monolith, but only a capable designer
+# turns that rejection into a decomposition rather than a smaller monolith.
+[roles.design]
+backend = "codex"
+model   = "gpt-6-astra"
+effort  = "xhigh"
+
+# Redesign after Gate 3 hands back the cost arithmetic, and revision after the
+# reviewers raise blocking findings. Both rewrite the shipped spec, so both
+# are the deliverable too.
+[roles.redesign]
+backend = "codex"
+model   = "gpt-6-astra"
+effort  = "xhigh"
+
+[roles.revise]
+backend = "codex"
+model   = "gpt-6-astra"
+effort  = "xhigh"
+
+# The independent Spike implementation. Gate 2 is only evidence that the spec
+# is unambiguous if this side is written competently; a weak implementation
+# makes a disagreement say nothing about the specification.
+#
+# Note what this routing costs in independence. Gate 2 compares the designer's
+# C model against this C++ one, and the comparison is strongest when the two
+# were written by agents with as little in common as possible. Running the
+# designer on Astra and this on Sol keeps them different models, but they are
+# now the same vendor and the same family — weaker than the Claude/Codex split
+# the commented block at the bottom restores.
+[roles.iss]
+effort = "high"
+
+# The four reviewers ask the questions the gates cannot, and a blocking
+# finding they miss is a defect that ships. They are also the largest turn
+# count in the loop: four concurrent turns per round, up to four rounds. Sol
+# at high effort is the deliberate trade — Astra here would cost more than
+# synthesis does.
+[roles.review]
+effort = "high"
+
+# Rewriting a model that a confirmed exploit broke, usually branch-free.
+[roles.security_repair]
+effort = "high"
+
+# Self-improvement (red.rsi, run after a design run finishes). Reading a
+# finished run and arguing for a change to RED's own prompts is a judgment
+# task with no gate behind it: a bad proposal is caught by the test suite only
+# if it breaks something, and a merely useless one is caught by nothing. So it
+# gets the frontier model, the same as synthesis.
+[roles.improve]
+backend = "codex"
+model   = "gpt-6-astra"
+effort  = "high"
+
+# ---------------------------------------------------------------------------
+# Restoring cross-vendor independence at Gate 2
+# ---------------------------------------------------------------------------
+#
+# With every stage on GPT-6, the designer and the ISS implementer share a
+# vendor and a training lineage, so a systematic misreading of the spec is
+# more likely to be shared — and a shared misreading is exactly what Gate 2
+# cannot see. Uncomment to put the Spike side back on a different company's
+# agent. Both sides are already prevented from seeing each other's work by the
+# tool surface; this makes them different agents as well.
+#
+# [roles.iss]
+# backend = "claude"
+# model   = "claude-opus-5-5"
+# effort  = "high"

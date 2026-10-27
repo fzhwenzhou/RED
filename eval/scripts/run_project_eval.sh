@@ -3,7 +3,7 @@ set -euo pipefail
 PROJECT="${1:?usage: run_project_eval.sh matrixmul|libcrc}"
 [[ "$PROJECT" = matrixmul || "$PROJECT" = libcrc ]] || { echo "unsupported project: $PROJECT" >&2; exit 2; }
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$REPO"
-B="eval/build/$PROJECT"; SPEC="eval/spec/$PROJECT.json"; ACCEL="eval/projects/$PROJECT/red_accel.v"
+B="eval/build/$PROJECT"; SPEC="eval/spec/$PROJECT.yaml"; ACCEL="eval/projects/$PROJECT/red_accel.v"
 mkdir -p "$B/logs"
 say(){ printf '\n==> %s\n' "$*"; }
 run_sim(){ local variant="$1"; "$B/obj_$variant/sim_$variant" +firmware="$B/$variant.hex" >"$B/logs/$variant.log" 2>&1; cat "$B/logs/$variant.log"; grep -q '^RESULT: PASS$' "$B/logs/$variant.log"; grep -q '\[sim\] finished: status=0 ' "$B/logs/$variant.log"; }

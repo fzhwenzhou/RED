@@ -1,0 +1,4 @@
+counterexample: null
+detail: 364,004,779 instructions, 100.0% in the project's own code, 0.00% drift
+gate: gate0
+passed: true

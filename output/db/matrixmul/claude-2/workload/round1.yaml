@@ -1,0 +1,19 @@
+api:
+- multiply
+- fill
+- main
+- call_weak_fn
+detail: 409,133,689 instructions, 98.8% in the project's own code, 0.00% run-to-run drift
+drift: 0.0
+dynamic_ir: 409133689
+entry: /home/naonao/RED/output/work/matrixmul/20261026-115900-fcf93a/workload/r1/_red_workload.c
+exit_code: 0
+name: ''
+passes_gate0: true
+project: /home/naonao/RED/target_project/matrixmul
+project_ir: 404160047
+project_share: 0.9878434796895936
+rationale: ''
+runs:
+- 409133689
+- 409133689

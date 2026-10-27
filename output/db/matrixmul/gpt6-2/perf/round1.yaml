@@ -1,0 +1,46 @@
+app_speedup: 4.620801734532544
+covered_share: 0.9957060242855349
+detail: |-
+  covers 99.6% of profiled cycles; predicted whole-application speedup 4.62x
+    xqpack2.s: 38 cyc (0 beats, 0 MAC, 0.00 MAC/word, x20,000,000 per call) vs 802 cyc of software = 21.04x — its C model executes 73 instructions, of which 73 are not accounted for by mac_ops=0; charged as 10 sequential logic steps
+    xqdot4: 32 cyc (0 beats, 4 MAC, 1.00 MAC/word, x60,000,000 per call) vs 267 cyc of software = 8.35x
+    xqto.s: 37 cyc (0 beats, 0 MAC, 0.00 MAC/word, x20,000,000 per call) vs 802 cyc of software = 21.83x — its C model executes 63 instructions, of which 63 are not accounted for by mac_ops=0; charged as 9 sequential logic steps
+measurement_error: ''
+per_instruction:
+- beats: 0
+  cycles: 38.118029236599895
+  invocations: 20000000
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: xqpack2.s
+  note: its C model executes 73 instructions, of which 73 are not accounted for by mac_ops=0; charged as 10 sequential logic steps
+  replaced_cycles: 801.986872856
+  replaces: multiply::matrix_product_loop_nest
+  speedup: 21.03956812347355
+  unverified: ''
+  words: 2
+- beats: 0
+  cycles: 32.0
+  invocations: 60000000
+  mac_ops: 4
+  marshal_cycles: 0.0
+  mnemonic: xqdot4
+  note: ''
+  replaced_cycles: 267.32895761866666
+  replaces: multiply::matrix_product_loop_nest
+  speedup: 8.354029925583333
+  unverified: ''
+  words: 2
+- beats: 0
+  cycles: 36.73199783432594
+  invocations: 20000000
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: xqto.s
+  note: its C model executes 63 instructions, of which 63 are not accounted for by mac_ops=0; charged as 9 sequential logic steps
+  replaced_cycles: 801.986872856
+  replaces: multiply::matrix_product_loop_nest
+  speedup: 21.833467280305285
+  unverified: ''
+  words: 2
+unverified: []

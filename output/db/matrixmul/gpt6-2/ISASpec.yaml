@@ -1,0 +1,331 @@
+base_isa: RV32IM
+critic_rounds: 1
+csrs: []
+description: 'Three stateless register primitives for checked exact Q6 matrix dot products: binary32 pair packing, four signed-byte products, and integer/4096 to binary32 conversion. Matrix traversal and all memory access stay in software.'
+encodings: []
+gate2_vectors: 100000
+instructions:
+- c_model: |
+    #include <stdint.h>
+
+    void xqpack2_s_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t lanes = 0u;
+        uint32_t rejected = 0u;
+        for (uint32_t i = 0u; i < 2u; ++i) {
+        uint32_t u = in[i];
+        uint32_t sign = u >> 31;
+        uint32_t exponent = (u >> 23) & 255u;
+        uint32_t significand = (u & 0x007fffffu) | 0x00800000u;
+        uint32_t shift = (144u - exponent) & 31u;
+        uint32_t magnitude = significand >> shift;
+        uint32_t tail = significand & ((1u << shift) - 1u);
+        uint32_t normal_ok = (uint32_t)(exponent >= 121u)
+                           & (uint32_t)(exponent <= 128u)
+                           & (uint32_t)(tail == 0u)
+                           & (uint32_t)(magnitude <= 127u + sign);
+        uint32_t zero_ok = (uint32_t)((u & 0x7fffffffu) == 0u);
+        uint32_t negative_mask = 0u - sign;
+        uint32_t signed_byte = ((magnitude ^ negative_mask) + sign) & 255u;
+        uint32_t lane = signed_byte & (0u - normal_ok);
+        uint32_t reject = 1u ^ (normal_ok | zero_ok);
+        lanes |= lane << (8u * i);
+        rejected |= reject;
+        }
+        out[0] = lanes | (rejected << 31);
+        out[1] = 0u;
+    }
+  encoding: 0000001 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 20000000
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xqpack2.s
+  name: Checked binary32 to two Q6 byte lanes
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    All arithmetic below is unsigned 32-bit modulo 2^32 except boolean comparisons; BOOL produces 0 or 1. SEL(c,a,b)=(a AND (0-BOOL(c))) OR (b AND NOT(0-BOOL(c))). All shifts have counts 0..31; every expression is evaluated.
+    For each i in the fixed range 0..1, independently:
+      u_i := in[i]
+      s_i := u_i >> 31
+      e_i := (u_i >> 23) AND 255
+      f_i := u_i AND 0x007fffff
+      m_i := f_i OR 0x00800000
+      d_i := (144 - e_i) AND 31
+      q_i := m_i >> d_i
+      t_i := m_i AND ((1 << d_i) - 1)
+      n_i := BOOL(e_i >= 121) AND BOOL(e_i <= 128) AND BOOL(t_i = 0) AND BOOL(q_i <= 127+s_i)
+      z_i := BOOL((u_i AND 0x7fffffff) = 0)
+      b_i := SEL(n_i, ((q_i XOR (0-s_i)) + s_i) AND 255, 0)
+      bad_i := 1 XOR (n_i OR z_i)
+    r := b_0 OR (b_1 << 8) OR ((bad_0 OR bad_1) << 31)
+    out[0] := r
+    out[1] := 0
+    x[rd] := r (discard when rd=0)
+  reads_state: []
+  replaces: multiply::matrix_product_loop_nest
+  semantics: Register operands are values, never addresses. in[0]=x[rs1] and in[1]=x[rs2]; out[0] is the sole result written to x[rd], while out[1]=0 is model padding only. Read all sources before writeback; rd may equal a source and x0 discards writeback. No memory access, alignment condition, arithmetic trap, CSR access, floating-point exception flags, or persistent state. All input bit patterns are defined. Each instruction has operand-independent latency and fixed work; invalid arithmetic data is handled by the specified result, without early completion. The two-word model arrays do not cause bus transfers or a second architectural result. Interpret each source as an IEEE binary32 bit pattern. Accept a lane exactly when its numerical value is q/64 for an integer q in [-128,127]. Both signed zeros are accepted as q=0. Return rs1's q modulo 256 in bits 7:0 and rs2's in bits 15:8. A rejected lane contributes byte zero. Bit 31 is one if either lane is rejected; bits 30:16 are zero. Reject all NaNs, infinities, nonzero subnormals, out-of-range values and values between grid points. This is checked exact conversion, with neither saturation nor rounding. For example -2 is accepted as 0x80; +2 is rejected. Test bit 31 before combining pairs into four-byte words. Software performs layout conversion and handles rejection by retaining the original float kernel. One logical 10x10 product packs 200 elements with 100 invocations. invocations=20000000 accounts for all 200000 logical products in the frozen report's single aggregate call; see rationale. marshal_words=0 because there is no block ABI; ordinary CPU loads, pair combining, and scratch stores are separately required caller work.
+  spike_model: |-
+    void xqpack2_s_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        const uint32_t input[2] = {in[0], in[1]};
+        uint32_t packed = 0u;
+        uint32_t rejected = 0u;
+        for (uint32_t i = 0u; i < 2u; ++i) {
+            const uint32_t u = input[i];
+            const uint32_t sign = u >> 31;
+            const uint32_t exponent = (u >> 23) & 255u;
+            const uint32_t significand = (u & 0x007fffffu) | 0x00800000u;
+            const uint32_t shift = (144u - exponent) & 31u;
+            const uint32_t magnitude = significand >> shift;
+            const uint32_t remainder = significand & ((1u << shift) - 1u);
+            const uint32_t valid = uint32_t(exponent >= 121u)
+                                 & uint32_t(exponent <= 128u)
+                                 & uint32_t(remainder == 0u)
+                                 & uint32_t(magnitude <= 127u + sign);
+            const uint32_t zero = uint32_t((u & 0x7fffffffu) == 0u);
+            const uint32_t byte = (((magnitude ^ (0u - sign)) + sign) & 255u)
+                                & (0u - valid);
+            packed |= byte << (8u * i);
+            rejected |= 1u ^ (valid | zero);
+        }
+        out[0] = packed | (rejected << 31);
+        out[1] = 0u;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+
+    void xqdot4_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t a = in[0];
+        uint32_t b = in[1];
+        int32_t sum = 0;
+        for (uint32_t i = 0; i < 4u; ++i) {
+            uint32_t au = (a >> (8u * i)) & 255u;
+            uint32_t bu = (b >> (8u * i)) & 255u;
+            int32_t av = (int32_t)(au ^ 128u) - 128;
+            int32_t bv = (int32_t)(bu ^ 128u) - 128;
+            sum += av * bv;
+        }
+        out[0] = (uint32_t)sum;
+        out[1] = 0u;
+    }
+  encoding: 0000001 rs2 rs1 001 rd 0101011
+  form: reg
+  funct3: '001'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 60000000
+  mac_ops: 4
+  marshal_words: 0
+  mnemonic: xqdot4
+  name: Four signed-byte dot product
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    Define S8(b) = integer(b XOR 128) - 128, for b in 0..255.
+    a := in[0]
+    b := in[1]
+    sum_0 := 0
+    For i in the fixed range 0..3:
+      a_i := S8((a >> (8*i)) AND 255)
+      b_i := S8((b >> (8*i)) AND 255)
+      p_i := a_i * b_i (exact signed 32-bit multiplication)
+      sum_(i+1) := sum_i + p_i (exact; every prefix fits int32)
+    r := sum_4 modulo 2^32
+    out[0] := r
+    out[1] := 0
+    x[rd] := r (discard when rd=0)
+  reads_state: []
+  replaces: multiply::matrix_product_loop_nest
+  semantics: 'Register operands are values, never addresses. in[0]=x[rs1] and in[1]=x[rs2]; out[0] is the sole result written to x[rd], while out[1]=0 is model padding only. Read all sources before writeback; rd may equal a source and x0 discards writeback. No memory access, alignment condition, arithmetic trap, CSR access, floating-point exception flags, or persistent state. All input bit patterns are defined. Each instruction has operand-independent latency and fixed work; invalid arithmetic data is handled by the specified result, without early completion. The two-word model arrays do not cause bus transfers or a second architectural result. Each source holds four two''s-complement signed bytes, lane i in bits 8*i+7:8*i, independent of memory byte order. Return the exact sum of the four corresponding signed products as a two''s-complement 32-bit word. The range is [-65024,65536], so there is no overflow or saturation. There is no third source or implicit accumulator. Execute all four 32-bit sign-extended multiplies, including zero lanes: mac_ops=4. Time-share the existing red_accel 32x32 multiplier and accumulation datapath; do not instantiate another multiplier or claim access to the CPU''s internal fast_mul. The low 32 bits of an unsigned product of sign-extended representations give the same result. Software adds partial dot results using base ADD. For each 10-element dot, issue three times for k=0..3,4..7,8..9; software zeroes the final two lanes. Thus 100 output elements require 300 invocations per logical product, or 60000000 for the frozen aggregate report call. marshal_words=0; the CPU loads two already-packed words for each invocation.'
+  spike_model: |-
+    void xqdot4_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        const uint32_t a = in[0];
+        const uint32_t b = in[1];
+        int32_t sum = 0;
+        for (uint32_t i = 0u; i < 4u; ++i) {
+            const uint32_t a_byte = (a >> (8u * i)) & 255u;
+            const uint32_t b_byte = (b >> (8u * i)) & 255u;
+            const int32_t a_signed = int32_t(a_byte ^ 128u) - 128;
+            const int32_t b_signed = int32_t(b_byte ^ 128u) - 128;
+            sum += a_signed * b_signed;
+        }
+        out[0] = uint32_t(sum);
+        out[1] = 0u;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+
+    void xqto_s_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t bits = in[0];
+        uint32_t sign = bits >> 31;
+        uint32_t magnitude = (bits ^ (0u - sign)) + sign;
+        uint32_t s16 = (uint32_t)(magnitude >= 0x10000u) << 4;
+        uint32_t v16 = magnitude >> s16;
+        uint32_t s8 = (uint32_t)(v16 >= 0x100u) << 3;
+        uint32_t v8 = v16 >> s8;
+        uint32_t s4 = (uint32_t)(v8 >= 0x10u) << 2;
+        uint32_t v4 = v8 >> s4;
+        uint32_t s2 = (uint32_t)(v4 >= 4u) << 1;
+        uint32_t v2 = v4 >> s2;
+        uint32_t s1 = (uint32_t)(v2 >= 2u);
+        uint32_t high = s16 + s8 + s4 + s2 + s1;
+        uint32_t wide = (uint32_t)(high > 23u);
+        uint32_t right = (high - 23u) & (0u - wide);
+        uint32_t left = (23u - high) & 31u;
+        uint32_t large = magnitude >> right;
+        uint32_t small = magnitude << left;
+        uint32_t sig = (large & (0u - wide)) | (small & ~(0u - wide));
+        uint32_t remainder = magnitude & ((1u << right) - 1u);
+        uint32_t halfway = (1u << right) >> 1;
+        uint32_t increment = (uint32_t)(right != 0u)
+                           & ((uint32_t)(remainder > halfway)
+                           | ((uint32_t)(remainder == halfway) & (sig & 1u)));
+        uint32_t rounded = sig + increment;
+        uint32_t carry = rounded >> 24;
+        uint32_t exponent = high + 115u + carry;
+        uint32_t fraction = (rounded >> carry) & 0x007fffffu;
+        uint32_t result = (sign << 31) | (exponent << 23) | fraction;
+        out[0] = result & (0u - (uint32_t)(magnitude != 0u));
+        out[1] = 0u;
+    }
+  encoding: 0000001 rs2 rs1 010 rd 0101011
+  form: reg
+  funct3: '010'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 20000000
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xqto.s
+  name: Signed integer scaled by 2^-12 to binary32
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  pseudocode: |-
+    All expressions are unsigned 32-bit modulo 2^32 unless stated. BOOL produces 0 or 1. SEL(c,a,b)=(a AND (0-BOOL(c))) OR (b AND NOT(0-BOOL(c))).
+    u := in[0]
+    s := u >> 31
+    m := (u XOR (0-s)) + s
+    d16 := BOOL(m >= 65536) << 4
+    v16 := m >> d16
+    d8 := BOOL(v16 >= 256) << 3
+    v8 := v16 >> d8
+    d4 := BOOL(v8 >= 16) << 2
+    v4 := v8 >> d4
+    d2 := BOOL(v4 >= 4) << 1
+    v2 := v4 >> d2
+    d1 := BOOL(v2 >= 2)
+    h := d16+d8+d4+d2+d1 (floor(log2(m)) for nonzero m, 0 for m=0)
+    w := BOOL(h > 23)
+    rshift := (h-23) AND (0-w) (0..8)
+    lshift := (23-h) AND 31
+    hi := m >> rshift
+    lo := m << lshift
+    sig := SEL(w,hi,lo)
+    rem := m AND ((1 << rshift)-1)
+    half := (1 << rshift) >> 1
+    inc := BOOL(rshift != 0) AND (BOOL(rem > half) OR (BOOL(rem = half) AND (sig AND 1)))
+    rounded := sig+inc
+    carry := rounded >> 24 (0 or 1)
+    exponent := h+115+carry
+    fraction := (rounded >> carry) AND 0x007fffff
+    candidate := (s << 31) OR (exponent << 23) OR fraction
+    result := SEL(m != 0,candidate,0)
+    out[0] := result
+    out[1] := 0
+    x[rd] := result (discard when rd=0)
+  reads_state: []
+  replaces: multiply::matrix_product_loop_nest
+  semantics: Register operands are values, never addresses. in[0]=x[rs1]; the register-form adapter supplies in[1]=0 for this unary operation; out[0] is the sole result written to x[rd], while out[1]=0 is model padding only. Read all sources before writeback; rd may equal a source and x0 discards writeback. No memory access, alignment condition, arithmetic trap, CSR access, floating-point exception flags, or persistent state. All input bit patterns are defined. Each instruction has operand-independent latency and fixed work; invalid arithmetic data is handled by the specified result, without early completion. The two-word model arrays do not cause bus transfers or a second architectural result. The encoded rs2 field is ignored for all 32 register indices; assemblers conventionally emit rs2=x0. The model ignores in[1] for every bit pattern, not just zero. Interpret x[rs1] as a signed two's-complement integer n. Return the IEEE binary32 encoding of n/4096, with fixed round-to-nearest, ties-to-even, independently of any host or architectural rounding mode. Zero becomes +0. Every nonzero input produces a finite normal result; INT32_MIN yields -524288 (0xc9000000). No inexact flag is accrued. General large integers may round; accepted 10-element Q6 matrix dot products are exact. A logical 10x10 product converts each of 100 integer output sums once, hence invocations=20000000 for the frozen aggregate report call. marshal_words=0; the result is a register word which software stores into C.
+  spike_model: |-
+    void xqto_s_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        const uint32_t u = in[0];
+        const uint32_t sign = u >> 31;
+        const uint32_t magnitude = (u ^ (0u - sign)) + sign;
+        const uint32_t d16 = uint32_t(magnitude >= 65536u) << 4;
+        const uint32_t v16 = magnitude >> d16;
+        const uint32_t d8 = uint32_t(v16 >= 256u) << 3;
+        const uint32_t v8 = v16 >> d8;
+        const uint32_t d4 = uint32_t(v8 >= 16u) << 2;
+        const uint32_t v4 = v8 >> d4;
+        const uint32_t d2 = uint32_t(v4 >= 4u) << 1;
+        const uint32_t v2 = v4 >> d2;
+        const uint32_t d1 = uint32_t(v2 >= 2u);
+        const uint32_t highest = d16 + d8 + d4 + d2 + d1;
+        const uint32_t wide = uint32_t(highest > 23u);
+        const uint32_t right_shift = (highest - 23u) & (0u - wide);
+        const uint32_t left_shift = (23u - highest) & 31u;
+        const uint32_t high = magnitude >> right_shift;
+        const uint32_t low = magnitude << left_shift;
+        const uint32_t mask = 0u - wide;
+        const uint32_t sig = (high & mask) | (low & ~mask);
+        const uint32_t remainder = magnitude & ((1u << right_shift) - 1u);
+        const uint32_t half = (1u << right_shift) >> 1;
+        const uint32_t increment = uint32_t(right_shift != 0u)
+                                 & (uint32_t(remainder > half)
+                                    | (uint32_t(remainder == half) & (sig & 1u)));
+        const uint32_t rounded = sig + increment;
+        const uint32_t carry = rounded >> 24;
+        const uint32_t exponent = highest + 115u + carry;
+        const uint32_t fraction = (rounded >> carry) & 0x007fffffu;
+        const uint32_t candidate = (sign << 31) | (exponent << 23) | fraction;
+        out[0] = candidate & (0u - uint32_t(magnitude != 0u));
+        out[1] = 0u;
+    }
+  src_regs: 1
+  state_words: 0
+  words: 2
+  writes_state: []
+link1_vectors: 100000
+name: XredQ6Matrix
+passes_gate2: true
+passes_link1: true
+rationale: |-
+  S2a: The sole mined region is multiply::matrix_product_loop_nest, a row-major float matrix product with strided B reads and a loop-carried C accumulation. Its frozen cycle share is 0.9957060242855349, so accelerating this region alone has an ideal Amdahl ceiling of about 232.8844x. That is an upper bound, not a prediction; loop control, initialization, loads/stores, conversion, checking and software fallback remain. There are no other mined regions to credit.
+
+  Evidence refining the report's explicitly unknown geometry: read_profile names the generated source output/work/matrixmul/20261026-125631-fe3ed0/profile/run1/_red_workload.c, which was found and read directly. It declares BANK=16, DIM=10, ITERATIONS=200000. Initial A values are ((n*13+i*7+j*3)%33-16)/16; B values are ((n*11+i*5+j*17)%31-15)/16. Each iteration changes one A value to ((iteration*19+n*7)%65-32)/32, and calls the project's multiply through a volatile function pointer. All these values are exactly on the Q6 grid within the checked byte range. This is evidence for a checked exact specialization, not permission to quantize arbitrary float data. The supplied test.c's 2x2 example does not determine these counts.
+
+  Invocation accounting: each logical multiply processes 100 A and 100 B float elements and computes 100 length-10 dot products: packing=(100+100)/2=100, dots=100*ceil(10/4)=300, output conversions=100. The report has calls=1 and dynamic_cycles=1884810512 for the aggregate profiling region. Raw callgrind.out identifies multiply and multiply'2, with a self-edge calls=199998; its function attribution is collapsed and its one reported call is not one logical 10x10 product. The generated harness supplies the exact 200000 logical products. Therefore the fields use 200000*[100,300,100]=[20000000,60000000,20000000] per frozen reported call, preserving its measurement scale. They are NOT counts for one source-level call: those are [100,300,100]. If A1 repairs calls to 200000, divide these fields by 200000 together; do not alter either side independently. The frozen report is unchanged. Its host-instruction attribution also includes non-kernel work, so whole-region credit is an optimistic bound.
+
+  S2b: Start from the converged xqpack2.s/xqdot4/xqto.s family, retaining its words=[2,2,2], mac_ops=[0,4,0] and Q6 scale, and recount invocations for this harness. It fits the two-source/one-result PCPI interface and all current shape/security bounds. Earlier memory-to-memory MACs and 200/240-word tile kernels violate today's bounds; floating scalar multiply/add would support general floats but would pay two issues per term and require a complete binary32 arithmetic datapath. This family adds checked packing and normalization logic and reuses red_accel's existing multiplier/accumulator across four steps. No additional multiplier, divider, floating-point ALU, wide architectural buffer, CSR, or register file is required. Do not use the CPU internal fast_mul concurrently with external PCPI completion.
+
+  Software schedule and exactness: fast-path only valid nonoverlapping C versus A/B Matrix storage, binary32 float layout, round-to-nearest ties-to-even evaluation, and dimensions 10x10; retain the original function for all other cases. A and B may overlap each other, since both are only read. Keep the original dimension check/return behavior. Check output/input overlap before copying or clearing; on overlap run the original, so its clearMatrix and alias semantics survive. Pack every input once each call, accumulate all rejection bits without early exit, and invoke the original function if any bit is set. Never cache packed operands across calls: the harness mutates A. Use ordinary CPU loads/stores to build ten A rows and ten B columns, each three packed words; merge two low-16-bit pair results with OR and shift-by-16, and explicitly zero the upper two lanes of the final word. This requires 60 caller-owned scratch words (240 bytes); it is ordinary software memory, not hidden accelerator state. CPU loads two words for each xqdot4, combines three results with two ADDs, converts via xqto.s and stores C. Preserve clearMatrix's initialization of all 100 C elements and result dimensions. Do not move memory access into compute instructions. Any optional output-buffer overlap with software scratch is prohibited by allocation.
+
+  An accepted value is q/64, |q|<=128. Each product is an exact integer/4096 of magnitude <=16384/4096. Every prefix of a length-10 dot has numerator magnitude <=163840, far below 2^24, so every source binary32 multiplication and subsequent addition is exact. Regrouping into three integer dot results thus preserves source results. Both signed-zero inputs map to zero; the source starts C at +0, and RNE accumulation yields +0 for an exactly zero final sum, matching xqto.s. No approximation, saturation, double rounding or unguarded treatment of float encodings as integers is used. NaNs, infinities, subnormals and off-grid values always trigger fallback.
+
+  Cost: read_core reports acceptance overhead 1 cycle, ALU 4, CPU load 7, accelerator word throughput 2, and existing multiplier/accumulator. The RED calibrated end-to-end issue model is 28 cycles (the acceptance cycle plus 27 implementation cycles), not 1; neither figure includes arbitrary conversion latency. With zero accelerator beats, the simple lower-bound instruction costs are 28,32,28, totaling 15200 cycles per logical product before model-measured sequential conversion work. Baseline aggregate/200000 is 9424.05256 host instructions, about 80198.6873 calibrated target cycles. Pricing only custom issues would give an optimistic roughly 5.18x application speedup; do not claim this as achieved. Retain CPU work: at least 200 input loads, 60 scratch stores, 600 packed-word loads, 100 result stores, 100 initialization stores, pair merges, rejection handling, address/index/loop work, and 200 partial-sum ADDs. At the core's 7-cycle memory cost these 1060 memory accesses alone add 7420 cycles; extra logic, loop instructions and real PCPI latency must also be charged. marshal_words=0 truthfully means no instruction-block copying; it does not make this software traffic free. Gate 3 must sum the three instruction costs against the region only once, and any measured speedup needs an integrated RV32 implementation.
+
+  S2c: Three critique passes cover (1) shape/encoding/resource and report-count consistency, (2) numeric totality and exact fast-path/fallback equivalence, and (3) constant-work models, output padding, memory bounds, observability and register aliasing. All instructions are pure reg forms; all three output functions are directly observable and no state sequencing assumption is needed. Gate 2 remains independent: no Spike model is supplied, and local reference checks do not assert a Gate-2 pass.
+register_files: []
+state_note: No added architectural state. Only x[rd] changes; x0 discards. Context switches use the existing integer-register context and need no extension save area. No fcsr/fflags or floating register file exists or is touched. Every input terminates after an operand-independent schedule. Assert pcpi_wait at recognition/acceptance before the 4-bit no-wait timeout, keep it asserted until the fixed completion cycle, then assert ready/wr and the defined rd. Wait for pcpi_valid to drop before accepting the same request again. For these register operations mem_valid and mem_wstrb stay zero throughout; in[]/out[] are test interfaces only. The existing accelerator busy signal may still stall CPU memory acknowledgments while the shared datapath is occupied. The reserved custom-0 operation remains separately decoded, with its mem_issued/beat_done request qualification unchanged. Reset cancels transient work without stale writeback; no transient arithmetic buffer is state shared between invocations. A future RTL implementation must verify equal acceptance-to-ready latency across operand classes; model tests alone do not prove that.
+tests:
+- 'link1: coverage 99.57% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan'
+- 'gate2: 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+version: 1.0.0

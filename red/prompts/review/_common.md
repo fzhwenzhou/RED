@@ -62,16 +62,37 @@ a mis-declared `mac_ops`, an operand layout the caller cannot produce, a value
 the caller needs that the instruction discards, an encoding collision, an
 instruction slower than the software it replaces.
 
-RED's operand ABI, fixed for every instruction it designs:
+RED's operand ABI. Each instruction declares a `form`, and the form decides
+how its operands reach it. **There is no single fixed ABI** — an instruction
+in a register form is not violating anything, and a finding that says it
+contradicts "the memory-block ABI" is wrong:
 
-    <mnemonic> rd, rs1, rs2
-        rs1 = address of the input block  (`words` x uint32, little-endian)
-        rs2 = address of the output block (`words` x uint32)
-        rd  <- 0
+    form: reg       <mnemonic> rd, rs1, rs2
+                        in[0] = x[rs1], in[1] = x[rs2] (0 if src_regs = 1)
+                        out[0] -> x[rd]          no memory traffic at all
+
+    form: reg_imm   <mnemonic> rd, rs1, imm
+                        in[0] = x[rs1], in[1] = zero-extended imm
+                        out[0] -> x[rd]          no memory traffic at all
+
+    form: block     <mnemonic> rd, rs1, rs2
+                        rs1 = address of the input block  (`words` x uint32)
+                        rs2 = address of the output block (`words` x uint32)
+                        rd  <- 0
+                    Legal only for `load-store` and `move` instructions.
+                    RISC-V addresses memory from loads and stores; an
+                    arithmetic instruction that names an address is a
+                    memory-to-memory ALU operation and the structural check
+                    rejects it. A wide operand belongs in a declared
+                    extension register file, loaded and stored around a
+                    register-to-register `compute`.
 
 Measured on this core, and the model the loop's own performance gate uses:
 
-    instruction cycles = 28 + 2 x (2 x words) + 1 x mac_ops
+    instruction cycles = issue_overhead + 2 x beats + 1 x mac_ops
+
+where `beats` is `2 x words` for a `block` instruction and **zero** for a
+register form, whose operands are already in the register file.
 
 - one 32-bit CPU load or store: ~5 cycles
 - one host instruction in the profile: ~8.5 cycles on this core
@@ -79,10 +100,23 @@ Measured on this core, and the model the loop's own performance gate uses:
 - a software 256x256 multiply (`uECC_vli_mult`, 64 MACs): ~9,000 cycles
 - copying 8 words into a contiguous block and 8 back out: ~455 cycles
 
-The operand traffic is fixed by `words` and paid on **every** invocation, so
-the quantity that decides whether an instruction is worth building is
-arithmetic per operand word moved: a 5-word MAC does 0.10, a 256x256 multiply
-over a 16-word block does 2.00 — the same traffic buying twenty times the work.
+For a `block` instruction the operand traffic is fixed by `words` and paid on
+**every** invocation, so the quantity that decides whether it is worth
+building is arithmetic per operand word moved: a 5-word MAC does 0.10, a
+256x256 multiply over a 16-word block does 2.00 — the same traffic buying
+twenty times the work.
+
+That ratio is the wrong question for a register form, which moves no words.
+There the question is whether one invocation beats the handful of base-ISA
+instructions it replaces, and on this core the issue overhead is what it has
+to beat. Judge a register-form instruction on `replaces` and the measured
+kernel cost, not on MAC-per-word.
+
+An extension of several small composable instructions is the shape the
+structural check asks for, and it is not a defect to be reported as one. What
+*is* worth a finding is when the pieces do not compose: a value one produces
+that the next cannot consume, a packing the caller cannot produce with base
+ISA instructions, or a sequence whose total cost exceeds the software.
 Each instruction declares `mac_ops`, `replaces`, `invocations` (per call of the
 loop it replaces) and `marshal_words`; check those claims against its
 `c_model` and its semantics.

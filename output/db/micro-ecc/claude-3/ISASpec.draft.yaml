@@ -1,0 +1,731 @@
+base_isa: RV32IM_Zicntr
+critic_rounds: 1
+csrs: []
+description: 'Xp256: a P-256 field-arithmetic register extension for the red_core PicoRV32. Two declared registers: FA (256-bit operand A) and ACC (352-bit accumulator). Three load/store movers connect them to memory, and three register-only compute instructions do the arithmetic: a 256x64-bit Horner multiply-accumulate step whose digit comes from two GPRs, a reduction of the accumulator mod p, and a modular subtract. A modular multiply is software running lda, then four (mac2, red) pairs, then str. The extension replaces the work of uECC_vli_mult, vli_mmod_fast_secp256r1 and uECC_vli_modSub.'
+encodings: []
+gate2_vectors: 0
+instructions:
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural registers, limb 0 least significant.  Other instructions
+       write them in hardware, so they are volatile here: this translation
+       unit does not see every write. */
+    static volatile uint32_t p256_fa[8];
+    static volatile uint32_t p256_acc[11];
+
+    /* p256.lda: FA <- in[0..7]; ACC <- 0; out[0..7] <- FA (copy-through). */
+    void p256_lda_model(const uint32_t in[8], uint32_t out[8])
+    {
+        int i;
+        for (i = 0; i < 8; i++)
+            p256_fa[i] = in[i];
+        for (i = 0; i < 11; i++)
+            p256_acc[i] = 0;
+        for (i = 0; i < 8; i++)
+            out[i] = p256_fa[i];
+    }
+  encoding: 0000000 rs2 rs1 000 rd 0101011
+  form: block
+  funct3: '000'
+  funct7: '0000000'
+  group: load-store
+  imm_bits: 0
+  invocations: 2
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.lda
+  name: P-256 load operand A and clear accumulator
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    A1 = x[rs1] & 0xFFFFFFFC
+    A2 = x[rs2] & 0xFFFFFFFC
+    w[i] = MEM32[(A1 + 4*i) mod 2^32]            for i = 0..7   (all reads first)
+    FA' = w[0..7]
+    ACC' = 0
+    MEM32[(A2 + 4*i) mod 2^32] = FA'[i]          for i = 0..7   (ascending)
+    x[rd] = 0
+  reads_state: []
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  semantics: |
+    p256.lda rd, rs1, rs2 starts a field operation: it loads operand A into FA and
+    clears ACC.
+
+    Load. in[i] = MEM32[(x[rs1] & ~3) + 4*i] for i = 0..7. in[0] is the least
+    significant limb, which is micro-ecc's uECC_word_t[8] layout with
+    uECC_WORD_SIZE=4. FA <- in[0..7], and ACC <- 0 (all 352 bits). All eight reads
+    complete before any write.
+
+    Copy-through. out[i] = FA[i] (= in[i]) is written to MEM32[(x[rs2] & ~3) + 4*i] in
+    ascending i. Canonical use is rs2 = rs1, which rewrites the same eight words
+    unchanged (all of this SoC's memory is SRAM). With rs2 != rs1 the instruction is
+    also an 8-word copy. If the operand sits in read-only memory, point rs2 at an
+    8-word scratch buffer instead.
+
+    Addresses wrap modulo 2^32. x[rd] <- 0 (use rd = x0).
+
+    Memory. The accesses are ordinary word loads and stores at the program's
+    privilege. A block outside RAM behaves like the same LW/SW sequence would: MMIO
+    side effects, and the SoC $fatals on unmapped addresses.
+
+    Timing. Fixed latency: one guard cycle for the in-flight prefetch (mem_issued), then
+    8 read beats and 8 write beats of 2 cycles each, about 34 cycles. pcpi_wait is
+    raised in the first cycle.
+
+    Verification. out = in is a pure function of in[], so Gate 2 exercises the load
+    path. FA and the clear of ACC are checked by the sequences under p256.mac2 and
+    p256.subm.
+
+    Cost accounting. lda runs once per modMult/modSquare and once per modSub. All
+    7,633,920 executions are charged to the modSub loop: 1.94 per call, declared as 2.
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 8
+  writes_state:
+  - FA
+  - ACC
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural accumulator, limb 0 least significant.  Volatile because
+       other instructions write it in hardware. */
+    static volatile uint32_t p256_acc[11];
+
+    /* p256.ldr: ACC <- in[0..7] zero-extended; out[0..7] <- ACC[0..7]. */
+    void p256_ldr_model(const uint32_t in[8], uint32_t out[8])
+    {
+        int i;
+        for (i = 0; i < 8; i++)
+            p256_acc[i] = in[i];
+        for (i = 8; i < 11; i++)
+            p256_acc[i] = 0;
+        for (i = 0; i < 8; i++)
+            out[i] = p256_acc[i];
+    }
+  encoding: 0000001 rs2 rs1 000 rd 0101011
+  form: block
+  funct3: '000'
+  funct7: '0000001'
+  group: load-store
+  imm_bits: 0
+  invocations: 1
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.ldr
+  name: P-256 load accumulator
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    A1 = x[rs1] & 0xFFFFFFFC
+    A2 = x[rs2] & 0xFFFFFFFC
+    w[i] = MEM32[(A1 + 4*i) mod 2^32]            for i = 0..7   (all reads first)
+    ACC' = w[0..7] (limbs 0..7), 0 (limbs 8..10)
+    MEM32[(A2 + 4*i) mod 2^32] = ACC'[i]         for i = 0..7   (ascending)
+    x[rd] = 0
+  reads_state: []
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  semantics: |
+    p256.ldr rd, rs1, rs2 loads a 256-bit value into the accumulator.
+
+    Load. in[i] = MEM32[(x[rs1] & ~3) + 4*i] for i = 0..7, with limb 0 least
+    significant. ACC[0..7] <- in[0..7], and ACC[8..10] <- 0. FA is unchanged. All eight
+    reads complete before any write.
+
+    Copy-through. out[i] = ACC[i] (= in[i]) is written to MEM32[(x[rs2] & ~3) + 4*i] in
+    ascending i. Canonical use is rs2 = rs1, which rewrites the same words unchanged.
+    For a read-only operand, point rs2 at an 8-word scratch buffer.
+
+    Addresses wrap modulo 2^32. x[rd] <- 0. Timing and memory rules are those of
+    p256.lda.
+
+    Use. ldr loads the subtrahend of p256.subm. It must come after p256.lda, because
+    lda clears ACC.
+
+    Verification. out = in, so Gate 2 exercises the load path; the subm sequence checks
+    ACC.
+
+    Cost accounting. ldr runs once per modSub only: 1 per call.
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 8
+  writes_state:
+  - ACC
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural accumulator, limb 0 least significant.  Volatile because
+       other instructions write it in hardware. */
+    static volatile uint32_t p256_acc[11];
+
+    /* p256.str: out[0..7] <- ACC[0..7].  in[] is not read. */
+    void p256_str_model(const uint32_t in[8], uint32_t out[8])
+    {
+        int i;
+        (void)in;
+        for (i = 0; i < 8; i++)
+            out[i] = p256_acc[i];
+    }
+  encoding: 0000000 rs2 rs1 001 rd 0101011
+  form: block
+  funct3: '001'
+  funct7: '0000000'
+  group: load-store
+  imm_bits: 0
+  invocations: 2
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.str
+  name: P-256 store accumulator
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    A2 = x[rs2] & 0xFFFFFFFC
+    MEM32[(A2 + 4*i) mod 2^32] = ACC[i]          for i = 0..7   (ascending)
+    x[rd] = 0
+  reads_state:
+  - ACC
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  semantics: |
+    p256.str rd, rs1, rs2 stores the low 256 bits of ACC to the 8-word output block at
+    x[rs2]: out[i] = ACC[i], MEM32[(x[rs2] & ~3) + 4*i] = ACC[i] for i = 0..7 in
+    ascending order. Addresses wrap modulo 2^32. ACC[8..10] are not stored; they are
+    zero after p256.red, p256.subm and p256.ldr.
+
+    The input block is not read and rs1 is ignored (encode rs1 = rs2), so the hardware
+    issues only the eight write beats. The gate's cost model charges 16 beats, which
+    overstates the cost.
+
+    FA and ACC are unchanged. x[rd] <- 0. The memory rules are those of p256.lda.
+
+    Timing. Fixed latency: one guard cycle, then 8 write beats, about 18 cycles.
+
+    Verification. From reset ACC = 0, so Gate 2 sees an all-zero block; the sequences
+    under p256.mac2 and p256.subm check str.
+
+    Cost accounting. str runs once per modMult/modSquare and once per modSub. All
+    executions are charged to the modSub loop: 1.94 per call, declared as 2.
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 8
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural registers, limb 0 least significant.  Volatile because
+       other instructions write them in hardware. */
+    static volatile uint32_t p256_fa[8];
+    static volatile uint32_t p256_acc[11];
+
+    /* p256.mac2: ACC <- (ACC*2^64 + FA*(in[0]*2^32 + in[1])) mod 2^352; rd <- 0. */
+    void p256_mac2_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t a[8], t[11];
+        uint64_t c;
+        int i;
+
+        for (i = 0; i < 8; i++)
+            a[i] = p256_fa[i];
+
+        /* t = ACC * 2^64 mod 2^352 */
+        t[0] = 0;
+        t[1] = 0;
+        for (i = 2; i < 11; i++)
+            t[i] = p256_acc[i - 2];
+
+        /* t += FA * x[rs2] at limb 0 */
+        c = 0;
+        for (i = 0; i < 8; i++) {
+            c += (uint64_t)a[i] * in[1] + t[i];
+            t[i] = (uint32_t)c;
+            c >>= 32;
+        }
+        for (i = 8; i < 11; i++) {
+            c += t[i];
+            t[i] = (uint32_t)c;
+            c >>= 32;
+        }
+
+        /* t += FA * x[rs1] at limb 1 */
+        c = 0;
+        for (i = 0; i < 8; i++) {
+            c += (uint64_t)a[i] * in[0] + t[i + 1];
+            t[i + 1] = (uint32_t)c;
+            c >>= 32;
+        }
+        for (i = 9; i < 11; i++) {
+            c += t[i];
+            t[i] = (uint32_t)c;
+            c >>= 32;
+        }
+
+        for (i = 0; i < 11; i++)
+            p256_acc[i] = t[i];
+        out[0] = 0;
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 010 rd 0101011
+  form: reg
+  funct3: '010'
+  funct7: '0000000'
+  group: compute
+  imm_bits: 0
+  invocations: 4
+  mac_ops: 16
+  marshal_words: 0
+  mnemonic: p256.mac2
+  name: P-256 multiply-accumulate one 64-bit digit
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    b = x[rs1] * 2^32 + x[rs2]                     (unsigned 64-bit digit)
+    a = FA[7..0] as unsigned 256-bit integer
+    acc = ACC[10..0] as unsigned 352-bit integer
+    ACC' = (acc * 2^64 + a * b) mod 2^352
+    x[rd] = 0
+  reads_state:
+  - FA
+  - ACC
+  replaces: uECC_vli_mult::product_scanning
+  semantics: |
+    p256.mac2 rd, rs1, rs2 is one Horner step of a 256 x 64-bit multiply-accumulate.
+
+    Digit. b = x[rs1]*2^32 + x[rs2]: in[0] = x[rs1] is the high 32-bit digit and
+    in[1] = x[rs2] the low one.
+
+    Operation. ACC <- (ACC * 2^64 + FA * b) mod 2^352. FA is unchanged. x[rd] <- 0:
+    out[0] = 0, and out[1] = 0 pads the 2-word model. If ACC < 2^256 on entry (as after
+    p256.lda or p256.red), the result is below 2^321 and nothing is dropped.
+
+    Reference order:
+    1. Shift ACC up two limbs, dropping limbs 9 and 10.
+    2. Add FA*x[rs2] at limb 0, as an 8-limb row with carry propagated to limb 10.
+    3. Add FA*x[rs1] at limb 1, with carry propagated to limb 10. The final carry out
+       is dropped.
+    That is 16 32x32 multiplies, with fixed trip counts, and no data-dependent branch or
+    index.
+
+    Hardware. One 32x32 multiplier (red_accel's limb_product). The 2-limb shift is a
+    rotate of the limb index. About 18 cycles, constant time.
+
+    Use (modMult_fast; for modSquare_fast, right = left):
+      p256.lda  x0, left, left
+      for m = 3, 2, 1, 0:
+        lw t1, 8m+4(right); lw t0, 8m(right)
+        p256.mac2 x0, t1, t0
+        p256.red  x0, x0, x0
+      p256.str  x0, result, result
+    This leaves result = left*right mod p, canonical, for every pair of 256-bit inputs.
+    That is the same as uECC_vli_mult followed by vli_mmod_fast_secp256r1. The pattern
+    is safe when result aliases left or right, because every LW and lda precede the
+    store.
+
+    Verification. Gate 2 starts from reset with FA = ACC = 0, so it sees x[rd] = 0
+    only. The reviewers should run the sequence above against uECC_vli_modMult_fast.
+    Suggested vectors:
+    - left = right = p-1, which gives 1.
+    - left = right = 2^256-1 (non-canonical).
+    - left = right = 2^128, which gives 2^256 mod p.
+    - left = 0.
+
+    Invocations. 4 per uECC_vli_mult call: eight 32-bit digits of right, two per step.
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - ACC
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural accumulator, limb 0 least significant.  Volatile because
+       other instructions write it in hardware. */
+    static volatile uint32_t p256_acc[11];
+
+    /* p = 2^256 - 2^224 + 2^192 + 2^96 - 1, plus a zero ninth limb */
+    static const uint32_t P256_P9[9] = {
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000001u, 0xFFFFFFFFu,
+        0x00000000u
+    };
+
+    /* x <- (x mod 2^256) + (x >> 256) * K over 11 limbs, where
+       K = 2^256 mod p = 2^224 - 2^192 - 2^96 + 1.  The high part T sits at
+       h[7..9]; limb j gets +T[j] - T[j-3] - T[j-6] + T[j-7].  The carry is a
+       floor division by 2^32, done as an exact division. */
+    static void fold(uint32_t x[11])
+    {
+        uint32_t l[11], h[20];
+        int64_t carry = 0;
+        int j;
+
+        for (j = 0; j < 8; j++)
+            l[j] = x[j];
+        l[8] = 0;
+        l[9] = 0;
+        l[10] = 0;
+        for (j = 0; j < 20; j++)
+            h[j] = 0;
+        h[7] = x[8];
+        h[8] = x[9];
+        h[9] = x[10];
+        for (j = 0; j < 11; j++) {
+            int64_t v = carry + l[j] + h[j + 7] - h[j + 4] - h[j + 1] + h[j];
+            uint32_t lo = (uint32_t)v;
+            x[j] = lo;
+            carry = (v - (int64_t)lo) / 4294967296LL;
+        }
+    }
+
+    /* p256.red: ACC <- ACC mod p (canonical).  x[rs1], x[rs2] not read; rd <- 0. */
+    void p256_red_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t x[11], w[9];
+        uint64_t b = 0;
+        uint32_t keep;
+        int i;
+
+        (void)in;
+        for (i = 0; i < 11; i++)
+            x[i] = p256_acc[i];
+        for (i = 0; i < 4; i++)
+            fold(x);
+
+        /* x < 2^256 + 7*2^224: one subtraction of p, kept by mask */
+        for (i = 0; i < 9; i++) {
+            uint64_t d = (uint64_t)x[i] - P256_P9[i] - b;
+            w[i] = (uint32_t)d;
+            b = d >> 63;
+        }
+        keep = (uint32_t)0 - (uint32_t)b;   /* all ones when x < p */
+        for (i = 0; i < 8; i++)
+            p256_acc[i] = (x[i] & keep) | (w[i] & ~keep);
+        for (i = 8; i < 11; i++)
+            p256_acc[i] = 0;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  encoding: 0000000 rs2 rs1 011 rd 0101011
+  form: reg
+  funct3: '011'
+  funct7: '0000000'
+  group: reduction
+  imm_bits: 0
+  invocations: 28
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.red
+  name: P-256 reduce accumulator
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    K = 2^224 - 2^192 - 2^96 + 1
+    X0 = ACC[10..0] as unsigned 352-bit integer
+    X1 = (X0 mod 2^256) + floor(X0 / 2^256) * K
+    X2 = (X1 mod 2^256) + floor(X1 / 2^256) * K
+    X3 = (X2 mod 2^256) + floor(X2 / 2^256) * K
+    X4 = (X3 mod 2^256) + floor(X3 / 2^256) * K      (0 <= X4 < 2^256 + 7*2^224)
+    W  = (X4 - p) mod 2^288;  b = (X4 < p)
+    m  = 0 - b  (all ones when b = 1)
+    ACC' = (X4 AND m) OR (W AND NOT m), limbs 8..10 = 0      (= X0 mod p)
+    x[rd] = 0
+  reads_state:
+  - ACC
+  replaces: vli_mmod_fast_secp256r1::reduction
+  semantics: |
+    p256.red rd, rs1, rs2 reduces the accumulator modulo
+    p = 2^256 - 2^224 + 2^192 + 2^96 - 1: ACC <- ACC mod p, canonical
+    (0 <= ACC < p, ACC[8..10] = 0), for every 352-bit ACC. FA is unchanged.
+    x[rd] <- 0; x[rs1] and x[rs2] are ignored (encode x0).
+
+    Algorithm. K = 2^256 mod p = 2^224 - 2^192 - 2^96 + 1, and K > 0.
+    1. Fold four times: X <- (X mod 2^256) + floor(X / 2^256) * K. For the high part
+       T = (X >> 256), up to 3 limbs, the fold adds +T at limb 0, -T at limb 3, -T at
+       limb 6 and +T at limb 7, then propagates signed carries across 11 limbs. Each
+       fold preserves X mod p and keeps X >= 0. Starting below 2^352, the bounds after
+       each fold are below 2^321, 2^290, 2^259, and 2^256 + 7*2^224.
+    2. Compute W = X - p over 9 limbs, with borrow b. ACC <- X if b = 1, else W. The
+       choice is made by mask, not branch. If b = 1, X < p. Otherwise
+       W < K + 7*2^224 < p. Either way the result is canonical.
+    Trip counts are fixed; no branch or index depends on data.
+
+    Hardware. No multiplier. Each fold is 11 limb steps through a 4-input adder with a
+    signed carry; then a 9-limb subtract and the select. About 55 cycles, constant time.
+
+    Use. One red follows every p256.mac2 (see the sequence there). Each red keeps ACC
+    below p, so the next mac2 stays below 2^321. After the fourth red of a multiply,
+    ACC equals what vli_mmod_fast_secp256r1 returns for the full 512-bit product.
+
+    Verification. From reset ACC = 0, so Gate 2 sees x[rd] = 0 only. The mac2 sequence
+    verifies red. Edge values worth running through a seeded ACC (via p256.ldr then red):
+    - p, which gives 0.
+    - p-1, which is unchanged.
+    - 2^256-1, which gives K-1.
+
+    Invocations. 28 per recorded mmod call: 4 per reduction x 3,694,592 reductions /
+    530,948 recorded calls = 27.8.
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - ACC
+- c_model: |
+    #include <stdint.h>
+    #include <string.h>
+
+    /* Architectural registers, limb 0 least significant.  Volatile because
+       other instructions write them in hardware. */
+    static volatile uint32_t p256_fa[8];
+    static volatile uint32_t p256_acc[11];
+
+    /* p = 2^256 - 2^224 + 2^192 + 2^96 - 1 */
+    static const uint32_t P256_P[8] = {
+        0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000001u, 0xFFFFFFFFu
+    };
+
+    /* p256.subm: ACC <- (FA - ACC[0..7]) mod p as uECC_vli_modSub.
+       x[rs1], x[rs2] not read; rd <- 0. */
+    void p256_subm_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t a[8], s[8], d[8];
+        uint64_t bw = 0, c = 0;
+        uint32_t m;
+        int i;
+
+        (void)in;
+        for (i = 0; i < 8; i++) {
+            a[i] = p256_fa[i];
+            s[i] = p256_acc[i];
+        }
+        for (i = 0; i < 8; i++) {
+            uint64_t t = (uint64_t)a[i] - s[i] - bw;
+            d[i] = (uint32_t)t;
+            bw = t >> 63;
+        }
+        m = (uint32_t)0 - (uint32_t)bw;   /* all ones when FA < ACC */
+        for (i = 0; i < 8; i++) {
+            c += (uint64_t)d[i] + (P256_P[i] & m);
+            p256_acc[i] = (uint32_t)c;
+            c >>= 32;
+        }
+        for (i = 8; i < 11; i++)
+            p256_acc[i] = 0;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  encoding: 0000001 rs2 rs1 010 rd 0101011
+  form: reg
+  funct3: '010'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 1
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.subm
+  name: P-256 modular subtract
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    a = FA[7..0], s = ACC[7..0] as unsigned 256-bit integers
+    D = (a - s) mod 2^256
+    bw = 1 if a < s else 0
+    m = 0 - bw  (256-bit all ones when bw = 1)
+    ACC' = (D + (p AND m)) mod 2^256 in limbs 0..7, 0 in limbs 8..10
+    x[rd] = 0
+  reads_state:
+  - FA
+  - ACC
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  semantics: |
+    p256.subm rd, rs1, rs2 sets ACC <- (FA - ACC[0..7]) mod p, using the convention of
+    micro-ecc's uECC_vli_modSub:
+    - D = (FA - ACC[0..7]) mod 2^256, with borrow bw; bw = 1 exactly when FA <
+      ACC[0..7] as unsigned 256-bit integers.
+    - ACC[0..7] <- (D + (p AND mask(bw))) mod 2^256, where mask(bw) is all ones when
+      bw = 1 and zero otherwise. The carry out is discarded.
+    - ACC[8..10] <- 0.
+    For canonical inputs the result is canonical. For any other inputs it is exactly
+    what uECC_vli_modSub computes, so the instruction is total.
+
+    The p addend is masked, not branched on, and the latency is fixed. FA is unchanged.
+    x[rd] <- 0; x[rs1] and x[rs2] are ignored (encode x0).
+
+    Hardware. The adder of p256.red: an 8-limb subtract, then an 8-limb masked add,
+    about 18 cycles.
+
+    Use (uECC_vli_modSub when mod is secp256r1's p; other moduli keep the software
+    path):
+      p256.lda x0, left, left; p256.ldr x0, right, right; p256.subm x0, x0, x0;
+      p256.str x0, result, result
+    This is safe when result aliases left or right.
+
+    Verification. From reset FA = ACC = 0, so Gate 2 sees x[rd] = 0 only. Run the
+    sequence against uECC_vli_modSub. Suggested vectors:
+    - left = right, which gives 0.
+    - left = 0, right = 1, which gives p-1.
+    - left = p-1, right = 0.
+    - left = 0, right = 2^256-1 (non-canonical).
+  spike_model: ''
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - ACC
+link1_vectors: 0
+name: xp256
+passes_gate2: false
+passes_link1: false
+rationale: |
+  S2a (patterns, Amdahl). The report covers 97.2% of cycles in three loops that are
+  all 256-bit prime-field arithmetic: vli_mmod_fast_secp256r1 (48.5%), uECC_vli_mult
+  (42.5%) and uECC_vli_modSub (6.2%). The Amdahl ceiling is about 35x. mult and mmod
+  run as a pair: every uECC_vli_modMult_fast/modSquare_fast does one of each, so both
+  run 3,694,592 times. callgrind records mmod at 530,948 calls because it is reached
+  through curve->mmod_fast, which is 6.96 reductions per recorded call.
+
+  Shapes ruled out.
+  - Pure 2-in/1-out primitives. Run 4b0bd1's add2lo/add2hi were blocked: at 28 cycles
+    each they cost more than the RV32 ops they replaced. A Comba step needs a 3-word
+    accumulator, and an mmod limb sums up to 10 product words.
+  - The 16-word memory-to-memory compute blocks that shipped before (secp256r1.mult,
+    mmod, modsub). Block compute is now blocking.
+  - A one-shot register-only multiply (FP <- FA*FB) and a one-shot NIST reduction
+    (FA <- FP mod p). These were this draft's first version. write_spec rejected them
+    because a 2-word reg instruction run once cannot be the whole of a 1,028-IR
+    (mult) or 8,168-IR (mmod) kernel. Its data-volume check does not see register-file
+    operands.
+
+  The design: interleaved (Horner) modular multiplication on two registers.
+  - FA holds the multiplicand.
+  - ACC holds the running residue.
+  - Each mac2 folds in one 64-bit digit of the multiplier, taken from two GPRs:
+    ACC <- ACC*2^64 + FA*b (16 MACs).
+  - Each red brings ACC back to a canonical residue mod p, using only the sparse
+    identity 2^256 = 2^224 - 2^192 - 2^96 + 1 (mod p). It needs no multiplier.
+  - A modMult is: lda left; then 4 x (lw, lw, mac2, red) over right's digits from the
+    top; then str result.
+  - modSub is: lda left; ldr right; subm; str result.
+  Compared with the one-shot version, this needs no 512-bit product register and no
+  FB register, because the multiplier operand streams through GPRs. State drops from
+  1024 to 608 bits. Each compute instruction does a fixed, small step that its two
+  register operands can describe.
+
+  The movers are the price of a load/store architecture on this bus. At 60 gate cycles,
+  lda costs more than the eight LWs it resembles (about 48). It is still the cheapest
+  way to put 256 bits into the unit: a register-fed alternative needs at least four
+  28-cycle reg instructions plus the same LWs.
+
+  Area.
+  - FA + ACC = 608 flops, which is 19 of the 32 words red_accel's buffers already hold.
+  - One 32x32 multiplier (red_accel's limb_product, reused), one 32-bit adder plus a
+    4-input limb adder for the folds, and red_accel's bus master including its
+    mem_issued guard.
+  - Xp256 is meant to replace red_accel. It uses custom-1 only, so it never aliases
+    red_accel's custom-0 encoding.
+  - Compared with the baseline core it adds one 32x32 array. The core's fast_mul cannot
+    be shared: a PCPI unit cannot issue to it while the CPU waits on pcpi_wait.
+
+  Cost (gate model: 28 + 4*words + mac_ops):
+  - lda/ldr/str: 60 each.
+  - mac2: 44.
+  - red, subm: 28 each.
+  - modMult: 60 + 4*44 + 4*28 + 60 = 408 cycles vs 8,748 + 9,978 software. That leaves
+    out the 8 LWs of right's digits (about 48 real cycles), which the gate does not
+    model.
+  - modSub: 208 cycles vs 1,203 software.
+  - Predicted application speedup: about 16.9x, with invocations rounded up as below.
+  - Estimated real hardware latency: mac2 about 18 cycles, red about 55, subm about 18,
+    lda/ldr about 34, str about 18. That puts a real modMult at about 450 cycles.
+
+  Invocations (integers; each from data volume).
+  - mac2: 4 per uECC_vli_mult call. Eight 32-bit digits of right, two per step.
+  - red: 28 per recorded mmod call. One red per mac2 gives 4 per reduction, and
+    4 x 3,694,592 / 530,948 = 27.8.
+  - subm: 1 per modSub call.
+  - ldr: 1 per modSub call; only modSub uses it.
+  - lda and str run once per modMult/modSquare and once per modSub: 7,633,920 times
+    each. All of them are charged to the modSub loop, at
+    (3,694,592 + 3,939,328) / 3,939,328 = 1.94, declared as 2.
+  The per-loop rows are therefore skewed: modSub carries every mover and mult/mmod carry
+  none. The application total is exact up to that rounding.
+
+  S2c. All encodings are custom-1, with distinct funct3/funct7 values. Every instruction
+  is total:
+  - mac2 is defined mod 2^352.
+  - red canonicalizes every 352-bit ACC.
+  - subm reproduces uECC_vli_modSub, including non-canonical inputs.
+  - Address bits [1:0] are ignored, and addresses wrap modulo 2^32.
+  - Unassigned custom-1 encodings are not claimed; they time out on PCPI and trap as
+    illegal.
+  Latencies are fixed, and every conditional is a mask. subm and red hardwire the
+  secp256r1 p, so callers with any other modulus keep the software path.
+register_files:
+- context: Not saved by hardware. Caller-saved scratch, dead after each leaf sequence. ENABLE_IRQ=0, so nothing preempts a sequence. An OS that adds preemption restarts the interrupted sequence from its p256.lda.
+  count: 1
+  name: FA
+  purpose: Operand A, 8 x 32-bit limbs, limb 0 least significant (micro-ecc uECC_word_t[8] layout). It is the multiplicand of p256.mac2 and the minuend of p256.subm. Only p256.lda writes it.
+  reset: zero
+  width_bits: 256
+- context: Not saved by hardware. Caller-saved scratch, dead after the p256.str that ends each leaf sequence. An OS that adds preemption saves it with p256.str (it is canonical, below 2^256, after every p256.red or p256.subm) and restores it with p256.ldr.
+  count: 1
+  name: ACC
+  purpose: Accumulator, 11 x 32-bit limbs, limb 0 least significant. It holds the running residue of a modular multiply, and the subtrahend and then the result of p256.subm. p256.str stores its low 256 bits.
+  reset: zero
+  width_bits: 352
+state_note: |
+  FA and ACC live in the Xp256 unit, reset to zero, and are touched only by Xp256
+  instructions.
+
+  Every instruction is atomic. The CPU is stalled on pcpi_wait for its whole latency,
+  and the core has ENABLE_IRQ=0, so no trap or interrupt can split one or preempt a
+  sequence. Faults from other instructions leave FA and ACC unchanged.
+
+  Software convention: FA and ACC are caller-saved scratch, and each leaf routine runs
+  one straight-line sequence.
+  - modMult/modSquare: lda; 4 x (lw, lw, mac2, red); str.
+  - modSub: lda; ldr; subm; str.
+  Nothing is live after it. p256.lda clears ACC, so every multiply starts from zero
+  without an extra instruction.
+
+  The movers make ordinary word accesses at the program's own privilege (machine mode;
+  no MMU or PMP). They use red_accel's bus-master port while acc_busy holds the bus and
+  follow its mem_issued rule, so the CPU's in-flight prefetch is never latched as data.
+
+  Every instruction raises pcpi_wait in its first cycle (the timeout is 16 cycles) and
+  has a data-independent latency.
+
+  Gate 2 runs each instruction alone from reset, where FA = ACC = 0. It verifies the
+  movers' copy path, but sees only zeros from mac2, red, subm and str. Those four are
+  verified by the sequences in their semantics, which the reviewers should run against
+  uECC_vli_modMult_fast and uECC_vli_modSub.
+tests: []
+version: '1.0'

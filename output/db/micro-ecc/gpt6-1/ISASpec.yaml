@@ -1,0 +1,542 @@
+base_isa: RV32IM with the target's existing read-only counters and legacy custom-0 multiply
+critic_rounds: 3
+csrs: []
+description: Seven composable custom-1 operations for exact 256x256-to-512 multiplication and P-256 reduction on RED's RV32IM PicoRV32. A 256-bit multiplicand register and 512-bit accumulator hold the working state. Four register MAC steps form the exact product; sixteen immediate-selected high-digit folds reduce a full 512-bit input. Software performs the loops and scalar reduction loads/stores.
+encodings: []
+gate2_vectors: 100000
+instructions:
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_lda_model(const uint32_t in[6], uint32_t out[6]) {
+        xp256_a[0] = 0; xp256_a[1] = 0;
+        for (int i = 0; i < 6; ++i) xp256_a[i+2] = in[i];
+        for (int i = 0; i < 16; ++i) xp256_c[i] = 0;
+        for (int i = 0; i < 6; ++i) out[i] = xp256_a[i+2];
+    }
+  encoding: 0000000 rs2 rs1 000 rd 0101011
+  form: block
+  funct3: '000'
+  funct7: '0000000'
+  group: load-store
+  imm_bits: 0
+  invocations: 1
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.lda
+  name: Load upper six multiplicand limbs and initialize product
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    A_next[0] := 0; A_next[1] := 0.
+    For each i in 0..5: A_next[i+2] := in[i].
+    For each i in 0..15: C_next[i] := 0.
+    For each i in 0..5: out[i] := A_next[i+2].
+    rd_next := 0.
+  reads_state: []
+  replaces: uECC_vli_mult::comba_product
+  semantics: 'Load A[2..7] from the six input words in increasing limb order: in[i] has weight 2^(32*(i+2)) in the 256-bit multiplicand. Clear A[0], A[1] and every limb of C, and copy A[2..7] to all six output words. Two subsequent p256.xword instructions install the low two limbs in A[0..1]. No arithmetic is done. Canonical multiplication uses rs1=left+8 bytes and rs2=a six-word scratch output (or rs2=left+8 bytes only for writable SRAM); the copy-through output depends on the loaded state. Scratch output needs no CPU copying and may be discarded. left and right remain separate arrays, because right is supplied through scalar loads to mac2. Block ABI: x[rs1] and x[rs2] are byte addresses of the input and output blocks, respectively. Caller supplies the full words-word blocks and uses word-aligned pointers into ordinary SRAM. For a misaligned encoding the effective base is x[rs] & 0xfffffffc, matching the SRAM word indexing; address additions wrap modulo 2^32. Read all words at input_base+4*i in ascending i before issuing any writes at output_base+4*i in ascending i, with four write strobes. This defines exact and partial overlap without a dependence on operand values. in[i] models the value read at input_base+4*i; out[i] models the value written at output_base+4*i. rd receives zero, independently of out[]. Use the existing separate accelerator memory master, not PCPI as a memory channel. Every request/address/data/strobe remains stable until mem_valid && mem_issued && mem_ready; reset mem_issued for each request and retain the ownership-handoff guard. pcpi_wait is asserted on acceptance and held until completion, which blocks the CPU. Only complete after all writes are acknowledged. MMIO and unmapped addresses have the existing SoC bus behavior (including testbench termination for unmapped access), not a new memory protection or fault mechanism. The constant-work and termination guarantees apply to valid SRAM blocks with responding memory; external wait states can extend latency. One lda per 24-byte upper part of a 32-byte multiplicand; scalar LW of left[0] and left[1], each followed by an xword with selector 0 or 1 respectively, complete the remaining eight bytes. marshal_words=0 for the direct target uECC_WORD_SIZE=4 layout. The reset-to-zero state update itself requires a following xword/mac2 sequence test.'
+  spike_model: |-
+    void p256_lda_iss(const uint32_t in[6], uint32_t out[6])
+    {
+        // The pure ABI cannot retain A_next or C_next.
+        // All observable outputs are the six loaded upper multiplicand limbs.
+        uint32_t loaded[6];
+        for (unsigned i = 0; i < 6; ++i) loaded[i] = in[i];
+        for (unsigned i = 0; i < 6; ++i) out[i] = loaded[i];
+    }
+  src_regs: 2
+  state_words: 0
+  words: 6
+  writes_state:
+  - A
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_mac2_model(const uint32_t in[2], uint32_t out[2]) {
+        uint32_t digit[2];
+        digit[0] = in[0];
+        digit[1] = in[1];
+        for (int i = 15; i >= 2; --i) xp256_c[i] = xp256_c[i-2];
+        xp256_c[0] = 0;
+        xp256_c[1] = 0;
+        for (int j = 0; j < 2; ++j) {
+            uint64_t carry = 0;
+            for (int i = 0; i < 8; ++i) {
+                uint64_t t = (uint64_t)xp256_a[i] * (uint64_t)digit[j]
+                           + (uint64_t)xp256_c[i+j] + carry;
+                xp256_c[i+j] = (uint32_t)t;
+                carry = t >> 32;
+            }
+            for (int i = 8+j; i < 16; ++i) {
+                uint64_t t = (uint64_t)xp256_c[i] + carry;
+                xp256_c[i] = (uint32_t)t;
+                carry = t >> 32;
+            }
+        }
+        out[0] = xp256_c[0];
+        out[1] = 0;
+    }
+  encoding: 0000001 rs2 rs1 001 rd 0101011
+  form: reg
+  funct3: '001'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 4
+  mac_ops: 16
+  marshal_words: 0
+  mnemonic: p256.mac2
+  name: Exact 512-bit Horner multiply-accumulate step
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    a := LE256(A_entry); c := LE512(C_entry).
+    d := zext64(in[0]) + (zext64(in[1]) << 32).
+    s := (c << 64) mod 2^512.
+    r0 := (s + a*zext(in[0])) mod 2^512.
+    r1 := (r0 + (a*zext(in[1]) << 32)) mod 2^512.
+    C_next := limbs32(r1,16); A_next := A_entry.
+    out[0] := C_next[0]; out[1] := 0.
+  reads_state:
+  - A
+  - C
+  replaces: uECC_vli_mult::comba_product
+  semantics: 'Register ABI: in[0]=x[rs1], in[1]=x[rs2]; out[0] is written to x[rd] and out[1] is always zero model padding, not a second architectural result. x0 discards writeback but never suppresses state updates. No memory accesses. All operands are sampled before writeback, so rd may alias either source. Interpret A=sum(A[i]*2^(32*i),i=0..7), C=sum(C[i]*2^(32*i),i=0..15), and digit=in[0]+2^32*in[1] (LOW word in rs1, HIGH word in rs2). Set C_next=(C*2^64+A*digit) mod 2^512; A is unchanged; return C_next[0]. This is total for every A, every 512-bit C and both source values: discard old C[14..15], shift old C[0..13] up by two limbs, zero-fill C[0..1], then accumulate the low-digit row at offset 0 and the high-digit row at offset 1 with carry propagation through limb 15; discard the final carry. There is no claim of congruence modulo p for an arbitrary overflowing accumulator. Each row has eight 32x32 multiplies; exactly 16 per invocation. Hardware reuses red_accel''s existing 32x32 limb multiplier and 64-bit MAC, adding control and operand selection, not another multiplier. There are 16 MAC steps plus 15 fixed carry-tail steps and a shift/clear step; the 44-cycle Gate-3 price is not a claim that these tail steps take zero time. To multiply two 256-bit values: lda(left+8,scratch6); LW low0=left[0]; xword(low0,selector=0); LW low1=left[1]; xword(low1,selector=1); for k=3,2,1,0 load right[2*k] and right[2*k+1] to rs1,rs2 and issue mac2; stp(product). Four steps process 8/2=4 digit pairs and perform 64 multiplies. The exact result fits 512 bits, including all-ones inputs. No modular reduction is interleaved, so the upper half required by uECC_vli_mult is preserved. Verification boundary: the single-instruction Gate-2 harness starts this instruction with A=C=0, so it does not establish the nonzero-state arithmetic or cross-instruction transitions. This instruction is explicitly unverified for those transitions until the sequence checks in rationale are run against the independent ISS/RTL. Its returned accumulator limb is observable after state setup; p256.xword can seed and inspect every limb without hidden test state.'
+  spike_model: |-
+    void p256_mac2_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        // Isolated reset-state interpretation: A_entry = C_entry = 0.
+        // No incoming state is supplied, and persistent storage is forbidden.
+        // Thus (C_entry * 2^64 + A_entry * digit) mod 2^512 = 0.
+        (void)in;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_stp_model(const uint32_t in[16], uint32_t out[16]) {
+        (void)in;
+        for (int i = 0; i < 16; ++i) out[i] = xp256_c[i];
+        for (int i = 0; i < 8; ++i) xp256_a[i] = 0;
+        for (int i = 0; i < 16; ++i) xp256_c[i] = 0;
+    }
+  encoding: 0000010 rs2 rs1 000 rd 0101011
+  form: block
+  funct3: '000'
+  funct7: '0000010'
+  group: load-store
+  imm_bits: 0
+  invocations: 1
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.stp
+  name: Store exact 512-bit product and clear working state
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    For each i in 0..15: out[i] := C_entry[i].
+    For each i in 0..7: A_next[i] := 0.
+    For each i in 0..15: C_next[i] := 0.
+    rd_next := 0; state clear commits after output writes.
+  reads_state:
+  - C
+  replaces: uECC_vli_mult::comba_product
+  semantics: 'Write all sixteen limbs of the entry C to the output block, least-significant limb first. The sixteen input words are read for the block transfer ABI but their values are ignored; no input staging buffer is needed. Canonical use sets rs1=rs2=the caller''s existing 16-word product buffer. Every output word is meaningful and no expansion or copy is required, so marshal_words=0. After the last write acknowledgement clear all eight A limbs and all sixteen C limbs, including any high limbs. rd receives zero. This store never reduces or modifies the product being returned. Block ABI: x[rs1] and x[rs2] are byte addresses of the input and output blocks, respectively. Caller supplies the full words-word blocks and uses word-aligned pointers into ordinary SRAM. For a misaligned encoding the effective base is x[rs] & 0xfffffffc, matching the SRAM word indexing; address additions wrap modulo 2^32. Read all words at input_base+4*i in ascending i before issuing any writes at output_base+4*i in ascending i, with four write strobes. This defines exact and partial overlap without a dependence on operand values. in[i] models the value read at input_base+4*i; out[i] models the value written at output_base+4*i. rd receives zero, independently of out[]. Use the existing separate accelerator memory master, not PCPI as a memory channel. Every request/address/data/strobe remains stable until mem_valid && mem_issued && mem_ready; reset mem_issued for each request and retain the ownership-handoff guard. pcpi_wait is asserted on acceptance and held until completion, which blocks the CPU. Only complete after all writes are acknowledged. MMIO and unmapped addresses have the existing SoC bus behavior (including testbench termination for unmapped access), not a new memory protection or fault mechanism. The constant-work and termination guarantees apply to valid SRAM blocks with responding memory; external wait states can extend latency. Verification boundary: the single-instruction Gate-2 harness starts this instruction with A=C=0, so it does not establish the nonzero-state arithmetic or cross-instruction transitions. This instruction is explicitly unverified for those transitions until the sequence checks in rationale are run against the independent ISS/RTL. Its returned accumulator limb is observable after state setup; p256.xword can seed and inspect every limb without hidden test state. One stp per 64-byte product; after stp a second store returns all zero, preventing stale secrets from surviving a completed operation.'
+  spike_model: |-
+    void p256_stp_iss(const uint32_t in[16], uint32_t out[16])
+    {
+        // Isolated reset-state interpretation: C_entry = 0.
+        // Input block values are explicitly ignored; they do not encode C.
+        // The pure ABI cannot observe or clear persistent architectural state.
+        (void)in;
+        for (unsigned i = 0; i < 16; ++i) out[i] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 16
+  writes_state:
+  - A
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_fold_model(const uint32_t in[2], uint32_t out[2]) {
+        const uint32_t p[16] = {
+            UINT32_C(0xffffffff), UINT32_C(0xffffffff), UINT32_C(0xffffffff),
+            0, 0, 0, 1, UINT32_C(0xffffffff), 0, 0, 0, 0, 0, 0, 0, 0
+        };
+        uint32_t sel = in[1] & UINT32_C(15);
+        uint64_t borrow = 0;
+        for (int round = 0; round < 2; ++round) {
+            uint32_t h = 0;
+            int64_t carry = 0;
+            for (int k = 0; k < 16; ++k) {
+                uint32_t m = UINT32_C(0) - (uint32_t)(sel == (uint32_t)k);
+                uint32_t t = (xp256_c[8+k/2] >> (16*(k%2))) & UINT32_C(0xffff);
+                h |= t & m;
+            }
+            for (int i = 0; i < 32; ++i) {
+                uint32_t shift = (uint32_t)(16*(i%2));
+                uint32_t old = (xp256_c[i/2] >> shift) & UINT32_C(0xffff);
+                uint32_t m0 = UINT32_C(0) - (uint32_t)((uint32_t)i == sel);
+                uint32_t m6 = UINT32_C(0) - (uint32_t)((uint32_t)i == sel+6);
+                uint32_t m12 = UINT32_C(0) - (uint32_t)((uint32_t)i == sel+12);
+                uint32_t m14 = UINT32_C(0) - (uint32_t)((uint32_t)i == sel+14);
+                uint32_t m16 = UINT32_C(0) - (uint32_t)((uint32_t)i == sel+16);
+                int64_t v = (int64_t)old + carry
+                          + (int64_t)(h & m0) - (int64_t)(h & m6)
+                          - (int64_t)(h & m12) + (int64_t)(h & m14)
+                          - (int64_t)(h & m16);
+                uint32_t digit = (uint32_t)v & UINT32_C(0xffff);
+                xp256_c[i/2] = (xp256_c[i/2] & ~(UINT32_C(0xffff) << shift))
+                            | (digit << shift);
+                carry = (int64_t)((uint64_t)(v + INT64_C(262144)) >> 16) - INT64_C(4);
+            }
+        }
+        for (int i = 0; i < 16; ++i) {
+            uint64_t d = (uint64_t)xp256_c[i] - (uint64_t)p[i] - borrow;
+            borrow = d >> 63;
+        }
+        {
+            uint32_t mask = UINT32_C(0) - (uint32_t)(UINT64_C(1) - borrow);
+            borrow = 0;
+            for (int i = 0; i < 16; ++i) {
+                uint64_t d = (uint64_t)xp256_c[i] - (uint64_t)(p[i] & mask) - borrow;
+                xp256_c[i] = (uint32_t)d;
+                borrow = d >> 63;
+            }
+        }
+        for (int i = 0; i < 8; ++i) xp256_a[i] = 0;
+        out[0] = xp256_c[0]; out[1] = 0;
+    }
+  encoding: 0000100 0 imm4 rs1 010 rd 0101011
+  form: reg_imm
+  funct3: '010'
+  funct7: '0000100'
+  group: reduction
+  imm_bits: 4
+  invocations: 16
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.fold
+  name: Eliminate one selected high 16-bit digit modulo P-256
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - imm4
+  pseudocode: |-
+    q := 2^16; k := in[1] AND 15.
+    p := 2^256-2^224+2^192+2^96-1; K := 2^256-p.
+    T := 2^(256+16*k); Q := K << (16*k); X0 := LE512(C_entry).
+    h0 := floor(X0/T) mod q; X1 := X0-h0*T+h0*Q.
+    h1 := floor(X1/T) mod q; X2 := X1-h1*T+h1*Q.
+    b := unsigned_borrow_512(X2-p); mask := (0-(1-b)) mod 2^512.
+    R := X2-(p AND mask).
+    C_next := limbs32(R,16); A_next := zero256.
+    out[0] := C_next[0]; out[1] := 0.
+  reads_state:
+  - C
+  replaces: vli_mmod_fast_secp256r1::fold_and_normalize
+  semantics: |-
+    Register/immediate ABI: in[0]=x[rs1] is ignored (encode rs1=x0), and in[1] is the zero-extended 4-bit immediate k=instruction bits[23:20]. Bit 24 is fixed zero and MUST be checked by the decoder; the corresponding bit-24-one encodings are reserved and not accepted. For the total C-array model k=in[1]&15, so arbitrary high bits in in[1] are ignored. out[0] is the low word of the updated C and goes to x[rd]; out[1]=0 padding. There are no memory accesses and no multiplication. rd=x0 discards only writeback.
+    Let q=2^16, M=2^256, p=2^256-2^224+2^192+2^96-1 and K=M-p=2^224-2^192-2^96+1. Let T=2^(256+16*k), Q=K*2^(16*k), and X0=LE512(C_entry). Perform EXACTLY TWO passes: h_t=floor(X_t/T) mod q, X_(t+1)=X_t-h_t*T+h_t*Q, for t=0,1. Then compute R=X2-p if X2>=p, otherwise R=X2, by a mask. Set C_next=limbs32(R,16), clear all A, and return C_next[0]. These equations, including the single conditional subtraction, define every initial 512-bit C and every immediate; no input precondition is needed for totality. Each pass is nonnegative and no larger than its input, because it removes an existing digit at T and replaces it with the smaller positive contribution Q. It preserves residue modulo p. There is no hidden modular truncation of a value above 512 bits.
+    Software must call fold with k=15,14,...,0, once for each of the SIXTEEN 16-bit digits above bit 255. The order is fixed, independent of values. This produces canonical C in [0,p). Proof: at step k, X<T*q. Since Q<T/q^2, the first pass is below T+T/q. If its digit at T is zero, the second leaves it unchanged. Otherwise that digit is one and the low part is below T/q, so the second pass is below T/q+Q<T. The subtraction only decreases X. Descending k therefore leaves X<2^256, and p>2^255 means the final single subtraction normalizes it. Two passes are necessary to handle carry back into the just-eliminated position; both always execute.
+    An implementation can express each pass in 32 base-q digits: snapshot selected h from C halfwords 16..31 with a fixed scan and equality masks; update digits low-to-high, adding h at position k, subtracting h at k+6 and k+12, adding h at k+14, and subtracting h at k+16. Propagate signed floor carry at base q. The C model uses a positive 4q bias so negative carry has C99-defined behavior. Then use two full 16-word subtraction passes, first finding borrow and then subtracting a masked modulus. All memory indices depend only on fixed loop indices, never on the immediate or secret C. Reuse the existing 64-bit adder/accumulation datapath; no multiplier or divider is required. This step clobbers A, so a new multiplication must reload its multiplicand. Isolated Gate 2 from reset only observes zero and does not verify these state transitions; seed C via sixteen push instructions or xword and execute the specified sequence against the independent ISS/RTL. invocations=16 follows 256 high bits / 16 bits per step.
+  spike_model: |-
+    void p256_fold_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        // Isolated reset-state interpretation: C_entry = 0.
+        // For every k = in[1] & 15, both selected digits are zero.
+        // Both replacements leave zero; zero < p, so subtraction leaves zero.
+        // No incoming C or outgoing A/C can be represented by this pure ABI.
+        (void)in;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  src_regs: 1
+  state_words: 0
+  words: 2
+  writes_state:
+  - A
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_xword_model(const uint32_t in[2], uint32_t out[2]) {
+        uint32_t value = in[0];
+        uint32_t sel = in[1] & UINT32_C(31);
+        for (int i = 0; i < 8; ++i) {
+            uint32_t mask = UINT32_C(0) - (uint32_t)(sel == (uint32_t)i);
+            xp256_a[i] = (xp256_a[i] & ~mask) | (value & mask);
+        }
+        for (int i = 0; i < 16; ++i) {
+            uint32_t mask = UINT32_C(0) - (uint32_t)(sel == (uint32_t)(i+8));
+            xp256_c[i] = (xp256_c[i] & ~mask) | (value & mask);
+        }
+        out[0] = value;
+        out[1] = 0;
+    }
+  encoding: 0000110 rs2 rs1 011 rd 0101011
+  form: reg
+  funct3: '011'
+  funct7: '0000110'
+  group: move
+  imm_bits: 0
+  invocations: 2
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.xword
+  name: Exchange one architectural state word
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    s := in[1] AND 31.
+    For each constant k in 0..23: m[k] := 0xffffffff if s=k, else 0.
+    For each k: R_entry[k] := A_entry[k] for k<8, otherwise C_entry[k-8].
+    For each k: R_next[k] := (R_entry[k] AND NOT m[k]) OR (in[0] AND m[k]).
+    A_next := R_next[0..7]; C_next := R_next[8..23].
+    out[0] := in[0]; out[1] := 0.
+  reads_state:
+  - A
+  - C
+  replaces: uECC_vli_mult::comba_product
+  semantics: 'Register ABI: in[0]=x[rs1] is the value to insert and in[1]=x[rs2] selects a state word modulo 32. Select s=in[1]&31. For s in 0..7, replace A[s] with in[0]; for s in 8..23, replace C[s-8] with in[0]; for s in 24..31, leave A and C unchanged. Return in[0] in out[0]/rd and set out[1]=0 padding. The result is the inserted value, never the prior state value, so repeated identical operands produce identical outputs even though the declared state is updated. No memory access. Inputs are sampled before writeback; rd may alias either source. rd=x0 discards only scalar writeback; the selected state update still occurs.'
+  spike_model: |-
+    void p256_xword_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        // Instruction semantics and pseudocode return the inserted value,
+        // including selectors 24..31; state_note's old-value exchange conflicts.
+        // The indexed A/C state write cannot persist through the pure ABI.
+        const uint32_t value = in[0];
+        out[0] = value;
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - A
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_push_model(const uint32_t in[2], uint32_t out[2]) {
+        uint32_t word = in[0];
+        for (int i = 15; i >= 1; --i) xp256_c[i] = xp256_c[i-1];
+        xp256_c[0] = word;
+        for (int i = 0; i < 8; ++i) xp256_a[i] = 0;
+        out[0] = xp256_c[0]; out[1] = 0;
+    }
+  encoding: 0000011 rs2 rs1 011 rd 0101011
+  form: reg
+  funct3: '011'
+  funct7: '0000011'
+  group: move
+  imm_bits: 0
+  invocations: 16
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.push
+  name: Shift in one scalar product word
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    X := LE512(C_entry).
+    C_next := limbs32(((X << 32)+zext(in[0])) mod 2^512,16).
+    A_next := zero256.
+    out[0] := C_next[0]; out[1] := 0.
+  reads_state:
+  - C
+  replaces: vli_mmod_fast_secp256r1::fold_and_normalize
+  semantics: 'Register ABI: in[0]=x[rs1] is the incoming 32-bit word; in[1]=x[rs2] is ignored (encode rs2=x0). Set C_next=((C_entry<<32)+in[0]) mod 2^512, clear all A, return C_next[0] in out[0]/rd, and set out[1]=0. This is a register shift/insert move with no memory access or multiplication. Discard old C[15], shift old C[0..14] up one word, and insert the new low word. Software seeds any 512-bit product by sixteen LW/push pairs in descending word order, i=15..0. Exactly 64 bytes / 4 bytes per invocation = SIXTEEN invocations. After sixteen, no old C remains, regardless of entry state. All product reads precede the final result stores, permitting aliased source and destination. marshal_words=0: each LW reads the caller''s native word directly and there is no operand block. Scalar loads are charged separately. The output observes the incoming word from reset; propagation to high C still requires sequence testing. rd may alias rs1; inputs are sampled before writeback. x0 discards only scalar writeback. Timing, wait and decode follow state_note.'
+  spike_model: |-
+    void p256_push_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        // The low word of ((C_entry << 32) + in[0]) mod 2^512 is
+        // in[0] for every C_entry. The pure ABI cannot retain C_next.
+        const uint32_t value = in[0];
+        out[0] = value;
+        out[1] = 0;
+    }
+  src_regs: 1
+  state_words: 0
+  words: 2
+  writes_state:
+  - A
+  - C
+- c_model: |
+    #include <stdint.h>
+    #ifndef XP256_R2_STATE_DEFINED
+    #define XP256_R2_STATE_DEFINED
+    /* One shared instance per modeled hart; include all model snippets in one TU. */
+    static uint32_t xp256_a[8] = {0};
+    static uint32_t xp256_c[16] = {0};
+    #endif
+
+    void p256_pop_model(const uint32_t in[2], uint32_t out[2]) {
+        uint32_t half = xp256_c[0] & UINT32_C(0xffff);
+        (void)in;
+        for (int i = 0; i < 15; ++i)
+            xp256_c[i] = (xp256_c[i] >> 16) | (xp256_c[i+1] << 16);
+        xp256_c[15] >>= 16;
+        for (int i = 0; i < 8; ++i) xp256_a[i] = 0;
+        out[0] = half; out[1] = 0;
+    }
+  encoding: 0000101 rs2 rs1 011 rd 0101011
+  form: reg
+  funct3: '011'
+  funct7: '0000101'
+  group: move
+  imm_bits: 0
+  invocations: 16
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: p256.pop
+  name: Shift out one 16-bit result digit
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    X := LE512(C_entry).
+    out[0] := X mod 2^16; out[1] := 0.
+    C_next := limbs32(floor(X/2^16),16).
+    A_next := zero256.
+  reads_state:
+  - C
+  replaces: vli_mmod_fast_secp256r1::fold_and_normalize
+  semantics: 'Register ABI: in[0]=x[rs1] and in[1]=x[rs2] are ignored (use x0,x0). Return the ZERO-EXTENDED low 16 bits of C_entry in out[0]/rd, write out[1]=0 padding, shift C right by SIXTEEN bits with zero fill, and clear every A limb. No memory accesses. Software drains a canonical 256-bit P-256 result using SIXTEEN pop instructions: for j=0..7 {lo=pop(); hi=pop(); result[j]=lo|(hi<<16);} with eight ordinary SW. This is 32 bytes / 2 bytes per pop = 16 invocations. The sixteen ordered folds leave C<p<2^256, so those sixteen pops erase ALL of C as well as A, and a subsequent pop returns zero. With an arbitrary unreduced 512-bit C, the unconsumed high 496 bits remain after one pop; thirty-two pops drain it entirely. This is a defined destructive read, not an implicit reduction. rd=x0 still consumes the digit. Software packing uses eight shift-by-16 and eight OR instructions; their target cost and all stores are additional to the PCPI price. No copied block is required, marshal_words=0. A reset-state isolated test sees zero only and does not verify the drain; seed C via push/xword and test the complete sequence in the independent ISS/RTL.'
+  spike_model: |-
+    void p256_pop_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        // Isolated reset-state interpretation: C_entry = 0.
+        // Its zero-extended low halfword and its shifted value are zero.
+        // The pure ABI cannot read or consume persistent C.
+        (void)in;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - A
+  - C
+link1_vectors: 100000
+name: xp256_steps
+passes_gate2: true
+passes_link1: true
+rationale: |-
+  S2a / source evidence. The report names only vli_mmod_fast_secp256r1::fold_and_normalize (share 0.4848706021140489, 4336800805 host callgrind events, 530951 recorded calls) and uECC_vli_mult::comba_product (share 0.4246351870290038, 3798040576 events, 3694592 calls). Their ideal combined Amdahl ceiling is 11.05043x from 90.95058% coverage; reduction alone caps at 1.94126x and multiplication alone at 1.73803x. These are upper bounds, not achieved measurements. The generalized patterns are carry-propagating convolution and fixed-prime high-digit elimination. No benefit is claimed for unmined modSub, add or inversion. micro-ecc/types.h defaults RV32 to 32-bit words and curve-specific.inc defines P-256 as 32 bytes/eight such words and supplies p=2^256-2^224+2^192+2^96-1. The profile does not identify effective host macros or runtime num_words distribution; dispatch the multiply sequence for logical 256-bit inputs (num_words=8 on RV32), retaining software for other sizes. Full reported coverage is an eligibility ceiling until that histogram is known.
+
+  S2b / history and partition. Start from the shipped p256.mac2 shape (reg, words=2, 16 multiplies per call, four calls). Preserve it while expanding C from the older 352-bit state to 512 bits: standalone uECC_vli_mult requires all product limbs, and a previously observed high-state truncation defect forbids claiming arbitrary-state modular equivalence for a narrow accumulator. The new mac2 explicitly defines modulo 2^512, and its four-call product does not overflow that width. Memory-to-memory compute monoliths and the formerly rejected tiny add2 pair are excluded. Arithmetic is now either register compute or register/immediate reduction, and only the load-store pair addresses memory. A 16-bit reduction digit is small enough to give a constant two-pass carry-elimination proof for every 512-bit state. Sixteen fixed steps leave the reduction loop in software. The final scalar insertion/extraction shape also respects the writer's minimum-invocation heuristic using real data counts, without inflating a one-load-per-kernel declaration. The six-word upper-multiplicand load plus two xword calls gives explicit state access real kernel work and satisfies the positive/helper invocation checks. This costs extra issue cycles and is included below.
+
+  Exact standalone multiplication wrapper (byte pointers):
+    lda x0, left+8, scratch6
+    LW a0=left[0]; xword x0,a0,selector0
+    LW a1=left[1]; xword x0,a1,selector1
+    for k=3,2,1,0: LW lo=right[2*k]; LW hi=right[2*k+1]; mac2 x0,lo,hi
+    stp x0,product,product
+  A word is 4 bytes. lda moves the upper 24 operand bytes directly and writes a six-word scratch output; xword supplies the other 8 bytes, one limb per invocation. Thus lda=1, xword=2, mac2=8/2=4, stp=1. mac2 performs 4*16=64 32x32 products and stp returns the full 16-word product. left/right are separate arrays; no concatenation is required. All operand reads precede the final store, so standard destination aliases are safe. Use scratch6 distinct from unread operands; if the upper-left input is writable SRAM, exact copy-through alias is also allowed.
+
+  Exact standalone reduction wrapper:
+    for i=15 down to 0: LW t=product[i]; push x0,t,x0
+    for k=15 down to 0: fold x0,x0,k
+    for j=0..7: lo=pop(); hi=pop(); SW result[j]=lo|(hi<<16)
+  There are 64/4=16 push calls, 256 high bits/16=16 fold calls, and 32 result bytes/2=16 pop calls. Sixteen pushes replace ANY prior C; there is no hidden initialize operation. The fold order is public and fixed and can be sixteen unrolled immediate instructions. After the last pop A=C=0. All sixteen LW occur before output stores, so product/result overlap is supported. In a known P-256 modMult caller, software may omit stp and the sixteen input pushes and reduce the live product; costing here conservatively keeps both standalone wrappers, without double-crediting fused execution. Helpers share their kernel's measured share; sum all their costs before calculating speedup. Each replaces field uses an exact current loop_id, and every declared invocation count describes the stated wrapper. marshal_words=0 means no CPU block copies: lda's source is the existing six-word suffix, stp's output is the caller's existing sixteen-word buffer, and the reduction transfers use ordinary scalar registers. Scalar loads, packing instructions and stores are still charged separately.
+
+  Target cost and uncertainty. Use issue=28, never the core's bare handshake=1. The six-word block load costs 28+4*6=52; stp costs 92; mac2 costs 44; xword, push, pop and fold cost 28 each in the stated gate formula. Multiplication is 52+2*28+4*44+92=376 gate cycles plus ten scalar LW at the core's 7-cycle estimate =446 before wrapper control. Four fixed MAC carry tails/shift steps add approximately 64 implementation cycles, giving a 510-cycle planning figure plus control. Reduction is (16+16+16)*28=1344 gate cycles, plus sixteen scalar LW (112), eight scalar SW (40 using the supplied 5-cycle store calibration), eight OR, and eight iterative shift-by-16 operations; the CPU has no barrel shifter. Gate mac_ops=0 does not make folding free. A conservative serial controller budget is 416 additional microcycles per fold for two fixed digit passes, selected-digit capture and two modulus-subtraction scans, giving 8000 extension cycles plus CPU transfers/packing/control (roughly 8.25k before loop/setup if packing takes about 96 cycles). This is a budget to validate in RTL, not measured latency. The persistent 768 bits are substantial versus 992 writable CPU register bits, but reuse existing buffers. No synthesized area claim, extra multiplier, asynchronous overlap, or new memory channel is assumed.
+  Callgrind host events are not target cycles; 8.5 target cycles per host event is calibration only. The recorded indirect reduction call count is much lower than multiplication's, so do not import the historical about-seven correction factor as a measured kernel trip count. Invocation counts above come from bytes. Any performance extrapolation must additionally check sensitivity to approximately 3694592/530951=6.96 times the recorded reduction count and resolve attribution before claiming application speedup.
+
+  S2c round 1, arithmetic/totality. MAC intermediates fit uint64: one 32x32 product plus a 32-bit destination and carry is at most 2^64-1. Arbitrary accumulator overflow is explicitly modulo 2^512. Fold's h is an existing 16-bit digit; each pass replaces h*T with smaller h*Q, so it is nonnegative, cannot overflow 512 bits, and preserves residue. Two passes remove the digit in descending order even when the first reintroduces a carry. The proof and exact conditional subtraction are in semantics. Intermediate signed magnitude is below 4*65536; a positive bias implements floor carry without implementation-defined signed shifts. p>2^255 makes one final subtraction enough after k=0. C-model high immediate bits and invalid xword selectors are defined, all outputs are assigned, and all scalar padding is zero.
+
+  S2c round 2, timing/state/security. Every loop has a constant geometry-bound trip count. No model branch or address depends on input values: fold finds its immediate-selected digit with equality masks over fixed locations, and xword scans all 24 state locations. Signed intermediates are bounded, all shifts are by 0,16,32 or63, and unsigned subtraction wraps by C99 rules. There is no libc, undeclared state, input write, or block overrun. All C models support in==out because used scalar inputs are captured before output, lda loads its full block before echoing, and stp ignores input values. stp and a complete normalized pop drain clear secrets; xword supports exact state save/clear/restore rather than relying on reset-only tests. A complete reduction changes every persistent word even when entry state was arbitrary.
+
+  S2c round 3, decode/callability/core. All seven triples are unique custom-1 encodings ending in 0101011, with fully specified funct3/funct7. fold additionally fixes bit24=0 and consumes only imm4; no alias with custom-0 legacy multiply or opcode0x33 M instructions exists. Block widths are 6 and16, both load-store; the remaining operations are register moves, compute or reduction, words=2, state_words=0. There are no new CSRs or hidden configuration. PCPI blocking, prompt wait, stable acknowledged memory transactions and the ownership guard are mandatory. Only one scalar result is returned; 512-/256-bit results are drained explicitly. All data volume, output sizing, shifts and setup instructions are accounted for.
+
+  Executed design checks and verification boundary. A JavaScript limb simulation checked the exact mac2 algorithm against independent BigInt equations for 20000 arbitrary initial accumulators and 20049 product sequences including all-ones, zero, p-1 and power-of-two cases. The final digit-fold/move algorithm passed 1036 directed full reductions (including every isolated bit and adjacent power-of-two threshold, p,2p,p^2,(p-1)^2,all-ones), 20000 random 512-bit push/fold/pop sequences, 20000 arbitrary-state/immediate fold cases, and 20000 xword context save/clear/restore tests with invalid selectors. These are arithmetic/design checks, not C compilation, sanitizers, constant-time instrumentation, ISS or RTL tests.
+  The sealed tool surface exposes no compiler, sanitizer or evaluation runner. Isolated Gate 2 starts state at zero and does not verify nonzero mac2/fold/pop transitions; affected semantics explicitly disclose this limitation. For integration, concatenate models into one shared-state C99 translation unit, then compare the full multiplication wrapper against an independent 512-bit product and the full reduction wrapper against X mod p. Compare the fused wrapper against a*b mod p. Seed every limb via xword for arbitrary-state tests; test upper immediate bits in the array model, illegal encoded bit24, all state selectors, context switches at every instruction boundary, exact/partial block overlaps, output poisoning, repeated post-drain reads, memory stalls and stale-ready handoff. The independent ISS/RTL implementations must pass these sequence tests before a hardware shipping claim.
+  Final wrapper recheck after the accepted operand-setup revision: 20000 additional deterministic random sequences passed six-word lda plus two xword setup, four exact mac2 steps, full product store/clear, sixteen scalar pushes, descending digit folds, and sixteen-digit drain against independent BigInt product and modulo-p results. This remains a JavaScript design check, not an executable C/ISS gate result.
+register_files:
+- context: Per-hart secret architectural state. Save/clear with xword selectors 0..7 and restore with xword. stp, push, fold and pop clear A.
+  count: 1
+  name: A
+  purpose: Eight little-endian 32-bit multiplicand limbs; lda loads upper six, two xword calls supply low two. Reduction moves and fold clear A.
+  reset: All 256 bits zero.
+  width_bits: 256
+- context: Per-hart secret architectural state. Save/clear with xword selectors 8..23 and restore with xword. stp clears all limbs; the canonical sixteen-pop reduction drain consumes all limbs.
+  count: 1
+  name: C
+  purpose: Sixteen little-endian 32-bit accumulator/product/reduction limbs. Multiplication is exact modulo 2^512; reduction steps preserve residue modulo the fixed P-256 prime.
+  reset: All 512 bits zero.
+  width_bits: 512
+state_note: |-
+  The only persistent extension state is A (256 bits) and C (512 bits): 24 words/768 bits. state_words=0 means no threaded state prefix in model operands. Every c_model carries identical guarded file-scope xp256_a[8] and xp256_c[16] declarations. Concatenate all snippets into ONE C99 translation unit for sequence modeling; the guard creates one shared instance. Separate compilation of snippets creates separate isolated machines, which cannot test cross-instruction effects. All state is zero on reset. Geometry and prime are fixed; csrs is intentionally empty, with no reliance on unavailable CSR-write support. The four-bit fold immediate selects a digit operation, not persistent configuration.
+  The register-only instructions use at most two scalar sources and one scalar 32-bit result. They issue no memory transactions. lda and stp alone use the existing separate accelerator memory master and acc_busy bus mux; PCPI itself has no memory channel. Their full memory/overlap/address rules are in semantics. Assert pcpi_wait upon accepting any instruction, keep it asserted for long operations, and complete once using pcpi_ready/pcpi_wr, waiting for pcpi_valid to fall before reaccepting. CPU execution blocks throughout. Keep bus requests stable until acknowledged and preserve mem_issued against stale acknowledgement during ownership handoff. Match the complete custom-1/funct3/funct7 tuples and also fixed bit 24=0 for fold. Never assert external ready for base M or legacy custom-0 encodings.
+  Reuse red_accel's current 32x32 limb multiplier and 64-bit accumulation/add datapath for mac2 and signed fold microsteps; do not add a second new multiplier or divider. Map A onto operands[0..7] and C onto product_words[0..15]; this uses 768 of the existing 1024 buffer bits. Sampled operands, address, carry and controller registers are temporary and cleared on completion. Physical area and timing require synthesis; buffer counts alone are not an area measurement. Existing custom-0/funct3=000/funct7=000 keeps its original product encoding and memory result but clobbers the shared new state; finish it with A=C=0. A caller with live new-extension state must save it before invoking legacy multiplication.
+  These are caller-clobbered per-hart registers. The target disables IRQs, but scheduling or synchronous trap handling between instructions must save and clear all 24 words via xword before another security context runs and restore them before resuming. xword(v,k) exchanges word k with v, so xword(0,k) both returns and erases each saved word. Protect and erase the software context image as for base register secrets. No context switch occurs inside a stalled PCPI operation. stp clears A/C only after its last acknowledged store. Sixteen pops following the specified sixteen folds consume all of C and clear A; arbitrary unfinished sequences require explicit context cleanup. Reset clears in-flight and architectural state. Bus faults/waits inherit the target's behavior; no new memory protection or fault channel is implied.
+tests:
+- 'link1: coverage 90.95% >= 80%; 7/7 C models built and survived 100,000 vectors under ASan+UBSan'
+- 'gate2: 7/7 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+version: 1.0.0

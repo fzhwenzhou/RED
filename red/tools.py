@@ -32,7 +32,6 @@ malformed artifact is rejected back to the agent rather than reaching a gate.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 
@@ -83,6 +82,53 @@ class _SourceMixin:
         these paths verbatim with `read_source`."""
         index = self._source_index()
         return "\n".join(f"- {p}" for p in sorted(index))
+
+    def grep_source(self, pattern: str, path: str = "", context: int = 2) -> str:
+        """Search the project and core sources for a regular expression.
+
+        Returns up to 200 matching lines as ``path:line: text``, each with
+        `context` lines either side. `path` optionally restricts the search to
+        one file, named as `list_sources` lists it.
+
+        This exists because the alternative was worse. ``read_source`` returns
+        a whole file, and the interesting ones are not small -- micro-ecc's
+        uECC.c is thousands of lines -- so an agent looking for one function
+        either reads the lot or reaches for a shell it does not have. Two
+        micro-ecc runs died exactly there: the designer called Bash, the tool
+        seal denied it, and the turn failed with nothing to show. A search
+        that stays inside the sealed surface removes the reason to leave it.
+        """
+        try:
+            rx = re.compile(pattern)
+        except re.error as exc:
+            return f"Rejected: {pattern!r} is not a valid regular expression — {exc}"
+        index = self._source_index()
+        if path:
+            resolved = self.read_source(path)
+            if resolved.startswith("Rejected:"):
+                return resolved
+            keys = [k for k in index if k == path or k.endswith("/" + path)
+                    or k.split("/")[-1] == path]
+            index = {k: index[k] for k in keys} or index
+        out, shown = [], 0
+        for key in sorted(index):
+            try:
+                with open(index[key], "r", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+            for n, line in enumerate(lines):
+                if not rx.search(line):
+                    continue
+                lo, hi = max(0, n - context), min(len(lines), n + context + 1)
+                out.append(f"--- {key}:{n + 1}")
+                out += [f"{key}:{i + 1}: {lines[i]}" for i in range(lo, hi)]
+                shown += 1
+                if shown >= 200:
+                    out.append(f"... stopped at {shown} matches; narrow the "
+                               "pattern or pass `path`")
+                    return "\n".join(out)
+        return "\n".join(out) if out else f"no match for {pattern!r}"
 
     def read_source(self, rel_path: str) -> str:
         """Return the contents of one source file listed by `list_sources`.
@@ -143,7 +189,7 @@ class _ProfileMixin:
 class _ReportMixin:
 
     def read_report(self) -> str:
-        """Return the current HotLoopReport JSON (mined loops, cycle share,
+        """Return the current HotLoopReport (mined loops, cycle share,
         coverage, Gate-1 status)."""
         if not os.path.exists(self.report_path):
             return "No HotLoopReport yet."
@@ -155,8 +201,8 @@ class _ReportMixin:
         """True once Gate 1 has accepted A1's report. See :meth:`write_report`."""
         return os.path.exists(getattr(self, "report_path", "") + ".frozen")
 
-    def write_report(self, report_json: str) -> str:
-        """Record your ranked loop selection. `report_json` must be a valid
+    def write_report(self, report_yaml: str) -> str:
+        """Record your ranked loop selection. `report_yaml` must be a valid
         HotLoopReport (workload + loops[] with loop_id/function); it is
         validated and rejected if not. Dynamic cycle numbers are the loop's to
         fill in from the profile."""
@@ -173,18 +219,19 @@ class _ReportMixin:
                     "loop's numbers look wrong, say so in your rationale rather "
                     "than editing the measurement.")
         try:
-            report = state_def.from_json(report_json, state_def.HotLoopReport)
+            report = state_def.from_yaml(report_yaml, state_def.HotLoopReport)
             for loop in report.loops:
                 # Agents write operand_stats either as prose or as a small
                 # object; normalize to text so the artifact is well-typed
                 # either way instead of rejecting a useful report on shape.
                 if not isinstance(loop.operand_stats, str):
-                    loop.operand_stats = json.dumps(loop.operand_stats)
+                    loop.operand_stats = state_def.to_yaml(
+                        loop.operand_stats).strip()
             state_def.validate_hot_loop_report(report)
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
+        except (TypeError, ValueError) as e:
             return f"Rejected: invalid HotLoopReport — {e}"
         with open(self.report_path, "w") as f:
-            f.write(state_def.to_json(report))
+            f.write(state_def.to_yaml(report))
         return f"Accepted HotLoopReport for '{report.workload}' ({len(report.loops)} loops)."
 
 
@@ -203,8 +250,8 @@ class _SpecMixin:
             return set()
         try:
             with open(path) as f:
-                report = state_def.from_json(f.read(), state_def.HotLoopReport)
-        except (json.JSONDecodeError, TypeError, ValueError):
+                report = state_def.from_yaml(f.read(), state_def.HotLoopReport)
+        except (TypeError, ValueError):
             return set()
         return {l.loop_id for l in report.loops} | {l.function for l in report.loops}
 
@@ -218,8 +265,8 @@ class _SpecMixin:
             return
         try:
             with open(path) as f:
-                report = state_def.from_json(f.read(), state_def.HotLoopReport)
-        except (json.JSONDecodeError, TypeError, ValueError):
+                report = state_def.from_yaml(f.read(), state_def.HotLoopReport)
+        except (TypeError, ValueError):
             return
         loops = {l.loop_id: l for l in report.loops}
         for l in report.loops:
@@ -252,19 +299,19 @@ class _SpecMixin:
                     "prediction.")
 
     def read_spec(self) -> str:
-        """Return the current ISASpec draft JSON."""
+        """Return the current ISASpec draft."""
         if not os.path.exists(self.spec_path):
             return "No ISASpec draft yet."
         with open(self.spec_path) as f:
             return f.read()
 
 
-    def write_spec(self, spec_json: str) -> str:
-        """Replace the ISASpec draft. `spec_json` must be valid JSON matching the
-        ISASpec schema (name, instructions[] with mnemonic/encoding/semantics/
+    def write_spec(self, spec_yaml: str) -> str:
+        """Replace the ISASpec draft. `spec_yaml` must match the ISASpec
+        schema (name, instructions[] with mnemonic/encoding/semantics/
         pseudocode); it is validated and rejected if not."""
         try:
-            spec = state_def.from_json(spec_json, state_def.ISASpec)
+            spec = state_def.from_yaml(spec_yaml, state_def.ISASpec)
             for ins in spec.instructions:
                 # Agents commonly nest the encoding fields
                 # (``"encoding": {"opcode": ..., "funct3": ...}``) instead of
@@ -286,6 +333,18 @@ class _SpecMixin:
                                         state_def.normalize_opcode(ins.opcode),
                                         "opcode")) if x))
                 ins.opcode = state_def.normalize_opcode(ins.opcode) or ins.opcode
+                # Spelling of the shape fields is normalized rather than
+                # bounced: "reg-imm" and "REG_IMM" are the same design.
+                ins.form = state_def.normalize_form(ins.form) or ins.form
+                ins.group = state_def.normalize_group(ins.group)
+                # A register-form instruction's width is decided by the form,
+                # not by the designer -- in[0], in[1] -> out[0]. Setting it
+                # here means a draft that got the form right is not rejected
+                # over a field it had no freedom in.
+                if ins.form in state_def.REGISTER_FORMS:
+                    ins.words = state_def.REGISTER_FORM_WORDS
+                    if ins.form == "reg_imm":
+                        ins.src_regs = 1
             state_def.validate_isa_spec(spec)
             # `replaces` decides how much benefit Gate 3 credits, so it has to
             # name a loop that was actually mined. Catching it here turns a
@@ -311,7 +370,7 @@ class _SpecMixin:
                             f"instruction {ins.name!r} replaces={ins.replaces!r}, "
                             f"which is not a mined loop. Use one of: "
                             + ", ".join(sorted(known)))
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
+        except (TypeError, ValueError) as e:
             return f"Rejected: invalid ISASpec — {e}"
 
         # spike_model belongs to the ISS implementer alone. Gate 2 only means
@@ -322,15 +381,15 @@ class _SpecMixin:
         if os.path.exists(self.spec_path):
             try:
                 with open(self.spec_path) as f:
-                    prior = state_def.from_json(f.read(), state_def.ISASpec)
+                    prior = state_def.from_yaml(f.read(), state_def.ISASpec)
                 existing = {i.mnemonic: i.spike_model for i in prior.instructions}
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (TypeError, ValueError):
                 existing = {}
         for ins in spec.instructions:
             ins.spike_model = existing.get(ins.mnemonic, "")
 
         with open(self.spec_path, "w") as f:
-            f.write(state_def.to_json(spec))
+            f.write(state_def.to_yaml(spec))
         return f"Accepted ISASpec '{spec.name}' ({len(spec.instructions)} instructions)."
 
 
@@ -398,7 +457,7 @@ class _IssSpecMixin:
 
     def _load(self):
         with open(self.spec_path) as f:
-            return state_def.from_json(f.read(), state_def.ISASpec)
+            return state_def.from_yaml(f.read(), state_def.ISASpec)
 
 
     def read_spec(self) -> str:
@@ -410,16 +469,16 @@ class _IssSpecMixin:
         spec = self._load()
         for ins in spec.instructions:
             ins.c_model = "(withheld — implement from the specification above)"
-        return state_def.to_json(spec)
+        return state_def.to_yaml(spec)
 
 
-    def write_spec(self, spec_json: str) -> str:
+    def write_spec(self, spec_yaml: str) -> str:
         """Record your Spike implementations. Send the spec back with a
         `spike_model` on each instruction; only those fields are taken, every
         other field keeps the designer's value."""
         try:
-            incoming = state_def.from_json(spec_json, state_def.ISASpec)
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            incoming = state_def.from_yaml(spec_yaml, state_def.ISASpec)
+        except (TypeError, ValueError) as e:
             return f"Rejected: not a valid ISASpec — {e}"
         if not os.path.exists(self.spec_path):
             return "Rejected: there is no ISASpec on disk to add models to."
@@ -446,7 +505,7 @@ class _IssSpecMixin:
             return "Rejected: " + "; ".join(parts)
 
         with open(self.spec_path, "w") as f:
-            f.write(state_def.to_json(spec))
+            f.write(state_def.to_yaml(spec))
         return (f"Accepted {len(spec.instructions)} Spike model(s). Gate 2 will "
                 "run them against the reference C models.")
 
@@ -479,7 +538,7 @@ class _GraphMixin:
     @staticmethod
     def _table(rows: list, columns: list) -> str:
         """Rows as a compact markdown table — agents read these far better than
-        raw JSON, and it keeps long C models out of the reply."""
+        raw artifact, and it keeps long C models out of the reply."""
         if not rows:
             return "(nothing recorded yet)"
         out = ["| " + " | ".join(columns) + " |",
@@ -646,7 +705,7 @@ class DesignerTool(_SourceMixin, _ProfileMixin, _CoreMixin, _ReportMixin,
                    _FinishMixin, LocalTool):
     """Everything the mining and synthesis agents touch, on one server."""
 
-    METHODS = ("list_sources", "read_source", "read_profile", "read_core",
+    METHODS = ("list_sources", "read_source", "grep_source", "read_profile", "read_core",
                "read_report", "write_report", "read_spec", "write_spec",
                "read_status", "read_knowledge", "append_knowledge",
                "graph_winning_shape", "graph_prior_designs",
@@ -701,7 +760,7 @@ class WorkloadTool(_SourceMixin, _StatusMixin, _KnowledgeMixin, LocalTool):
     measurement, in the same words for every round.
     """
 
-    METHODS = ("list_sources", "read_source", "write_harness", "read_status",
+    METHODS = ("list_sources", "read_source", "grep_source", "write_harness", "read_status",
                "read_knowledge", "append_knowledge")
 
     def __init__(self, name, source_roots, harness_path, status_path,
@@ -787,8 +846,8 @@ class SecurityTool(_CoreMixin, _KnowledgeMixin, LocalTool):
             return None
         try:
             with open(self.spec_path) as f:
-                return state_def.from_json(f.read(), state_def.ISASpec)
-        except (json.JSONDecodeError, TypeError, ValueError):
+                return state_def.from_yaml(f.read(), state_def.ISASpec)
+        except (TypeError, ValueError):
             return None
 
     def read_spec(self) -> str:
@@ -855,14 +914,14 @@ class SecurityTool(_CoreMixin, _KnowledgeMixin, LocalTool):
         if os.path.exists(self.findings_path):
             try:
                 with open(self.findings_path) as f:
-                    items = json.load(f)
-            except (json.JSONDecodeError, OSError):
+                    items = state_def.loads(f.read()) or []
+            except (ValueError, OSError):
                 items = []
         items.append(asdict(finding))
         with open(self.findings_path, "w") as f:
-            json.dump(items, f, indent=2)
+            f.write(state_def.to_yaml(items))
 
-    def report_findings(self, findings_json: str) -> str:
+    def report_findings(self, findings_text: str) -> str:
         """Record your findings as a JSON array and end your turn. One object
         per finding:
 
@@ -878,8 +937,8 @@ class SecurityTool(_CoreMixin, _KnowledgeMixin, LocalTool):
         with `probe_vector` first — that result is recorded for you.
         """
         from red import security
-        found = security.parse_agent_findings(findings_json)
-        if not found and (findings_json or "").strip() not in ("[]", ""):
+        found = security.parse_agent_findings(findings_text)
+        if not found and (findings_text or "").strip() not in ("[]", ""):
             return ("Rejected: could not parse a JSON array of findings out of "
                     "that. Reply with the array itself, nothing else.")
         for f in found:

@@ -26,6 +26,6 @@ selection as a HotLoopReport.
   profile.
 
 ## Output
-Write your ranked selection with the `${WRITE_REPORT}` tool as HotLoopReport
-JSON: a `workload` string and a `loops` array (ranked, hottest first). Then
-reply with one paragraph justifying the ranking.
+Write your ranked selection with the `${WRITE_REPORT}` tool as a
+HotLoopReport: a `workload` string and a `loops` array (ranked, hottest
+first). Then reply with one paragraph justifying the ranking.

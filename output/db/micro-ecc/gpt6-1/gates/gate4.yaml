@@ -1,0 +1,4 @@
+counterexample: null
+detail: '13 checks over 512 adversarial vectors per model: 0 mechanically confirmed blocking, 1 advisory; 7 check(s) could not run'
+gate: gate4
+passed: true

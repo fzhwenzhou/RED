@@ -149,21 +149,48 @@ class Platform:
             cpu_load_store=profile.cycles_per_load or CPU_LOAD_STORE,
             cycles_per_ir=CYCLES_PER_IR)
 
-    def instruction_cycles(self, words: int, mac_ops: int) -> float:
+    def instruction_cycles(self, words: int, mac_ops: int,
+                           beats: int | None = None) -> float:
+        """Cycles for one invocation.
+
+        ``beats`` is the number of 32-bit words that cross the bus. It
+        defaults to ``2 * words`` -- the block form's copy in and copy out --
+        but a register-form instruction moves none, because its operands are
+        already in the register file and its result goes straight back to it.
+        That is most of why a small register-to-register instruction can pay
+        for itself where a block of the same arithmetic cannot."""
+        if beats is None:
+            beats = 2 * max(words, 1)
         return (self.fixed_cycles
-                + self.cycles_per_beat * 2 * max(words, 1)
+                + self.cycles_per_beat * max(beats, 0)
                 + self.mac_cycles * max(mac_ops, 0))
 
 
-def instruction_cycles(words: int, mac_ops: int, platform: "Platform | None" = None) -> float:
+def operand_beats(ins) -> int:
+    """32-bit words one invocation moves across the bus.
+
+    Register forms move zero: ``in[0]``/``in[1]`` arrive in x[rs1]/x[rs2] (or
+    as an immediate) and ``out[0]`` is written to x[rd]."""
+    if getattr(ins, "form", "block") in ("reg", "reg_imm"):
+        return 0
+    return 2 * max(getattr(ins, "words", 1), 1)
+
+
+def instruction_cycles(words: int, mac_ops: int, platform: "Platform | None" = None,
+                       beats: int | None = None) -> float:
     """Cycles for one invocation, operand traffic included."""
-    return (platform or Platform()).instruction_cycles(words, mac_ops)
+    return (platform or Platform()).instruction_cycles(words, mac_ops, beats)
 
 
 def work_per_beat(words: int, mac_ops: int) -> float:
     """Multiplies performed per 32-bit word moved — the number that decides
-    whether an instruction can win at all. Below ~1 the instruction is a data
-    movement engine with an ALU attached."""
+    whether a *block* instruction can win at all. Below ~1 the instruction is
+    a data movement engine with an ALU attached.
+
+    It is not the right question for a register form, which moves no words:
+    there the question is whether one invocation beats the handful of base-ISA
+    instructions it replaces, and the answer comes from `replaces` and the
+    measured kernel cost rather than from a ratio."""
     return mac_ops / float(2 * max(words, 1))
 
 
@@ -407,6 +434,39 @@ def target_for(round_: int, covered_share: float,
     return bar, "; ".join(reasons)
 
 
+def _close_kernels(per_kernel: dict) -> dict:
+    """Turn each kernel's running totals into one speedup for that kernel.
+
+    Gate 3 used to keep the *best* claim when several instructions named the
+    same kernel, on the reasoning that they were alternative designs rather
+    than a pipeline. That held while RED only ever produced one instruction
+    per kernel, and it stopped holding the moment the structural check started
+    pushing designs toward small composable instructions: matrixmul shipped
+    ``xqpack2.s`` -> ``xqdot4`` -> ``xqto.s``, three instructions that each
+    named ``multiply::matrix_product_ijk`` and each claimed to replace
+    essentially all of it. Taking the best of 20.90x, 8.33x and 19.89x
+    reported 19.22x for a kernel that in fact has to run all three.
+
+    So every instruction the spec ships for a kernel is charged. The software
+    they displace is credited once and capped at the kernel, because a kernel's
+    cycles can only be spent once however many instructions claim them.
+
+    If the instructions really were alternatives, charging for all of them is
+    still the right answer: the spec ships them all, the caller has them all,
+    and a design that wants to be priced as one instruction should contain one
+    instruction."""
+    out: dict[str, tuple[float, float]] = {}
+    for key, agg in per_kernel.items():
+        kernel = agg["kernel"]
+        if kernel <= 0:
+            continue
+        replaced = min(agg["replaced"], kernel)
+        new_kernel = (kernel - replaced) + agg["hw"]
+        out[key] = (agg["share"],
+                    (kernel / new_kernel) if new_kernel > 0 else 0.0)
+    return out
+
+
 def estimate(spec: state_def.ISASpec,
              report: state_def.HotLoopReport,
              core_profile=None,
@@ -453,14 +513,16 @@ def estimate(spec: state_def.ISASpec,
                 "red.nodes._parse_callgrind_raw against the callgrind output on "
                 "the profiling node."))
     costs: list[InstructionCost] = []
-    # kernel -> (share of app cycles, best speedup claimed on it)
+    # kernel -> (share of app cycles, speedup the whole extension gets on it)
     accelerated: dict[str, tuple[float, float]] = {}
+    # kernel -> running totals, folded into `accelerated` by _close_kernels
+    per_kernel: dict[str, dict] = {}
 
     measured_ops = measured_ops or {}
     ir_per_op = _IR_PER_OP_CACHE.get("v", _IR_PER_OP_FALLBACK)
     ir_per_step = _IR_PER_STEP_CACHE.get("v", _IR_PER_LOGIC_FALLBACK)
     for ins in spec.instructions:
-        beats = 2 * max(ins.words, 1)
+        beats = operand_beats(ins)
         # Split the measured work into the part the declared multiplies can
         # account for and the part they cannot, and charge each at the rate the
         # datapath runs it. Pricing everything as multiplies was the defect
@@ -484,7 +546,8 @@ def estimate(spec: state_def.ISASpec,
                         f"{ir - mac_ir:,.0f} are not accounted for by "
                         f"mac_ops={ins.mac_ops}; charged as "
                         f"{logic_steps:.0f} sequential logic steps")
-        cycles = plat.instruction_cycles(ins.words, ops) + logic_steps * LOGIC_CYCLES
+        cycles = (plat.instruction_cycles(ins.words, ops, beats)
+                  + logic_steps * LOGIC_CYCLES)
         # Copy in and back out, at the measured marshalling rate rather than the
         # bare load/store rate. On the one call anyone has measured end to end,
         # this is 413 of 656 cycles -- the largest single component, and a
@@ -588,15 +651,6 @@ def estimate(spec: state_def.ISASpec,
 
         share = loop.cycle_share or (
             (loop.dynamic_cycles / total_ir) * report.coverage if total_ir else 0.0)
-        # Whatever the instruction does not replace still runs in software. An
-        # instruction that covers a sixty-fourth of its kernel leaves the other
-        # sixty-three sixty-fourths at full price, and the kernel barely moves —
-        # which is exactly why replacing a loop body instead of a loop loses.
-        unreplaced = max(0.0, kernel_cycles - replaced_per_invocation * n)
-        new_kernel = unreplaced + n * cost.total()
-        # A kernel accelerated by several instructions keeps the best claim
-        # rather than compounding them — they are alternatives, not a pipeline.
-        kernel_speedup = (kernel_cycles / new_kernel) if new_kernel > 0 else 0.0
         # Keyed by FUNCTION, not by loop id. A1 routinely mines two regions of
         # one kernel and gives each the function's whole cycle share: micro-ecc
         # reported two loops inside uECC_vli_mult at 47.3% each, plus the add
@@ -606,11 +660,18 @@ def estimate(spec: state_def.ISASpec,
         # of the application for replacing two halves of one function. One
         # function's cycles can only be spent once.
         key = loop.function or loop.loop_id
-        prev = accelerated.get(key)
-        if prev is None or kernel_speedup > prev[1]:
-            accelerated[key] = (max(share, prev[0]) if prev else share,
-                                kernel_speedup)
+        agg = per_kernel.setdefault(
+            key, {"share": 0.0, "kernel": 0.0, "hw": 0.0, "replaced": 0.0})
+        agg["share"] = max(agg["share"], share)
+        agg["kernel"] = max(agg["kernel"], kernel_cycles)
+        # Every instruction the spec ships for this kernel is charged, and the
+        # software each displaces is credited once. See _close_kernels below
+        # for why this is a sum rather than the best of them.
+        agg["hw"] += n * cost.total()
+        agg["replaced"] += replaced_per_invocation * n
         costs.append(cost)
+
+    accelerated.update(_close_kernels(per_kernel))
 
     # ...and the total still cannot exceed the application. Nested mined regions
     # can make even the per-function shares sum past 1.0; scale them back rather

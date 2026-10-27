@@ -82,7 +82,7 @@ def _others_digest(prior, reviewer: str) -> str:
     return "\n".join(out)
 
 
-def _charter(reviewer: str, spec_json: str, report_json: str, core: str,
+def _charter(reviewer: str, spec_yaml: str, report_yaml: str, core: str,
              core_profile=None, prior=None, perf=None, security=None) -> str:
     """The full prompt for one reviewer: the shared frame plus its question."""
     common = open(os.path.join(LLM_PROMPTS_DIR, "review", "_common.md")).read()
@@ -95,8 +95,8 @@ def _charter(reviewer: str, spec_json: str, report_json: str, core: str,
             .replace("${PRIOR}", _prior_digest(prior, reviewer))
             .replace("${OTHERS}", _others_digest(prior, reviewer))
             .replace("${PERF}", render_perf(perf))
-            .replace("${REPORT}", _report_digest(report_json))
-            .replace("${SPEC}", spec_json))
+            .replace("${REPORT}", _report_digest(report_yaml))
+            .replace("${SPEC}", spec_yaml))
 
 
 def render_perf(perf) -> str:
@@ -204,13 +204,13 @@ def render_core(profile) -> str:
     return "\n".join(out)
 
 
-def _report_digest(report_json: str) -> str:
+def _report_digest(report_yaml: str) -> str:
     """The hot loops as a reviewer needs them: what is hot, how hot, and the
     body text. Sending the whole report would bury that in cycle counts."""
     try:
-        rep = state_def.from_json(report_json, state_def.HotLoopReport)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return report_json[:4000]
+        rep = state_def.from_yaml(report_yaml, state_def.HotLoopReport)
+    except (TypeError, ValueError):
+        return report_yaml[:4000]
     out = [f"workload {rep.workload}, coverage {rep.coverage:.1%} "
            f"(profiled with {rep.profile_method})"]
     for loop in rep.ranked():
@@ -265,7 +265,7 @@ def _parse_findings(reviewer: str, text: str) -> list[state_def.ReviewFinding]:
     return []
 
 
-def review_spec(llm, spec_json: str, report_json: str, core: str,
+def review_spec(llm, spec_yaml: str, report_yaml: str, core: str,
                 dispatch, reviewers=REVIEWERS, core_profile=None, prior=None,
                 perf=None, security=None) -> state_def.ReviewReport:
     """Run every reviewer concurrently and merge what they found.
@@ -278,7 +278,7 @@ def review_spec(llm, spec_json: str, report_json: str, core: str,
     if llm is None:
         return state_def.ReviewReport(reviewers=[], findings=[])
 
-    refs = [dispatch(_charter(r, spec_json, report_json, core, core_profile,
+    refs = [dispatch(_charter(r, spec_yaml, report_yaml, core, core_profile,
                               prior, perf, security),
                      f"review:{r}")
             for r in reviewers]

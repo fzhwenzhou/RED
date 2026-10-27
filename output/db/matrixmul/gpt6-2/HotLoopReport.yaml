@@ -1,0 +1,33 @@
+coverage: 0.9957060242855349
+loops:
+- body: |2-
+        for (int i = 1; i <= matrixC->rows; i++) {
+            for (int j = 1; j <= matrixC->columns; j++) {
+                for (int k = 1; k <= matrixA->columns; k++) {
+                    setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);
+                }
+            }
+        }
+  calls: 1
+  cycle_share: 0.9957060242855349
+  dynamic_cycles: 1884810512
+  function: multiply
+  ir: ''
+  loop_id: multiply::matrix_product_loop_nest
+  operand_stats: |-
+    bounds: i runs from 1 through matrixC->rows, j through matrixC->columns, and k through matrixA->columns. The measured generated harness is not among the supplied sources, so its runtime dimensions and total trip count are unknown; the 2x2 setup in test.c is not assumed to describe that harness.
+    data_types: Matrix elements and arithmetic use C float; rows and columns use unsigned char; i, j, k and promoted index arithmetic use int. Exact type bit widths are not specified by the provided sources.
+    layout: Flat row-major elements[MAX_ELEMENTS], with MAX_ELEMENTS=100 and one-based accessor indices mapped to (row-1)*columns+(column-1).
+    memory_access: For fixed i,j, k reads consecutive A row elements and strides by matrixB->columns elements through B. C[i,j] is repeatedly read and written at the same location. The surrounding j loop advances through a C row.
+    operation: Repeated multiplication of A[i,k] and B[k,j], followed by addition into C[i,j]; source expresses separate multiply and add, with no explicit fused operation.
+    profile_attribution: Profile provides function-level counts only. Select the entire product loop nest once under multiply, without splitting or double-counting its nested loops. Its function count also includes dimension checking, setup, and any inlined initialization; precise loop-only counts are unavailable.
+    recurrence: Loop-carried floating-point accumulation through C[i,j] along k; source initializes C through clearMatrix before the nest. No restrict qualifiers or explicit aliasing guarantees.
+  rank: 1
+  source_file: matrixmul/matrixmul.h
+  trip_count: 0
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20261026-125631-fe3ed0/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20261026-125631-fe3ed0/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 1892938745
+workload: matrixmul

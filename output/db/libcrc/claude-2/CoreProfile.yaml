@@ -1,0 +1,57 @@
+area_note: 'The CPU''s architectural state is the 1024-bit register file (32x32) plus roughly 400-600 other flops: pc/next_pc, reg_op1/op2/out/sh, decoded instruction latches, the mem_* registers and 2x64-bit counters. fast_mul adds about 230 flops plus a 33x33 multiplier array, which is the largest single block in this configuration. div adds about 160 flops. The CPU without M is roughly 1-2k LUTs. A 16-word buffer (512 bits) is half the register file, so it is NOT small here. The current red_accel holds 1024 bits of buffers plus addresses plus its own 32x32 multiplier, about the size of the whole regfile plus a second multiplier. Tens of flops and a few XOR trees are small. Anything with a multiplier or more than about 8 words of state roughly doubles some part of the core.'
+constraints:
+- Bare PCPI cannot reach memory. Memory access exists only through red_core's accelerator bus-master port, and only while the instruction holds pcpi_wait=1 and busy=1, with the CPU fully stalled.
+- 'The accelerator''s ports are fixed by the red_core.v instantiation: pcpi_* plus mem_valid, mem_addr, mem_wdata, mem_wstrb, mem_rdata, mem_ready and busy. Don''t add ports unless you also edit red_core.v.'
+- busy must stay high for every cycle the unit drives the bus and must drop before or when pcpi_ready rises. The unit's mem_ready is gated by busy (acc_busy && mem_ready).
+- When busy first rises, a CPU prefetch reply may still arrive as mem_ready. Don't accept the first mem_ready after taking the bus without your own issued/ack tracking (red_accel uses mem_issued for this).
+- Each 32-bit memory beat costs 2 cycles on this SRAM, so N words moved cost at least 2N cycles inside the instruction.
+- 'PCPI timeout: CATCH_ILLINSN traps if pcpi_valid stays high without pcpi_wait for about 16 cycles. The unit must assert pcpi_wait within that window or finish.'
+- The unit must decode its own opcode/funct3/funct7 exactly and stay silent on everything else, especially MUL/DIV (OP, funct7=0000001), because the external PCPI has priority in the result mux.
+- After pcpi_ready, wait for pcpi_valid to drop before accepting a new instruction (red_accel's S_WAIT). Otherwise the same instruction is executed twice.
+- One 32-bit register result per instruction and at most 2 register source operands. No rs3 and no second rd.
+- 'No barrel shifter and no single-cycle shift: software shift-heavy loops (CRC bitwise loops, >>8 table steps) are slow, so a custom op that absorbs shifts and XORs saves real cycles.'
+- A 32x32 multiplier already exists (fast_mul). Duplicating one in the extension pays for it twice in area.
+- Addresses the unit issues must be word-aligned and inside 0x0-0x3FFFF. Anything else hits $fatal in red_soc_tb.
+- The baseline build (ENABLE_ACCEL=0) traps on any custom opcode, so the baseline binary must use only RV32IM.
+- There are no interrupts, so a long blocking instruction (hundreds of cycles) is architecturally allowed. It only costs throughput.
+coprocessor: 'PCPI (pcpi_valid, pcpi_insn[31:0], pcpi_rs1, pcpi_rs2 in; pcpi_wr, pcpi_rd[31:0], pcpi_wait, pcpi_ready out). Any instruction the core does not decode itself (instr_trap) is presented on PCPI with both register values already read. The external unit''s ready/wr/rd are ORed with fast_mul and div through the pcpi_int_* mux, and the external unit has priority. The bare PCPI interface cannot address memory: it only receives rs1/rs2 and returns one rd. In THIS build, red_core.v also gives red_accel a separate bus-master port (mem_valid/addr/wdata/wstrb[3:0] out, mem_rdata/mem_ready in, busy out) behind a 1-bit mux. While busy=1 the accelerator owns the shared SRAM bus and cpu_mem_ready is forced to 0. That is safe only because the CPU is stalled in ld_rs1 waiting on PCPI. So an extension can read and write memory, but only as a blocking, CPU-stalled DMA during its own instruction.'
+coprocessor_issue_overhead: 2
+coprocessor_memory_access: true
+coprocessor_result: One 32-bit value (pcpi_rd), written to rd only if pcpi_wr=1 in the same cycle as pcpi_ready. Wider results must go to memory through the bus-master port (as red_accel does with its 16-word output block) or be split over several instructions. No flags, no second destination, and no exceptions can be raised by the unit.
+custom_opcode_space:
+- 'custom-0 (0001011): fully free in the core because ENABLE_IRQ=0 disables getq/setq/retirq/maskirq/waitirq/timer. red_core.v routes it to red_accel. The existing red_accel decodes only funct3=000/funct7=0000000, so whatever the new design defines replaces that decode.'
+- 'custom-1 (0101011), custom-2 (1011011), custom-3 (1111011): not decoded by the core, so they also land on PCPI as instr_trap. Usable, but the red_core.v comments assume custom-0.'
+- 'Must not overlap OP (0110011) with funct7=0000001: fast_mul and div decode those, and the PCPI result mux would collide.'
+cycles_per_alu_op: 3
+cycles_per_load: 5
+cycles_per_word_moved: 2
+evidence:
+- 'Instantiation chosen: rtl/red_core.v (project-owned and wired to red_accel), instantiated by rtl/red_soc_tb.v with ENABLE_ACCEL=1. Vendor testbenches under picorv32/ and scripts/ were ignored because they are not the design under test.'
+- 'red_core.v picorv32 #(.ENABLE_COUNTERS(1), .ENABLE_MUL(0), .ENABLE_FAST_MUL(1), .ENABLE_DIV(1), .ENABLE_PCPI(ENABLE_ACCEL), .ENABLE_IRQ(0), .COMPRESSED_ISA(0)); every other parameter takes the picorv32.v module default (lines 62-88)'
+- 'red_core.v bus mux: mem_* = acc_busy ? acc_mem_* : cpu_mem_*; cpu_mem_ready = acc_busy ? 0 : mem_ready; red_accel .mem_ready(acc_busy && mem_ready)'
+- picorv32.v:272-346 fast_mul/div instantiation and the pcpi_int_* OR mux with ENABLE_PCPI && pcpi_ready first
+- 'picorv32.v:1585-1616 ld_rs1: instr_trap with REGS_DUALPORT sets pcpi_valid with reg_op1/op2 from cpuregs_rs1/rs2 and waits for pcpi_int_ready; pcpi_int_rd goes to reg_out, latched_store <= pcpi_int_wr'
+- picorv32.v:1423-1430 pcpi_timeout_counter (4-bit, counts while pcpi_valid && !pcpi_int_wait)
+- picorv32.v:871-1093 IRQ custom-0 ops gated by ENABLE_IRQ (=0 here); custom_ops.S uses opcode 0b0001011
+- 'picorv32.v:2318-2413 picorv32_pcpi_fast_mul: rd <= $signed(rs1)*$signed(rs2), pcpi_ready = active[1]'
+- 'picorv32.v:2420-2510 picorv32_pcpi_div: quotient_msk >> 1 per cycle from 1<<31'
+- 'picorv32.v:1829-1852 cpu_state_shift: shift by 4 when reg_sh>=4 (TWO_STAGE_SHIFT), else by 1; BARREL_SHIFTER=0'
+- picorv32.v:203 cpuregs[0:regfile_size-1], regfile_size=32 (REGS_16_31=1, IRQ=0)
+- 'picorv32.v:565-634 memory FSM: single outstanding transaction, mem_valid held until mem_ready'
+- 'red_soc_tb.v: mem_ready <= 1 registered when mem_valid && !mem_ready (1 wait state); MEM_WORDS=65536; MMIO at 0x10000000/4/8; $fatal on unmapped'
+- 'red_accel.v: mem_issued/beat_done protocol gives 1 word per 2 cycles; pcpi_wait set on accept; S_WAIT until !pcpi_valid'
+- README.md:344-354 CPI table (ALU 3, load 5, store 5, taken branch 5, jalr 6, shift 4-14) for this dual-port configuration
+- cycles_per_word_moved=2 is for the accelerator bus-master. The CPU moving a word in software costs about 10 cycles (lw 5 + sw 5) plus loop overhead.
+- 'coprocessor_issue_overhead=2: pcpi_valid is registered 1 cycle into ld_rs1, and the unit''s first registered action is the next edge. Counting fetch/decode, a no-op custom instruction costs about 4-5 cycles in total.'
+existing_units:
+- 'picorv32_pcpi_fast_mul: single-cycle 33x33 signed array multiplier (64-bit rd register plus 33-bit rs1/rs2 registers) for MUL/MULH/MULHSU/MULHU, result about 2 cycles after issue. A custom instruction that does 32x32 multiplies duplicates it. The current red_accel already carries its own second 32x32 multiplier.'
+- 'picorv32_pcpi_div: sequential shift-subtract divider, 1 bit per cycle, 32 iterations (dividend 32 bits + divisor 63 + quotient 32 + mask 32 flops)'
+- 'Main ALU: 32-bit add/sub/compare/logic, single-cycle combinational (TWO_CYCLE_ALU=0)'
+- 'Shifter: NOT a barrel shifter (BARREL_SHIFTER=0). It is an iterative shift by 4 then by 1 in cpu_state_shift, which makes variable and large shifts expensive in software.'
+- Cycle and instret counters, 64-bit each (ENABLE_COUNTERS=1, COUNTERS64 default)
+- 'red_accel (current contents of rtl/red_accel.v, a previous design for micro-ecc): custom-0 funct3=000 funct7=0, 16x32 operand buffer + 16x32 product buffer + 32x32 multiplier + bus-master FSM'
+isa: 'RV32IM plus Zicntr rdcycle/rdinstr (64-bit). M is split: MUL/MULH/MULHSU/MULHU run on picorv32_pcpi_fast_mul and DIV/DIVU/REM/REMU on picorv32_pcpi_div, both internal PCPI units. No C (COMPRESSED_ISA=0), so every instruction is 32-bit. No IRQs and no PicoRV32 IRQ custom ops (ENABLE_IRQ=0). Misaligned accesses and illegal instructions trap. In the baseline build (ENABLE_ACCEL=0) any custom opcode reaches PCPI, nobody answers, it times out and traps.'
+memory_interface: 'PicoRV32 native valid/ready bus, 32-bit, byte strobes, word-aligned addresses. One SRAM shared by instruction fetch, CPU data and the accelerator. In red_soc_tb, mem_ready is registered: assert mem_valid at t, ready/rdata arrive at t+1 and drop at t+2, so a beat takes 2 cycles. Writes commit on that beat. Map: 0x0-0x3FFFF is RAM (256 KiB), 0x10000000 putchar, 0x10000004 exit, 0x10000008 cycle counter read. Any other address calls $fatal. No caches, no bursts, and no outstanding transactions beyond one.'
+microarchitecture: 'Multi-cycle, not pipelined. One instruction at a time through the states fetch -> ld_rs1 (both source registers read in one cycle, dual-port) -> exec / shift / ldmem / stmem -> fetch, overlapped only by a prefetch of the next instruction. With this SoC''s 1-wait-state memory: ALU reg-reg or reg-imm 3 cycles, not-taken branch 3, jal 3, load 5, store 5, taken branch 5, jalr 6. Shifts have no barrel shifter (TWO_STAGE_SHIFT=1, so 4 bits per cycle then 1 bit per cycle) and cost 4-14 cycles, e.g. >>8 is about 5 and >>24 about 9. MUL takes about 5-6 cycles (fast_mul answers 2 cycles after pcpi_valid). DIV/REM take about 37-40 cycles (32-iteration shift-subtract). Software is slow: a byte table-lookup step (lbu + shift + xor + lw) costs about 20 or more cycles.'
+name: 'PicoRV32 as instantiated in rtl/red_core.v (cpu: ENABLE_COUNTERS=1, ENABLE_MUL=0, ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=ENABLE_ACCEL, ENABLE_IRQ=0, COMPRESSED_ISA=0; other parameters at module defaults: REGS_16_31=1, REGS_DUALPORT=1, TWO_STAGE_SHIFT=1, BARREL_SHIFTER=0, TWO_CYCLE_ALU=0, TWO_CYCLE_COMPARE=0, CATCH_ILLINSN=1, CATCH_MISALIGN=1, COUNTERS64=1), with the red_accel PCPI bus-master coprocessor, driven by rtl/red_soc_tb.v (ENABLE_ACCEL=1, 1-wait-state 256 KiB SRAM)'
+register_file: 32 x 32-bit cpuregs (ENABLE_REGS_16_31=1, no IRQ q-regs), 2 read ports and 1 write port (ENABLE_REGS_DUALPORT=1). A custom R-type instruction gets at most 2 register operands (rs1, rs2; the rs3 field is not read) and writes at most 1 register (rd).

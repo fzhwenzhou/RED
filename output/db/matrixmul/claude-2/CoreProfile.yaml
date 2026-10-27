@@ -1,0 +1,52 @@
+area_note: 'PicoRV32 is a minimal core. Its regfile is 32x32 = 1024 bits of storage (often RAM-inferred), plus 128 counter bits and a few hundred control/PC/decode flops. The fast_mul adds about 200 flops plus a 33x33 array multiplier, which is the biggest combinational block in the core. The divider adds about 160 flops. Scale: one 16-word buffer is 512 flops, half the CPU''s whole register file. The shipped red_accel already holds 2x512 operand/product flops plus a second 32x32 multiplier, so it roughly doubles the core''s storage. ''Small'' here means under about 100 flops and no new multiplier.'
+constraints:
+- Bare PCPI cannot reach memory. Memory operands only work through red_core's bus-master mux, and only while the accelerator holds pcpi_wait (acc_busy) with the CPU stalled. No concurrency with the CPU.
+- One memory transfer at a time, 32 bits wide, no bursts. Moving N words through the accelerator costs at least 2N cycles with this SRAM and FSM style.
+- At most 2 register operands (rs1, rs2) and 1 32-bit register result per instruction.
+- The unit must raise pcpi_wait within 16 cycles of pcpi_valid or the CPU traps (CATCH_ILLINSN=1).
+- The external PCPI unit sees every instruction the core does not decode, MUL/DIV included. It must decode opcode, funct3 and funct7 exactly, and must never assert ready/wr for OP/funct7=0000001 or it will collide with fast_mul/div in the pcpi_int mux.
+- A hardware 32x32 multiplier already exists (fast_mul, about 5-6 cycles per MUL). A custom instruction that only does one multiply saves almost nothing and duplicates a large array. The win must come from fusing loads, MACs and loop overhead.
+- No pipeline, so no hazards or forwarding to worry about. The flip side is that every software instruction costs 3-6 cycles, which makes the loop control a custom instruction eliminates expensive.
+- No compressed ISA and no interrupts. A long-running accelerator op cannot be pre-empted, and there is no IRQ state to save.
+- The ENABLE_ACCEL=0 baseline is the same core without the PCPI device. Area and cycle deltas are measured against that.
+coprocessor: 'PCPI (pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2 -> pcpi_wr, pcpi_rd, pcpi_wait, pcpi_ready). Any instruction the core does not decode itself (instr_trap) is offered on PCPI from cpu_state_ld_rs1, with rs1 and rs2 already read (pcpi_rs1=reg_op1, pcpi_rs2=reg_op2), and the CPU stalls until pcpi_int_ready. The external PCPI ready/wait are ORed with the internal fast_mul and div units (pcpi_int_* mux), so an external unit sees every unclaimed instruction, MUL/DIV included, and must decode its own opcode. PCPI by itself carries no memory access: two 32-bit register values in, one 32-bit value out. In THIS build the accelerator also gets the memory bus: red_core muxes mem_* to the accelerator whenever acc_busy, and the CPU is stalled on pcpi_wait for that whole time, so the two never contend. Wait rule: if the unit has not raised pcpi_wait within 16 cycles of pcpi_valid (pcpi_timeout_counter, 4 bits), the CPU traps as an illegal instruction.'
+coprocessor_issue_overhead: 3
+coprocessor_memory_access: true
+coprocessor_result: One 32-bit value per instruction on pcpi_rd, written to rd when pcpi_wr=1 together with pcpi_ready. There is no second destination register and no flags. Wider results must be written to memory by the accelerator's own bus-master port (the shipped red_accel writes 16 words and returns rd=0).
+custom_opcode_space:
+- 'custom-0 0001011 (0x0B): free in this build because ENABLE_IRQ=0 disables PicoRV32''s IRQ instructions. The shipped red_accel uses funct3=000/funct7=0000000.'
+- 'custom-1 0101011 (0x2B): free'
+- 'custom-2 1011011 (0x5B): free (reserved for RV128 in the spec, unused on RV32)'
+- 'custom-3 1111011 (0x7B): free (reserved for RV128 in the spec, unused on RV32)'
+- 'Avoid OP 0110011 with funct7=0000001: the internal fast_mul and div units claim it (MUL/DIV).'
+cycles_per_alu_op: 3
+cycles_per_load: 5
+cycles_per_word_moved: 2
+evidence:
+- 'rtl/red_core.v: the picorv32 #(...) cpu instantiation sets ENABLE_COUNTERS=1, ENABLE_MUL=0, ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=ENABLE_ACCEL, ENABLE_IRQ=0, COMPRESSED_ISA=0. All other parameters are module defaults.'
+- 'rtl/red_soc_tb.v instantiates red_core #(.ENABLE_ACCEL(ENABLE_ACCEL)) with ENABLE_ACCEL=1 and a 1-cycle registered-ready SRAM. I used it as the project''s design under test over the vendor testbenches (picorv32/testbench*.v, scripts/*), which build other configurations.'
+- 'rtl/red_core.v bus mux: mem_* = acc_busy ? acc_mem_* : cpu_mem_*; cpu_mem_ready = acc_busy ? 0 : mem_ready.'
+- 'picorv32.v:328-345: pcpi_int_wait/ready OR the external PCPI with the pcpi_mul and pcpi_div units. The case mux gives the external pcpi_ready priority.'
+- 'picorv32.v:1579-1613 (cpu_state_ld_rs1): pcpi_valid<=1 with rs1/rs2 read in the same cycle under ENABLE_REGS_DUALPORT. On pcpi_int_ready: reg_out<=pcpi_int_rd, latched_store<=pcpi_int_wr, go to fetch.'
+- 'picorv32.v:1215,1423-1429: the 4-bit pcpi_timeout_counter runs while pcpi_valid && !pcpi_int_wait, and the timeout leads to the trap state.'
+- 'picorv32.v:1090-1093 and 871-889: custom-0 IRQ instructions are gated by ENABLE_IRQ (0 here).'
+- 'picorv32.v:2345,2371,2401-2403 (fast_mul): decodes OP/funct7=0000001 with funct3 000-011; single-cycle $signed multiply; pcpi_ready=active[1].'
+- 'picorv32.v:2444-2506 (div): one quotient bit per cycle over 32 iterations.'
+- 'picorv32.v:166,203: regfile_size=32 and cpuregs[0:31].'
+- 'picorv32.v:62-88 defaults in force: ENABLE_REGS_DUALPORT=1, BARREL_SHIFTER=0, TWO_STAGE_SHIFT=1, TWO_CYCLE_ALU=0, CATCH_ILLINSN=1.'
+- 'target_cpu/picorv32/README.md CPI table (dual-port, 1-cycle memory): ALU 3, load 5, store 5. This is where cycles_per_load=5 and cycles_per_alu_op=3 come from.'
+- 'rtl/red_accel.v S_LOAD/S_STORE: a beat completes when mem_valid && mem_issued && mem_ready. With the registered-ready SRAM that is one word per 2 cycles, hence cycles_per_word_moved=2.'
+- 'coprocessor_issue_overhead=3 is derived, not measured: fetch (2 cycles at this SRAM) + ld_rs1 asserts pcpi_valid + the accelerator registers its first action on the next edge, plus about 1 cycle back to fetch after pcpi_ready.'
+- The shipped rtl/red_accel.v is the micro-ecc secp256r1.mult unit (header comment), not a matrixmul design.
+existing_units:
+- 'picorv32_pcpi_fast_mul: single-cycle 33x33 signed array multiplier (rd <= rs1*rs2, then 64-bit rd register). About 2-3 cycles after pcpi_valid, so MUL/MULH* take about 5-6 cycles total. Registers: rs1/rs2 33b each, rd 64b.'
+- 'picorv32_pcpi_div: sequential restoring divider, 1 quotient bit per cycle, about 40 cycles per DIV/DIVU/REM/REMU. Registers: dividend 32b, divisor 63b, quotient 32b, quotient_msk 32b.'
+- 'Main ALU: single-cycle add/sub/logic/compare (TWO_CYCLE_ALU=0, TWO_CYCLE_COMPARE=0).'
+- 'Shifter: no barrel shifter (BARREL_SHIFTER=0). The iterative shifter moves 4 bits per cycle with TWO_STAGE_SHIFT=1.'
+- 64-bit cycle and instret counters (ENABLE_COUNTERS=1).
+- 'Currently shipped red_accel (written for micro-ecc, not matrixmul): one combinational 32x32 multiplier with a 64-bit MAC adder, 16x32 operand buffer, 16x32 product buffer, bus-master FSM. It decodes custom-0 with funct3=000, funct7=0. A new design replaces this module.'
+isa: RV32IM plus Zicntr-style counters. M comes from ENABLE_FAST_MUL=1 (MUL/MULH/MULHSU/MULHU) and ENABLE_DIV=1 (DIV/DIVU/REM/REMU), both built as internal PCPI units. No C (COMPRESSED_ISA=0). No IRQ, so the custom-0 IRQ instructions (getq/setq/retirq/maskirq/timer/waitirq) are not decoded. rdcycle/rdinstret are 64-bit (ENABLE_COUNTERS64 default 1). CATCH_ILLINSN=1 and CATCH_MISALIGN=1 (defaults).
+memory_interface: 'PicoRV32 native valid/ready interface: 32-bit address, 32-bit wdata/rdata, 4-bit wstrb, one transfer outstanding, no bursts. red_soc_tb serves it from 256 KiB SRAM that registers mem_ready on the clock edge after mem_valid (1 wait state). MMIO: 0x10000000 putchar, 0x10000004 exit, 0x10000008 cycle counter. The accelerator''s port is the same bus through red_core''s mux (mem_instr forced 0, cpu_mem_ready held 0 while acc_busy). The shipped red_accel FSM moves one word per 2 cycles (valid -> ready -> next address); no pipelining across beats.'
+microarchitecture: 'Multi-cycle, not pipelined. A single cpu_state FSM (fetch -> ld_rs1 -> [ld_rs2] -> exec/shift/ldmem/stmem) runs one instruction at a time with one memory transfer in flight. ENABLE_REGS_DUALPORT=1 (default) so rs1 and rs2 are read in the same ld_rs1 cycle. BARREL_SHIFTER=0 with TWO_STAGE_SHIFT=1, so shifts are 4-14 cycles. CPI per the vendor table (dual-port regfile, 1-cycle memory): ALU 3, load 5, store 5, taken branch 5, jalr 6. Average CPI is about 4. Software is slow, so a custom instruction competes against roughly 3-5 cycles per scalar op and about 5 cycles per word loaded.'
+name: 'PicoRV32 in red_core (rtl/red_core.v): ENABLE_FAST_MUL=1, ENABLE_DIV=1, ENABLE_PCPI=ENABLE_ACCEL (1 for the extended build), ENABLE_IRQ=0, COMPRESSED_ISA=0, ENABLE_COUNTERS=1. Accelerator is a PCPI device and also a bus master behind a 1-bit mux. Simulated in red_soc_tb with 1-cycle SRAM.'
+register_file: 32 x 32-bit (ENABLE_REGS_16_31=1, no IRQ qregs), stored as a cpuregs[0:31] array. Dual read ports (ENABLE_REGS_DUALPORT=1) and one write port. A custom instruction gets at most 2 source register values (rs1, rs2) and writes at most 1 destination (rd). The core has no third read port.

@@ -1,0 +1,644 @@
+base_isa: rv32im + Zicntr (PicoRV32, COMPRESSED_ISA=0, ENABLE_IRQ=0, no F extension)
+critic_rounds: 3
+csrs: []
+description: |
+  Three register-to-register instructions in custom-1 over a 6-word unit
+  state: four binary32 accumulators (FACC = C00, C01, C10, C11) and a 2-word
+  operand latch (FLAT = LA, LB). Together they compute a 2x2 block of the
+  binary32 matrix product in multiply::ijk_matmul (register blocking). Per k,
+  the software loads A[i][k], A[i+1][k], B[k][j], B[k][j+1] and issues
+  xfop.lo then xfop.hi, which perform all four multiply-accumulates
+  C[r][c] += A[i+r][k]*B[k][j+c]. After the k loop, four xfop.rd drain the
+  block into C. Each element accumulates its products in k order starting
+  from +0.0, rounding the product and then the sum (NOT fused). That is
+  exactly the C code's c + a*b, so the results are bit-identical to the
+  original loop. The loop nest, the loads of A and B and the address
+  arithmetic stay in software. No instruction touches memory.
+  This replaces round 1's xfmac.s/xfmacr.s pair, which needed one instruction
+  per MAC. Here it is 0.65.
+encodings: []
+gate2_vectors: 100000
+instructions:
+- c_model: |
+    #include <stdint.h>
+
+    /* Architectural state (register_files): xf_acc[0..3] = FACC C00, C01,
+       C10, C11; xf_lat[0..1] = FLAT LA, LB. Every element resets to
+       0x00000000. xfop.lo returns only its own product, so its result is a
+       function of in[] alone. */
+    static uint32_t xf_acc[4] = {0u, 0u, 0u, 0u};
+    static uint32_t xf_lat[2] = {0u, 0u};
+
+    typedef union { uint32_t u; float f; } xf_word;
+
+    /* xfop.lo rd, rs1, rs2: in[0] = x[rs1] = a0, in[1] = x[rs2] = b0.
+       p = RNE(a0*b0); C00 = canon(RNE(C00 + p)); LA = a0; LB = b0;
+       out[0] = canon(p) -> x[rd]; out[1] = 0 (not architectural).
+       canon() maps every NaN to 0x7FC00000 with a mask, not a branch. A NaN
+       product makes the sum NaN, so canonicalising p before the add or not
+       gives the same C00. */
+    void xfop_lo_model(const uint32_t in[2], uint32_t out[2])
+    {
+        xf_word a, b, p, c;
+        uint32_t m;
+        a.u = in[0];
+        b.u = in[1];
+        p.f = a.f * b.f;
+        c.u = xf_acc[0];
+        c.f = c.f + p.f;
+        m = (uint32_t)0 - (uint32_t)((c.u & 0x7FFFFFFFu) > 0x7F800000u);
+        xf_acc[0] = (c.u & ~m) | (0x7FC00000u & m);
+        xf_lat[0] = in[0];
+        xf_lat[1] = in[1];
+        m = (uint32_t)0 - (uint32_t)((p.u & 0x7FFFFFFFu) > 0x7F800000u);
+        out[0] = (p.u & ~m) | (0x7FC00000u & m);
+        out[1] = 0u;
+    }
+  encoding: 0001000 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0001000'
+  group: compute
+  imm_bits: 0
+  invocations: 250
+  mac_ops: 1
+  marshal_words: 0
+  mnemonic: xfop.lo
+  name: binary32 outer-product step, low half (C00 and operand latch)
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    // canon(v): a select, not a branch
+    canon(v)     = ((v & 0x7FFFFFFF) > 0x7F800000) ? 0x7FC00000 : v
+    // IEEE 754 binary32, roundTiesToEven, gradual underflow, no flags
+    fmul32(a, b) = canon(binary32_mul_rne(a, b))
+    fadd32(a, b) = canon(binary32_add_rne(a, b))
+
+    a0      = X[rs1]
+    b0      = X[rs2]
+    p       = fmul32(a0, b0)
+    FACC[0]' = fadd32(FACC[0], p)
+    FLAT[0]' = a0                    // LA, raw bits
+    FLAT[1]' = b0                    // LB, raw bits
+    X[rd]'   = p                     // no write when rd = x0
+  reads_state:
+  - facc
+  replaces: multiply::ijk_matmul
+  semantics: |
+    xfop.lo rd, rs1, rs2 is the first half of one k step of a 2x2
+    outer-product accumulation. x[rs1] = a0 (an element of A's row i) and
+    x[rs2] = b0 (an element of B's column j), both binary32 bit patterns.
+      p   = a0 * b0, rounded to binary32
+      C00 = C00 + p, rounded to binary32
+      LA  = a0, LB = b0   (raw 32-bit copies, kept for the xfop.hi that follows)
+      x[rd] = p
+    Operand packing (register form): in[0] = x[rs1], in[1] = x[rs2], out[0] ->
+    x[rd]. out[1] is not architectural and the model writes it 0. Reading x0
+    gives 0x00000000 (+0.0). Both sources and C00 are read before anything is
+    written. rs1 = rs2 is allowed. If rd = x0 the product is discarded, but
+    C00, LA and LB are still written. That is how the kernel issues it.
+    FACC[1..3] are not touched.
+
+    Arithmetic (shared with xfop.hi):
+    - IEEE 754-2008 binary32 multiplication, then a separate binary32 addition.
+      Each is rounded with roundTiesToEven. This is NOT a fused multiply-add:
+      the product is rounded to binary32 before it is added, exactly as the C
+      expression c + a*b does with float operands.
+    - Subnormal inputs and outputs are fully supported (gradual underflow, no
+      flush-to-zero, no denormals-are-zero). Overflow gives +/-Infinity.
+    - The sign of a product is the XOR of the operand signs, including zero
+      results (-2.0 * +0.0 = -0.0). An exactly-zero sum of opposite-signed
+      addends is +0.0, and (-0.0) + (-0.0) = -0.0.
+    - NaN rule: whenever IEEE 754 would produce a NaN, the result is exactly
+      0x7FC00000, the RISC-V canonical quiet NaN. That covers any NaN operand
+      (signalling or quiet, any sign or payload), Inf * 0 and Inf + (-Inf).
+      It applies to x[rd] and to every value written into FACC. A NaN product
+      always makes the sum a NaN, so the canonical sum does not depend on the
+      product's NaN payload.
+    - No exception flags, no fcsr access, no traps.
+
+    Timing: a fixed latency, independent of operand values and of the state.
+    There is no early-out for zero, Inf, NaN or subnormal operands.
+
+    Use (see xfop.hi for the whole schedule): xfop.lo x0, A[i][k], B[k][j]
+    immediately followed by xfop.hi x0, A[i+1][k], B[k][j+1]. On its own,
+    xfop.lo is also a 1x1 dot-product step, used for the odd row or column of
+    an odd-sized matrix: K x xfop.lo, then xfop.rd sel 0.
+
+    Single-instruction vectors (x[rd] = p, independent of the state):
+      0x3FC00000(1.5)  * 0x40000000(2.0)  -> 0x40400000 (3.0)
+      0x00000001       * 0x3F000000(0.5)  -> 0x00000000 (2^-150 is a tie; to even, +0)
+      0x00000003       * 0x3F000000       -> 0x00000002 (tie 1.5*2^-149 rounds to even)
+      0x7F7FFFFF       * 0x40000000       -> 0x7F800000 (overflow to +Inf)
+      0x7F800000       * 0x00000000       -> 0x7FC00000 (invalid, canonical NaN)
+      0xFFC12345       * 0x3F800000       -> 0x7FC00000 (payload and sign not propagated)
+      0x80000000       * 0x3F800000       -> 0x80000000 (-0.0)
+    Unfused rounding, from a clean FACC (this distinguishes it from an FMA):
+      xfop.lo x0, 0xBF800002, 0x3F800000  -> C00 = 0xBF800002
+      xfop.lo x0, 0x3F800001, 0x3F800001  -> p = 0x3F800002, C00 = 0x00000000
+                                             (an FMA would give 0x28800000)
+  spike_model: |-
+    static uint32_t fmul32(uint32_t a, uint32_t b) {
+        uint32_t sign = (a ^ b) & 0x80000000u;
+        uint32_t ea = (a >> 23) & 0xFF, eb = (b >> 23) & 0xFF;
+        uint32_t fa = a & 0x7FFFFF, fb = b & 0x7FFFFF;
+        bool anan = (ea == 255 && fa != 0), bnan = (eb == 255 && fb != 0);
+        bool ainf = (ea == 255 && fa == 0), binf = (eb == 255 && fb == 0);
+        bool azero = (ea == 0 && fa == 0), bzero = (eb == 0 && fb == 0);
+        if (anan || bnan || (ainf && bzero) || (binf && azero)) return 0x7FC00000u;
+        if (ainf || binf) return sign | 0x7F800000u;
+        if (azero || bzero) return sign;
+        int xa = (int)ea, xb = (int)eb;
+        uint64_t ma = fa, mb = fb;
+        if (ea == 0) { xa = 1; while (!(ma & 0x800000u)) { ma <<= 1; xa--; } }
+        else ma |= 0x800000u;
+        if (eb == 0) { xb = 1; while (!(mb & 0x800000u)) { mb <<= 1; xb--; } }
+        else mb |= 0x800000u;
+        uint64_t P = ma * mb;
+        int e = xa + xb - 127;
+        int s = 23;
+        if (P & (1ull << 47)) { s = 24; e += 1; }
+        if (e <= 0) s += 1 - e;
+        if (s > 50) s = 50;
+        uint64_t q = P >> s;
+        uint64_t rem = P & ((1ull << s) - 1);
+        uint64_t half = 1ull << (s - 1);
+        if (rem > half || (rem == half && (q & 1))) q += 1;
+        uint64_t r = ((uint64_t)(e > 0 ? e - 1 : 0) << 23) + q;
+        if (r >= 0x7F800000ull) return sign | 0x7F800000u;
+        return sign | (uint32_t)r;
+    }
+
+    void xfop_lo_iss(const uint32_t in[2], uint32_t out[2]) {
+        out[0] = fmul32(in[0], in[1]);
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - facc
+  - flat
+- c_model: |
+    #include <stdint.h>
+
+    /* Architectural state (register_files): xf_acc[0..3] = FACC C00, C01,
+       C10, C11; xf_lat[0..1] = FLAT LA, LB. Every element resets to
+       0x00000000. xfop.hi reads FLAT but never writes it and returns only
+       a1*b1, so its result is a function of in[] alone. */
+    static uint32_t xf_acc[4] = {0u, 0u, 0u, 0u};
+    static uint32_t xf_lat[2] = {0u, 0u};
+
+    typedef union { uint32_t u; float f; } xf_word;
+
+    /* xfop.hi rd, rs1, rs2: in[0] = x[rs1] = a1, in[1] = x[rs2] = b1.
+       C01 = canon(RNE(C01 + RNE(LA*b1))); C10 = canon(RNE(C10 + RNE(a1*LB)));
+       C11 = canon(RNE(C11 + RNE(a1*b1))); out[0] = canon(RNE(a1*b1)) -> x[rd];
+       out[1] = 0. canon() is a mask select, not a branch. */
+    void xfop_hi_model(const uint32_t in[2], uint32_t out[2])
+    {
+        xf_word a1, b1, la, lb, p01, p10, p11, c;
+        uint32_t m;
+        a1.u = in[0];
+        b1.u = in[1];
+        la.u = xf_lat[0];
+        lb.u = xf_lat[1];
+        p01.f = la.f * b1.f;
+        p10.f = a1.f * lb.f;
+        p11.f = a1.f * b1.f;
+        c.u = xf_acc[1];
+        c.f = c.f + p01.f;
+        m = (uint32_t)0 - (uint32_t)((c.u & 0x7FFFFFFFu) > 0x7F800000u);
+        xf_acc[1] = (c.u & ~m) | (0x7FC00000u & m);
+        c.u = xf_acc[2];
+        c.f = c.f + p10.f;
+        m = (uint32_t)0 - (uint32_t)((c.u & 0x7FFFFFFFu) > 0x7F800000u);
+        xf_acc[2] = (c.u & ~m) | (0x7FC00000u & m);
+        c.u = xf_acc[3];
+        c.f = c.f + p11.f;
+        m = (uint32_t)0 - (uint32_t)((c.u & 0x7FFFFFFFu) > 0x7F800000u);
+        xf_acc[3] = (c.u & ~m) | (0x7FC00000u & m);
+        m = (uint32_t)0 - (uint32_t)((p11.u & 0x7FFFFFFFu) > 0x7F800000u);
+        out[0] = (p11.u & ~m) | (0x7FC00000u & m);
+        out[1] = 0u;
+    }
+  encoding: 0001001 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0001001'
+  group: compute
+  imm_bits: 0
+  invocations: 167
+  mac_ops: 3
+  marshal_words: 0
+  mnemonic: xfop.hi
+  name: binary32 outer-product step, high half (C01, C10, C11)
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |
+    canon(v)     = ((v & 0x7FFFFFFF) > 0x7F800000) ? 0x7FC00000 : v
+    fmul32(a, b) = canon(binary32_mul_rne(a, b))
+    fadd32(a, b) = canon(binary32_add_rne(a, b))
+
+    a1       = X[rs1]
+    b1       = X[rs2]
+    la       = FLAT[0]
+    lb       = FLAT[1]
+    p01      = fmul32(la, b1)
+    p10      = fmul32(a1, lb)
+    p11      = fmul32(a1, b1)
+    FACC[1]' = fadd32(FACC[1], p01)
+    FACC[2]' = fadd32(FACC[2], p10)
+    FACC[3]' = fadd32(FACC[3], p11)
+    X[rd]'   = p11                   // no write when rd = x0
+  reads_state:
+  - facc
+  - flat
+  replaces: multiply::ijk_matmul
+  semantics: |
+    xfop.hi rd, rs1, rs2 completes one k step of a 2x2 outer-product
+    accumulation, using the latch that xfop.lo left. x[rs1] = a1 (the element
+    of A's row i+1) and x[rs2] = b1 (the element of B's column j+1).
+      C01 = C01 + (LA * b1)     i.e. C[i][j+1]   += A[i][k]   * B[k][j+1]
+      C10 = C10 + (a1 * LB)     i.e. C[i+1][j]   += A[i+1][k] * B[k][j]
+      C11 = C11 + (a1 * b1)     i.e. C[i+1][j+1] += A[i+1][k] * B[k][j+1]
+      x[rd] = a1 * b1
+    Each product is rounded to binary32, then each sum is rounded to binary32,
+    with exactly the arithmetic of xfop.lo: RNE, unfused, gradual underflow,
+    IEEE signed zeros, every NaN result becomes 0x7FC00000, no flags or traps.
+    Operand packing (register form): in[0] = x[rs1], in[1] = x[rs2], out[0] ->
+    x[rd]. out[1] is not architectural and the model writes it 0. Reading x0
+    gives +0.0. All three products use the values of LA, LB, C01, C10 and C11
+    from before the instruction. The three accumulator updates are
+    independent of each other. xfop.hi reads FLAT but never writes it, and it
+    never touches C00. LA and LB are whatever the most recent xfop.lo wrote,
+    or 0x00000000 after reset or xfop.rd sel 7. If rd = x0 the returned
+    product is discarded and FACC is still updated.
+
+    Timing: a fixed latency (three multiply-adds on the unit's datapath),
+    independent of operand values and of the state. No early-out.
+
+    Kernel schedule for C = A x B (M x K times K x N, C cleared to +0.0 by
+    clearMatrix, as the application does). It is bit-identical to the
+    original ijk loop, because each C element receives the same rounded
+    products, added in the same k order, starting from +0.0:
+      xfop.rd x0, x0, 7                         // entry: clear FACC and FLAT
+      for each full 2x2 block (i, j), i < M&~1, j < N&~1, step 2:
+        for k = 1..K:
+          xfop.lo x0, A[i][k],   B[k][j]
+          xfop.hi x0, A[i+1][k], B[k][j+1]
+        C[i][j]   = xfop.rd sel 0;  C[i][j+1]   = xfop.rd sel 1
+        C[i+1][j] = xfop.rd sel 2;  C[i+1][j+1] = xfop.rd sel 3
+      for each remaining element (odd last row / column):
+        for k = 1..K: xfop.lo x0, A[i][k], B[k][j]
+        C[i][j] = xfop.rd sel 0
+      xfop.rd x0, x0, 7                         // exit: scrub
+    xfop.lo and xfop.hi of one k step are issued back to back. Nothing on this
+    core can come between them (no interrupts; the loads and address
+    arithmetic in the loop cannot trap).
+
+    Worked sequence, from reset or after xfop.rd x0, x0, 7. A rows i, i+1 =
+    [1.5, 1.0], [0.25, 2.0] (k = 1, 2); B rows k = 1, 2 = [2.0, -4.0],
+    [0.5, 3.0] (columns j, j+1):
+      xfop.lo t0, 0x3FC00000(1.5),  0x40000000(2.0)  -> t0 = 0x40400000 (3.0)
+           C00 = 0x40400000, LA = 0x3FC00000, LB = 0x40000000
+      xfop.hi t0, 0x3E800000(0.25), 0xC0800000(-4.0) -> t0 = 0xBF800000 (-1.0)
+           C01 = 0xC0C00000 (-6.0), C10 = 0x3F000000 (0.5), C11 = 0xBF800000 (-1.0)
+      xfop.lo t0, 0x3F800000(1.0),  0x3F000000(0.5)  -> t0 = 0x3F000000 (0.5)
+           C00 = 0x40600000 (3.5), LA = 0x3F800000, LB = 0x3F000000
+      xfop.hi t0, 0x40000000(2.0),  0x40400000(3.0)  -> t0 = 0x40C00000 (6.0)
+           C01 = 0xC0400000 (-3.0), C10 = 0x3FC00000 (1.5), C11 = 0x40A00000 (5.0)
+      xfop.rd sel 0..3 -> 0x40600000, 0xC0400000, 0x3FC00000, 0x40A00000
+    Special values, from a clean state:
+      xfop.lo x0, 0x7F800000(+Inf), 0x3F800000      -> C00 = 0x7F800000, LA = +Inf, LB = 1.0
+      xfop.hi t1, 0x00000000(+0),   0xFF800000(-Inf) -> t1 = 0x7FC00000 (0 * -Inf)
+           C01 = 0xFF800000 (+Inf * -Inf), C10 = 0x00000000 (+0 + +0*1.0), C11 = 0x7FC00000
+    Single-instruction vectors with LA = LB = 0 (x[rd] = a1*b1 never depends
+    on the state):
+      0x00000003 * 0x3F000000 -> 0x00000002
+      0x7F7FFFFF * 0x40000000 -> 0x7F800000
+      0x7F800000 * 0x00000000 -> 0x7FC00000
+      0xFFC12345 * 0x3F800000 -> 0x7FC00000
+      0x80000000 * 0x3F800000 -> 0x80000000
+  spike_model: |-
+    static uint32_t fmul32(uint32_t a, uint32_t b) {
+        uint32_t sign = (a ^ b) & 0x80000000u;
+        uint32_t ea = (a >> 23) & 0xFF, eb = (b >> 23) & 0xFF;
+        uint32_t fa = a & 0x7FFFFF, fb = b & 0x7FFFFF;
+        bool anan = (ea == 255 && fa != 0), bnan = (eb == 255 && fb != 0);
+        bool ainf = (ea == 255 && fa == 0), binf = (eb == 255 && fb == 0);
+        bool azero = (ea == 0 && fa == 0), bzero = (eb == 0 && fb == 0);
+        if (anan || bnan || (ainf && bzero) || (binf && azero)) return 0x7FC00000u;
+        if (ainf || binf) return sign | 0x7F800000u;
+        if (azero || bzero) return sign;
+        int xa = (int)ea, xb = (int)eb;
+        uint64_t ma = fa, mb = fb;
+        if (ea == 0) { xa = 1; while (!(ma & 0x800000u)) { ma <<= 1; xa--; } }
+        else ma |= 0x800000u;
+        if (eb == 0) { xb = 1; while (!(mb & 0x800000u)) { mb <<= 1; xb--; } }
+        else mb |= 0x800000u;
+        uint64_t P = ma * mb;
+        int e = xa + xb - 127;
+        int s = 23;
+        if (P & (1ull << 47)) { s = 24; e += 1; }
+        if (e <= 0) s += 1 - e;
+        if (s > 50) s = 50;
+        uint64_t q = P >> s;
+        uint64_t rem = P & ((1ull << s) - 1);
+        uint64_t half = 1ull << (s - 1);
+        if (rem > half || (rem == half && (q & 1))) q += 1;
+        uint64_t r = ((uint64_t)(e > 0 ? e - 1 : 0) << 23) + q;
+        if (r >= 0x7F800000ull) return sign | 0x7F800000u;
+        return sign | (uint32_t)r;
+    }
+
+    void xfop_hi_iss(const uint32_t in[2], uint32_t out[2]) {
+        out[0] = fmul32(in[0], in[1]);
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state:
+  - facc
+- c_model: |
+    #include <stdint.h>
+
+    /* Architectural state (register_files): xf_acc[0..3] = FACC C00, C01,
+       C10, C11; xf_lat[0..1] = FLAT LA, LB. Every element resets to
+       0x00000000. */
+    static uint32_t xf_acc[4] = {0u, 0u, 0u, 0u};
+    static uint32_t xf_lat[2] = {0u, 0u};
+
+    /* xfop.rd rd, rs1, sel: in[0] = x[rs1] (not used), in[1] = imm,
+       sel = imm[2:0].
+       sel 0..3: out[0] = FACC[sel], then FACC[sel] = 0.
+       sel 4, 5: out[0] = LA / LB, then that latch = 0.
+       sel 6:    out[0] = 0, no state change (reserved).
+       sel 7:    out[0] = 0, every FACC and FLAT element = 0.
+       out[1] = 0. Branch-free: every element is visited for every sel. */
+    void xfop_rd_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t sel = in[1] & 7u, r = 0u, m;
+        uint32_t keep = ~((uint32_t)0 - (uint32_t)(sel == 7u));
+        int i;
+        for (i = 0; i < 4; i++) {
+            m = (uint32_t)0 - (uint32_t)(sel == (uint32_t)i);
+            r |= xf_acc[i] & m;
+            xf_acc[i] &= ~m & keep;
+        }
+        for (i = 0; i < 2; i++) {
+            m = (uint32_t)0 - (uint32_t)(sel == (uint32_t)(4 + i));
+            r |= xf_lat[i] & m;
+            xf_lat[i] &= ~m & keep;
+        }
+        out[0] = r;
+        out[1] = 0u;
+    }
+  encoding: imm[11:0] rs1 001 rd 0101011
+  form: reg_imm
+  funct3: '001'
+  funct7: '0000000'
+  group: move
+  imm_bits: 3
+  invocations: 70
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xfop.rd
+  name: drain one element of the outer-product state (read and clear)
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  pseudocode: |
+    sel = imm[2:0]
+    if sel < 4:
+        X[rd]'      = FACC[sel]
+        FACC[sel]'  = 0x00000000
+    elif sel < 6:
+        X[rd]'        = FLAT[sel-4]
+        FLAT[sel-4]'  = 0x00000000
+    elif sel == 6:
+        X[rd]' = 0x00000000
+    else:                                // sel == 7
+        X[rd]'  = 0x00000000
+        FACC[0..3]' = 0x00000000
+        FLAT[0..1]' = 0x00000000
+    // no write to X[rd] when rd = x0; the model selects with masks, not branches
+  reads_state:
+  - facc
+  - flat
+  replaces: multiply::ijk_matmul
+  semantics: |
+    xfop.rd rd, rs1, sel moves one element of the unit's state into x[rd] and
+    clears it. It is an I-type instruction: sel = imm[2:0], taken from
+    instruction bits 22:20. imm[11:3] (bits 31:23) are ignored and assemblers
+    write them 0, which is why funct7 is listed as 0000000. The decoder
+    matches opcode 0101011 with funct3 = 001 only, so the instruction occupies
+    the whole custom-1 funct3=001 slot. x[rs1] is not used (write x0).
+      sel 0..3: x[rd] = FACC[sel] (C00, C01, C10, C11), then FACC[sel] = 0x00000000
+      sel 4:    x[rd] = LA, then LA = 0x00000000
+      sel 5:    x[rd] = LB, then LB = 0x00000000
+      sel 6:    x[rd] = 0x00000000, no state change (reserved)
+      sel 7:    x[rd] = 0x00000000, and all four FACC and both FLAT
+                elements become 0x00000000 (clear all)
+    The value moved is the raw 32-bit pattern, with no arithmetic. Because
+    FACC only ever holds +0.0 or a canonical sum (see state_note), the value
+    read from FACC is exactly the C element the original loop computes.
+    Operand packing (reg_imm form): in[0] = x[rs1] (ignored), in[1] = the
+    zero-extended immediate (the model uses in[1] & 7), out[0] -> x[rd]. out[1]
+    is not architectural and the model writes it 0. If rd = x0 the value is
+    discarded and the element is still cleared. That is how the entry/exit
+    scrub xfop.rd x0, x0, 7 is issued.
+    Timing: fixed (a 6-way select and a clear), independent of sel and of
+    the state.
+    Hardware note: PicoRV32 offers an I-type custom instruction on PCPI like
+    any other, with pcpi_rs2 = x[insn[24:20]]. That value is meaningless here
+    and the unit must take sel from pcpi_insn[22:20].
+
+    Gate 2 tests each instruction alone from reset, and alone this one only
+    ever sees a zero state, so it always returns 0. Its data path is checked
+    by the sequences: in the xfop.hi worked sequence, sel 0..3 return
+    0x40600000, 0xC0400000, 0x3FC00000, 0x40A00000. A second read of the
+    same sel then returns 0x00000000. After xfop.lo x0, 0x3FC00000,
+    0x40000000, sel 4 returns 0x3FC00000 and sel 5 returns 0x40000000. After
+    sel 7, every sel returns 0.
+  spike_model: |-
+    void xfop_rd_iss(const uint32_t in[2], uint32_t out[2]) {
+        (void)in;
+        out[0] = 0;
+        out[1] = 0;
+    }
+  src_regs: 1
+  state_words: 0
+  words: 2
+  writes_state:
+  - facc
+  - flat
+link1_vectors: 100000
+name: 'RED-XFOP: binary32 2x2 outer-product accumulator for RV32IM'
+passes_gate2: true
+passes_link1: true
+rationale: |
+  S2a (pattern). One hot function, multiply, holds 68.3% of cycles, an Amdahl
+  ceiling of 1/(1-0.683) = 3.15x. Its two mined regions are the ijk triple
+  loop and the 100-store clearMatrix fill. Gate 3 credits them together as
+  one function, and the fill is plain stores the base ISA already does well,
+  so it stays in software. The ijk body is one dataflow pattern: a binary32
+  dot product with sequential accumulation, c = fl(c + fl(a*b)), starting
+  from +0.0. Without F, both operations are soft-float calls.
+
+  Why round 1 fell short (1.71x). xfop's predecessor, xfmac.s/xfmacr.s, was
+  bit-exact but issued one instruction per MAC. On this core every
+  register-form instruction costs about 30 cycles of issue before it does
+  anything, so the kernel cost was about 751 x 31 cycles. The only lever left
+  is more MACs per issued instruction, and a 2-source instruction brings only
+  two new binary32 values. The way to get more MACs out of the same values is
+  operand reuse, which is what register blocking does in every BLAS kernel.
+
+  S2b (shape). One k step of a 2x2 block of C needs four values (A[i][k],
+  A[i+1][k], B[k][j], B[k][j+1]) and does four MACs. Two 2-source
+  instructions carry the four values. Latching the first pair (FLAT) lets the
+  second instruction form all three remaining products, so it is 2
+  instructions per 4 MACs, and each value the software loads feeds two MACs.
+  The split is lo = 1 MAC plus the latch, hi = 3 MACs. Each instruction
+  returns its own a*b product, which is a function of its operands alone.
+  That keeps both twice-call pure under Gate 4 and lets Gate 2 check the
+  whole multiplier and rounding path on each of them in isolation. The four
+  accumulators hold the 2x2 block's sums. xfop.rd drains them one per
+  instruction, because PCPI returns one 32-bit value, and clears them as it
+  goes, so each block starts from +0.0 exactly like clearMatrix. Sel 7 is
+  the entry/exit scrub. The odd last row/column of the 5x5 and 9x9 shapes
+  uses xfop.lo alone as a 1x1 step. Accumulation order per element is
+  unchanged, so results are bit-identical to the C source. There is no limit
+  on M, N or K.
+
+  Rejected: (1) 2x4 or 4x4 blocking, which needs 10 or 20 words of state and
+  pads badly on the 5- and 9-wide shapes, for about 10-15% more on the
+  10x10 shape. (2) A raw write instruction into FACC for context restore.
+  Its only kernel use would be 2 scrubs per call, which the invocations bound
+  rejects, and sel 7 of xfop.rd already scrubs. On ENABLE_IRQ=0 the state
+  never lives across a context switch. (3) Block-form dot products or tile
+  multiplies, which are memory-operand arithmetic and structurally blocked.
+  (4) A fused multiply-add, or packed or quantised operands, either of which
+  changes the application's results. (5) A fixed matrix-size limit.
+
+  Cost (data volume). The profile harness rotates (M,K,N) = (10,10,10),
+  (8,12,8), (5,20,5), (9,9,9) over its 40,000 calls, so 1000, 768, 500 and 729
+  MACs (mean 749.25). Per shape, with full 2x2 blocks plus 1x1 edges:
+    10x10x10: 25 blocks -> lo 250, hi 250, rd 100
+    8x12x8:   16 blocks -> lo 192, hi 192, rd 64
+    5x20x5:   4 blocks + 9 edge elements -> lo 80+180 = 260, hi 80, rd 16+9 = 25
+    9x9x9:    16 blocks + 17 edge elements -> lo 144+153 = 297, hi 144, rd 64+17 = 81
+  Means: xfop.lo 249.75 -> 250, xfop.hi 166.5 -> 167, and xfop.rd 67.5
+  drains + 2 scrubs = 69.5 -> 70 (all rounded up). Check:
+  249.75 + 3 x 166.5 = 749.25 MACs, as required. That is 486 instructions
+  per call, against 751 for round 1.
+  Gate 3: about 250 x 31 + 167 x ~35 + 70 x ~36 = ~16.1k cycles (the last two
+  include the model's sequential-step charge), against 6,987 host Ir x 8.51 =
+  ~59.5k cycles of credited software per call. That predicts ~3.7x on
+  multiply and ~2.0x for the application (round 1: 1.71x; ceiling 3.15x).
+  Honest caveat: Gate 3 prices a MAC at 1 cycle, but a sequential binary32
+  datapath takes ~16-20 cycles per multiply-add, so xfop.hi is really about
+  3x slower than xfop.lo. On PicoRV32 the win still holds, for reasons the
+  gate's model does not see. The issue count per MAC falls from 1.0 to 0.65.
+  The software loads per MAC fall from 2 to 1 in the blocked region, at ~5
+  cycles each. And every libgcc soft-float call disappears.
+
+  Prior-run findings designed around: fused-vs-unfused mismatch (two
+  roundings, with a distinguishing vector); subnormal flush (gradual
+  underflow required); data-dependent FP latency (fixed by specification);
+  rd left undefined (every instruction defines x[rd]); dimension truncation
+  (no size limit); custom-0 IRQ aliasing (custom-1 used); Gate 4's twice-call
+  purity (no output depends on state its own instruction changes).
+register_files:
+- context: |
+    Scratch state, not saved or restored. It is live only inside one 2x2
+    block, from that block's first xfop.lo to its last xfop.rd drain, and
+    nothing on this core can interrupt that window. ENABLE_IRQ=0, and the
+    loads, address arithmetic and custom instructions in the window cannot
+    trap. Software treats it as clobbered across any call, ecall or trap.
+    Every context switch, and the kernel itself on entry and exit, issues
+    xfop.rd x0, x0, 7, so no partial sum of one caller reaches another. A
+    core with preemptive interrupts would need a write path for save/restore.
+    This version targets the ENABLE_IRQ=0 build and does not provide one.
+  count: 4
+  name: facc
+  purpose: |
+    The four binary32 running sums of the 2x2 block of C being formed:
+    FACC[0] = C00 = C[i][j], FACC[1] = C01 = C[i][j+1], FACC[2] = C10 =
+    C[i+1][j], FACC[3] = C11 = C[i+1][j+1]. Written by xfop.lo (C00) and
+    xfop.hi (C01, C10, C11), drained by xfop.rd sel 0..3. These four
+    registers let a 3-input multiply-accumulate issue as a 2-source R-type
+    instruction, and let each A and B element the software loads feed two
+    MACs instead of one.
+  reset: 0x00000000 (+0.0) in every element
+  width_bits: 32
+- context: |
+    Same as facc: scratch, live only between an xfop.lo and the xfop.hi
+    issued right after it. Scrubbed by xfop.rd x0, x0, 7 at kernel exit and
+    on any context switch, so the last A/B operands of one caller are not
+    left in the unit.
+  count: 2
+  name: flat
+  purpose: |
+    The operand latch: FLAT[0] = LA = the a0 and FLAT[1] = LB = the b0 of the
+    most recent xfop.lo, as raw 32-bit patterns. xfop.hi reads them to form
+    the two cross products LA*b1 and a1*LB, so one k step needs only two
+    2-source instructions for four MACs. Readable and clearable through
+    xfop.rd sel 4, 5 and 7.
+  reset: 0x00000000 in both elements
+  width_bits: 32
+state_note: |
+  The state is FACC (4 x 32) and FLAT (2 x 32), 192 bits in all, a fifth of
+  the core's 1,024-bit register file. There are no CSRs. Writers: xfop.lo
+  (C00, LA, LB), xfop.hi (C01, C10, C11) and xfop.rd (clears the element it
+  reads, or everything with sel 7). Reset clears everything.
+  Invariants, which follow from IEEE 754 roundTiesToEven and from the
+  absence of any raw write path into FACC:
+  (a) FACC never holds -0.0. Every element starts at +0.0 (reset, drain or
+      clear), an RNE sum is -0 only when both addends are -0, and a nonzero
+      exact sum of two binary32 values is at least 2^-149 in magnitude, so it
+      never rounds to zero.
+  (b) Any NaN in FACC is exactly 0x7FC00000.
+  Together these make the drained value bit-identical to the C variable the
+  original loop accumulates from clearMatrix's +0.0.
+  Interaction through the state, which Gate 2 cannot see because it runs
+  each instruction alone from reset: xfop.hi consumes the LA/LB written by
+  the preceding xfop.lo, xfop.rd returns what lo/hi accumulated, and a drain
+  leaves an element at +0.0 ready for the next block. The worked sequences
+  in xfop.hi and xfop.rd are the reference for reviewers and for the RTL
+  testbench. Each model holds its own copy of the state, and no instruction's
+  output depends on state that the same instruction changes. xfop.lo and
+  xfop.hi return their own a*b product, and xfop.rd alone from reset only
+  ever sees zeros. So every model is a pure function of in[] under repeated
+  calls.
+  Residue: the kernel issues xfop.rd x0, x0, 7 on entry, so its results never
+  depend on what an earlier caller left, and again on exit, so no operand or
+  partial sum outlives the call.
+  No instruction raises an exception, accesses memory, or reads or writes any
+  CSR. There is no fcsr (the core has no F extension), the rounding mode is
+  fixed at RNE, and no accrued-exception flags exist. This matches the libgcc
+  soft-float routines being replaced, which on this target neither honour a
+  dynamic rounding mode nor expose flags.
+  Hardware binding: one PCPI unit claims opcode 0101011 with (funct3 = 000
+  and funct7 in {0001000, 0001001}) or funct3 = 001. It raises pcpi_wait in
+  the cycle after pcpi_valid, well inside the 16-cycle timeout, and returns
+  pcpi_wr=1 with pcpi_rd after a fixed latency. It never asserts acc_busy, so
+  it never takes the memory bus, and it never claims OP/funct7=0000001, so it
+  cannot collide with fast_mul/div. Every other custom-1 encoding is left
+  unclaimed and traps as illegal (CATCH_ILLINSN=1). Non-normative datapath:
+  one binary32 multiply-add unit with a radix-4 sequential 24x24 significand
+  multiplier (12 steps; no second array multiplier beside fast_mul), then
+  align, add, normalise and round, about 16-20 cycles per multiply-add.
+  xfop.lo uses it once and xfop.hi three times back to back.
+tests:
+- 'link1: coverage 100.00% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan'
+- 'gate2: 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+version: 0.2.0

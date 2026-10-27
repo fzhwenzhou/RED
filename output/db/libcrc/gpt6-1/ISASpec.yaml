@@ -1,0 +1,248 @@
+base_isa: RV32IM
+critic_rounds: 1
+csrs: []
+description: 'Three stateless register CRC folding primitives for the current libcrc workload on RED''s PicoRV32. xcrc32.d folds eight bytes for the reflected 0xEDB88320 recurrence. xcrc64.dh and xcrc64.dl return complementary halves of the non-reflected 0x42F0E1EBA9EA3693 eight-byte transform in fold-ready byte order; both are required per eight bytes. All forms are reg, words=2, two input GPRs and exactly one output GPR, no memory operand blocks. Source truth: HotLoopReport loops crc_32::byte_update (share 0.5383541965514747, 939589632 profiled instructions, 8192 calls) and crc_64_ecma::byte_update (share 0.4614565122198257, 805380096 profiled instructions, 8192 calls); libcrc/src/crc32.c, libcrc/src/crc64.c, libcrc/include/checksum.h and precalc/crc32_table.c / crc64_table.c establish the recurrences, polynomials and initialization/finalization. The current profile/run1/_red_workload.c has BUFFER_SIZE=16384 and calls each CRC 8192 times. Its buffer symbol is at 0x20020 in the inspected harness, hence word aligned. One instruction (or, for CRC-64, one pair) consumes eight data bytes: 16384/8=2048 invocations PER FUNCTION CALL for EACH applicable mnemonic, not 8192 total calls and not the prior run''s 508. marshal_words=0 because there is no memory operand/output block and no copy or scatter; two ordinary source-word loads and XOR/loop work remain in software and are priced separately. The current report leaves trip_count unknown; direct inspection of /home/naonao/RED/output/work/libcrc/20261026-022303-943b21/profile/run1/_red_workload.c supplies the missing data volume. No spike_model is supplied.'
+encodings: []
+gate2_vectors: 100000
+instructions:
+- c_model: |
+    #include <stdint.h>
+    void xcrc32_d_model(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = in[0];
+        const uint32_t b = in[1];
+        for (unsigned int k = 0; k < 32; ++k) {
+            const uint32_t m = UINT32_C(0) - (r & UINT32_C(1));
+            r = (r >> 1) ^ (UINT32_C(0xEDB88320) & m);
+        }
+        r ^= b;
+        for (unsigned int k = 0; k < 32; ++k) {
+            const uint32_t m = UINT32_C(0) - (r & UINT32_C(1));
+            r = (r >> 1) ^ (UINT32_C(0xEDB88320) & m);
+        }
+        out[0] = r;
+        out[1] = UINT32_C(0);
+    }
+  encoding: 0000001 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000001'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xcrc32.d
+  name: Reflected CRC-32 eight-byte register fold
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    All indexed variables are single assignment. U32(z)=z modulo 2^32; right shifts are logical.
+    a := in[0] = pre_x[rs1]; b := in[1] = pre_x[rs2].
+    s[0] := a.
+    For k in the fixed range 0..31:
+        bit[k] := s[k] AND 1.
+        mask[k] := U32(0 - bit[k]).
+        s[k+1] := (s[k] >> 1) XOR (0xEDB88320 AND mask[k]).
+    t[0] := s[32] XOR b.
+    For j in the fixed range 0..31:
+        bit2[j] := t[j] AND 1.
+        mask2[j] := U32(0 - bit2[j]).
+        t[j+1] := (t[j] >> 1) XOR (0xEDB88320 AND mask2[j]).
+    out[0] := t[32]; out[1] := 0.
+    Architectural effect: x[rd] := t[32] unless rd is x0; no other state changes.
+  reads_state: []
+  replaces: crc_32::byte_update
+  semantics: 'This is a pure two-source RV32 register instruction: in[0] is the pre-instruction x[rs1] value and in[1] is the pre-instruction x[rs2] value. Neither is an address. out[0] is the sole 32-bit architectural result written to x[rd]; out[1]=0 is mandatory reference-model padding, not a second register result or a memory store. All operands are sampled before writeback, so register aliases are legal; rd=x0 discards the result. There are no memory accesses, CSRs, flags, persistent state, or operand-dependent traps. Every 64-bit input pair is legal. Both output words are written, also for all-zero and all-one inputs. Execution has a fixed 64 polynomial-bit-transition schedule independent of operand values; no operand-indexed table, branch, division, multiply, or early exit is used. Arithmetic: let a=in[0], b=in[1]. Define T32(v)=(v logical-right-shift 1) XOR (0xEDB88320 when the OLD v bit 0 is 1, otherwise 0), on exactly 32 bits. The returned value is T32 applied 32 times to (T32 applied 32 times to a) XOR b. Equivalently, compute a reflected CRC from initial value zero over the eight bytes a[7:0],a[15:8],a[23:16],a[31:24],b[7:0],b[15:8],b[23:16],b[31:24], in that order, without an initial or final complement. The polynomial selection is implemented by a 0-or-all-ones mask. Caller composition for the mined crc_32::byte_update loop: maintain the unfinalized 32-bit CRC c in a GPR; load w0=LE32(p[0..3]) and w1=LE32(p[4..7]) with ordinary CPU loads; c_next=xcrc32.d(c XOR w0,w1). This is exactly eight source byte updates. Initialize c=0xFFFFFFFF and apply c XOR 0xFFFFFFFF once at function return, not within this instruction. Software owns pointers, bounds, alignment, and iteration. For a general nonnull byte buffer, peel at most three bytes with the original byte update until 4-byte aligned, use 8-byte chunks, and process the remaining 0..7 bytes with the original byte update; do not pad a tail or overread. A null pointer follows the source function''s guard and issues no custom operations. The current profile/run1/_red_workload.c has BUFFER_SIZE=16384 and calls each CRC 8192 times. Its buffer symbol is at 0x20020 in the inspected harness, hence word aligned. One instruction (or, for CRC-64, one pair) consumes eight data bytes: 16384/8=2048 invocations PER FUNCTION CALL for EACH applicable mnemonic, not 8192 total calls and not the prior run''s 508. marshal_words=0 because there is no memory operand/output block and no copy or scatter; two ordinary source-word loads and XOR/loop work remain in software and are priced separately.'
+  spike_model: |-
+    void xcrc32_d_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        uint32_t r = in[0];
+        const uint32_t b = in[1];
+        for (unsigned k = 0; k < 32; ++k) {
+            const uint32_t mask = uint32_t(0) - (r & uint32_t(1));
+            r = (r >> 1) ^ (uint32_t(0xEDB88320u) & mask);
+        }
+        r ^= b;
+        for (unsigned k = 0; k < 32; ++k) {
+            const uint32_t mask = uint32_t(0) - (r & uint32_t(1));
+            r = (r >> 1) ^ (uint32_t(0xEDB88320u) & mask);
+        }
+        out[0] = r;
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    static uint32_t xcrc64_dh_bswap32(uint32_t v)
+    {
+        return ((v & UINT32_C(0x000000FF)) << 24)
+             | ((v & UINT32_C(0x0000FF00)) << 8)
+             | ((v & UINT32_C(0x00FF0000)) >> 8)
+             | ((v & UINT32_C(0xFF000000)) >> 24);
+    }
+    void xcrc64_dh_model(const uint32_t in[2], uint32_t out[2])
+    {
+        const uint32_t a = in[0];
+        const uint32_t b = in[1];
+        uint64_t r = ((uint64_t)xcrc64_dh_bswap32(a) << 32)
+                   | (uint64_t)xcrc64_dh_bswap32(b);
+        for (unsigned int k = 0; k < 64; ++k) {
+            const uint64_t m = UINT64_C(0) - (r >> 63);
+            r = (r << 1) ^ (UINT64_C(0x42F0E1EBA9EA3693) & m);
+        }
+        out[0] = xcrc64_dh_bswap32((uint32_t)(r >> 32));
+        out[1] = UINT32_C(0);
+    }
+  encoding: 0000010 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000010'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xcrc64.dh
+  name: CRC-64/ECMA eight-byte register fold, high result half
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    All indexed variables are single assignment. U32(z)=z modulo 2^32; U64(z)=z modulo 2^64. All right shifts are logical.
+    BSWAP32(v)=((v AND 0x000000FF)<<24) OR ((v AND 0x0000FF00)<<8) OR ((v AND 0x00FF0000)>>8) OR ((v AND 0xFF000000)>>24).
+    a := in[0] = pre_x[rs1]; b := in[1] = pre_x[rs2].
+    s[0] := (uint64(BSWAP32(a)) << 32) OR uint64(BSWAP32(b)).
+    For k in the fixed range 0..63:
+        bit[k] := s[k] >> 63.
+        mask[k] := U64(0 - bit[k]).
+        s[k+1] := U64(s[k] << 1) XOR (0x42F0E1EBA9EA3693 AND mask[k]).
+    result := BSWAP32(U32(s[64] >> 32)).
+    out[0] := result; out[1] := 0.
+    Architectural effect: x[rd] := result unless rd is x0; no other state changes.
+  reads_state: []
+  replaces: crc_64_ecma::byte_update
+  semantics: 'This is a pure two-source RV32 register instruction: in[0] is the pre-instruction x[rs1] value and in[1] is the pre-instruction x[rs2] value. Neither is an address. out[0] is the sole 32-bit architectural result written to x[rd]; out[1]=0 is mandatory reference-model padding, not a second register result or a memory store. All operands are sampled before writeback, so register aliases are legal; rd=x0 discards the result. There are no memory accesses, CSRs, flags, persistent state, or operand-dependent traps. Every 64-bit input pair is legal. Both output words are written, also for all-zero and all-one inputs. Execution has a fixed 64 polynomial-bit-transition schedule independent of operand values; no operand-indexed table, branch, division, multiply, or early exit is used. Arithmetic: BSWAP32 reverses the four bytes of a 32-bit value. Set the initial 64-bit work value r=(uint64(BSWAP32(in[0]))<<32)|BSWAP32(in[1]). Exactly 64 times, let f be the OLD r bit 63, then replace r by ((r<<1) modulo 2^64) XOR (0x42F0E1EBA9EA3693 when f=1, otherwise 0), using a mask for the polynomial. This is the non-reflected CRC from zero over eight bytes in[0][7:0],in[0][15:8],in[0][23:16],in[0][31:24],in[1][7:0],in[1][15:8],in[1][23:16],in[1][31:24], with each byte consumed most-significant-bit first. Return ONLY BSWAP32(the final r bits 63:32) in out[0], with out[1]=0. The byte reversal of the result is architectural, not optional. There is no initial/final complement. Caller composition for crc_64_ecma::byte_update: represent the unfinalized numeric CRC c by ah=BSWAP32(c>>32) and al=BSWAP32(c mod 2^32). Each denotes four bytes of the big-endian CRC serialized into a little-endian GPR. Load w0=LE32(p[0..3]) and w1=LE32(p[4..7]); snapshot t0=ah XOR w0 and t1=al XOR w1. Set next_ah=xcrc64.dh(t0,t1) and next_al=xcrc64.dl(t0,t1), then advance both state words together. Preserve t0 and t1 until BOTH instructions have consumed them; the first destination may overwrite old ah but must not destroy either temporary. Either instruction may execute first. They are independent pure functions, with no fusion, cache, hidden valid bit, or implicit communication. The pair together, never either half alone, implements eight byte updates. Start ah=al=0. Recover c=(uint64(BSWAP32(ah))<<32)|BSWAP32(al) at return; there is no final XOR. Software performs the pointer loop and ordinary CPU loads. For arbitrary byte buffers, peel at most three bytes in software to reach 4-byte alignment and handle the last 0..7 bytes in software after converting state to numeric order. No padding or out-of-range reads are permitted. Null input follows the source guard and issues no custom operations. The current profile/run1/_red_workload.c has BUFFER_SIZE=16384 and calls each CRC 8192 times. Its buffer symbol is at 0x20020 in the inspected harness, hence word aligned. One instruction (or, for CRC-64, one pair) consumes eight data bytes: 16384/8=2048 invocations PER FUNCTION CALL for EACH applicable mnemonic, not 8192 total calls and not the prior run''s 508. marshal_words=0 because there is no memory operand/output block and no copy or scatter; two ordinary source-word loads and XOR/loop work remain in software and are priced separately.'
+  spike_model: |-
+    void xcrc64_dh_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        const auto bswap32 = [](uint32_t v) -> uint32_t {
+            return ((v & 0x000000FFu) << 24)
+                 | ((v & 0x0000FF00u) << 8)
+                 | ((v & 0x00FF0000u) >> 8)
+                 | ((v & 0xFF000000u) >> 24);
+        };
+        const uint32_t a = in[0];
+        const uint32_t b = in[1];
+        uint64_t r = (uint64_t(bswap32(a)) << 32) | uint64_t(bswap32(b));
+        for (unsigned k = 0; k < 64; ++k) {
+            const uint64_t mask = uint64_t(0) - (r >> 63);
+            r = (r << 1) ^ (uint64_t(0x42F0E1EBA9EA3693ull) & mask);
+        }
+        out[0] = bswap32(uint32_t(r >> 32));
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+- c_model: |
+    #include <stdint.h>
+    static uint32_t xcrc64_dl_bswap32(uint32_t v)
+    {
+        return ((v & UINT32_C(0x000000FF)) << 24)
+             | ((v & UINT32_C(0x0000FF00)) << 8)
+             | ((v & UINT32_C(0x00FF0000)) >> 8)
+             | ((v & UINT32_C(0xFF000000)) >> 24);
+    }
+    void xcrc64_dl_model(const uint32_t in[2], uint32_t out[2])
+    {
+        const uint32_t a = in[0];
+        const uint32_t b = in[1];
+        uint64_t r = ((uint64_t)xcrc64_dl_bswap32(a) << 32)
+                   | (uint64_t)xcrc64_dl_bswap32(b);
+        for (unsigned int k = 0; k < 64; ++k) {
+            const uint64_t m = UINT64_C(0) - (r >> 63);
+            r = (r << 1) ^ (UINT64_C(0x42F0E1EBA9EA3693) & m);
+        }
+        out[0] = xcrc64_dl_bswap32((uint32_t)r);
+        out[1] = UINT32_C(0);
+    }
+  encoding: 0000011 rs2 rs1 000 rd 0101011
+  form: reg
+  funct3: '000'
+  funct7: '0000011'
+  group: compute
+  imm_bits: 0
+  invocations: 2048
+  mac_ops: 0
+  marshal_words: 0
+  mnemonic: xcrc64.dl
+  name: CRC-64/ECMA eight-byte register fold, low result half
+  opcode: custom-1
+  operands:
+  - rd
+  - rs1
+  - rs2
+  pseudocode: |-
+    All indexed variables are single assignment. U32(z)=z modulo 2^32; U64(z)=z modulo 2^64. All right shifts are logical.
+    BSWAP32(v)=((v AND 0x000000FF)<<24) OR ((v AND 0x0000FF00)<<8) OR ((v AND 0x00FF0000)>>8) OR ((v AND 0xFF000000)>>24).
+    a := in[0] = pre_x[rs1]; b := in[1] = pre_x[rs2].
+    s[0] := (uint64(BSWAP32(a)) << 32) OR uint64(BSWAP32(b)).
+    For k in the fixed range 0..63:
+        bit[k] := s[k] >> 63.
+        mask[k] := U64(0 - bit[k]).
+        s[k+1] := U64(s[k] << 1) XOR (0x42F0E1EBA9EA3693 AND mask[k]).
+    result := BSWAP32(U32(s[64])).
+    out[0] := result; out[1] := 0.
+    Architectural effect: x[rd] := result unless rd is x0; no other state changes.
+  reads_state: []
+  replaces: crc_64_ecma::byte_update
+  semantics: 'This is a pure two-source RV32 register instruction: in[0] is the pre-instruction x[rs1] value and in[1] is the pre-instruction x[rs2] value. Neither is an address. out[0] is the sole 32-bit architectural result written to x[rd]; out[1]=0 is mandatory reference-model padding, not a second register result or a memory store. All operands are sampled before writeback, so register aliases are legal; rd=x0 discards the result. There are no memory accesses, CSRs, flags, persistent state, or operand-dependent traps. Every 64-bit input pair is legal. Both output words are written, also for all-zero and all-one inputs. Execution has a fixed 64 polynomial-bit-transition schedule independent of operand values; no operand-indexed table, branch, division, multiply, or early exit is used. Arithmetic: BSWAP32 reverses the four bytes of a 32-bit value. Set the initial 64-bit work value r=(uint64(BSWAP32(in[0]))<<32)|BSWAP32(in[1]). Exactly 64 times, let f be the OLD r bit 63, then replace r by ((r<<1) modulo 2^64) XOR (0x42F0E1EBA9EA3693 when f=1, otherwise 0), using a mask for the polynomial. This is the non-reflected CRC from zero over eight bytes in[0][7:0],in[0][15:8],in[0][23:16],in[0][31:24],in[1][7:0],in[1][15:8],in[1][23:16],in[1][31:24], with each byte consumed most-significant-bit first. Return ONLY BSWAP32(the final r bits 31:0) in out[0], with out[1]=0. The byte reversal of the result is architectural, not optional. There is no initial/final complement. Caller composition for crc_64_ecma::byte_update: represent the unfinalized numeric CRC c by ah=BSWAP32(c>>32) and al=BSWAP32(c mod 2^32). Each denotes four bytes of the big-endian CRC serialized into a little-endian GPR. Load w0=LE32(p[0..3]) and w1=LE32(p[4..7]); snapshot t0=ah XOR w0 and t1=al XOR w1. Set next_ah=xcrc64.dh(t0,t1) and next_al=xcrc64.dl(t0,t1), then advance both state words together. Preserve t0 and t1 until BOTH instructions have consumed them; the first destination may overwrite old ah but must not destroy either temporary. Either instruction may execute first. They are independent pure functions, with no fusion, cache, hidden valid bit, or implicit communication. The pair together, never either half alone, implements eight byte updates. Start ah=al=0. Recover c=(uint64(BSWAP32(ah))<<32)|BSWAP32(al) at return; there is no final XOR. Software performs the pointer loop and ordinary CPU loads. For arbitrary byte buffers, peel at most three bytes in software to reach 4-byte alignment and handle the last 0..7 bytes in software after converting state to numeric order. No padding or out-of-range reads are permitted. Null input follows the source guard and issues no custom operations. The current profile/run1/_red_workload.c has BUFFER_SIZE=16384 and calls each CRC 8192 times. Its buffer symbol is at 0x20020 in the inspected harness, hence word aligned. One instruction (or, for CRC-64, one pair) consumes eight data bytes: 16384/8=2048 invocations PER FUNCTION CALL for EACH applicable mnemonic, not 8192 total calls and not the prior run''s 508. marshal_words=0 because there is no memory operand/output block and no copy or scatter; two ordinary source-word loads and XOR/loop work remain in software and are priced separately.'
+  spike_model: |-
+    void xcrc64_dl_iss(const uint32_t in[2], uint32_t out[2])
+    {
+        const auto bswap32 = [](uint32_t v) -> uint32_t {
+            return ((v & 0x000000FFu) << 24)
+                 | ((v & 0x0000FF00u) << 8)
+                 | ((v & 0x00FF0000u) >> 8)
+                 | ((v & 0xFF000000u) >> 24);
+        };
+        const uint32_t a = in[0];
+        const uint32_t b = in[1];
+        uint64_t r = (uint64_t(bswap32(a)) << 32) | uint64_t(bswap32(b));
+        for (unsigned k = 0; k < 64; ++k) {
+            const uint64_t mask = uint64_t(0) - (r >> 63);
+            r = (r << 1) ^ (uint64_t(0x42F0E1EBA9EA3693ull) & mask);
+        }
+        out[0] = bswap32(uint32_t(r));
+        out[1] = 0;
+    }
+  src_regs: 2
+  state_words: 0
+  words: 2
+  writes_state: []
+link1_vectors: 100000
+name: Xredcrcfold
+passes_gate2: true
+passes_link1: true
+rationale: |-
+  S2a: both mined loops are loop-carried linear polynomial CRC recurrences with serial table lookups, shifts, XORs and sequential byte loads. CRC-32 alone has Amdahl cap 1/(1-0.5383541965514747)=2.166x; CRC-64 alone caps at 1.857x; together coverage is 0.9998107087713004 and the ideal cap is about 5282.86x (a coverage ceiling, not a forecast). Profile counts are host instruction proxies, not measured target cycles. S2b: a 64-bit message fold matches the two 32-bit PCPI input ports. A 32-bit CRC result needs one instruction; a 64-bit result needs two because PCPI has one 32-bit rd. This preserves software's buffer walk, load/store architecture and scalar state, and requires no architectural file/CSR. It retains the legal reg words=2 shape and eight-byte granularity of the converged 20261025-231142-7ab4f6 crc32.d/crc64.dh/crc64.dl design, with current-workload invocation counts and explicit double computation cost. Earlier 17/18-word block CRC winners are rejected as a starting ABI because block compute violates this run's load/store rule, and their artificial nonzero mac_ops do not describe CRC arithmetic. No CRC-16 or other unmined kernel is targeted.
+  Cost: read_core reports PCPI acceptance overhead 1 clock, ordinary ALU 4 cycles, loads 7, word transfers 2; this acceptance clock excludes fetch/decode/writeback. Keep that separate from the supplied gate's conservative 28-cycle complete instruction allowance. Each custom invocation has 0 memory beats, 0 integer multiplies, and 64 polynomial bit transitions; NEVER price it as just 28 cycles or charge one transform for the CRC-64 pair. A feasible compact implementation is 64 fixed one-bit cycles using a shared 64-bit shift/XOR work register; a fixed 8-bit unroll would be an optional RTL optimization, not assumed here. Budget 28+64=92 clocks per instruction, 184 for the CRC-64 pair. Budget ordinary caller work separately: 48 clocks per eight bytes for CRC-32 and 52 for CRC-64, covering two aligned loads (14), 1/2 XORs (4/8), pointer/count/control and slack. Thus each 16384-byte CRC-32 call budgets 2048*(92+48)=286720 cycles, each CRC-64 call 2048*(184+52)=483328 cycles; no overlap while PCPI stalls the core. The current functions cost 114696 and 98313 host instructions per call, or 974916 and 835660.5 target cycles at the supplied 8.5 calibration. Combined budget including the measured uncovered host work yields approximately 2.35x, before RTL measurement; count both halves against one CRC-64 baseline and count coverage once. This is an estimate, not a Gate-3 or RTL pass.
+  Hardware feasibility: custom-1 funct3=000 with funct7=0000001/0000010/0000011 gives matches 0x0200002B/0x0400002B/0x0600002B under mask 0xFE00707F. It cannot overlap standard M, existing red_accel custom-0 or PicoRV32 IRQ custom-0. Decode only these exact triples; assert pcpi_wait promptly on recognized valid and keep it high through fixed work to prevent the four-bit unsupported-instruction timeout. Complete with pcpi_ready and pcpi_wr, one pcpi_rd, then retire; ignore unrelated encodings. No new integer multiplier/divider, general barrel shifter, lookup RAM or tile buffer is justified. Shifts by one and byte reversal are fixed wiring plus polynomial XOR taps; a shared CRC engine can reuse red_accel's existing 64-bit work storage and staged operand storage while it is idle, with only mode/count control. All operand/work bits are overwritten on every issue and are unobservable afterward. The engine may be dedicated instead if RTL sharing timing warrants; area needs synthesis, not storage-count claims. Register CRC operations never assert the accelerator memory request or take memory-bus ownership; retain the existing memory master, busy mux and mem_issued guarding for legacy block operations. CPU instruction fetch remains governed by the existing native interface.
+  S2c review scope: verify total unsigned recurrences and byte ordering against the source tables, complete output initialization and exactly sized arrays under sanitizers, constant input-independent instruction counts, paired CRC-64 composition across complete buffers, and unique custom decode. No hidden state is permitted to cache the unreturned CRC-64 half. Instructions remain callable individually, including with zero or identical registers.
+  S2c completed in three passes: (1) shape/cost audit selected only pure reg forms, corrected old 508/64-byte invocation assumptions to 2048 per current 16-KiB call, reserved custom-1 encodings, and explicitly charged both CRC-64 halves; (2) semantics/model audit compiled all models as C99 with GCC -O2 -Wall -Wextra -Werror -pedantic and AddressSanitizer/UndefinedBehaviorSanitizer, checked 100000 vectors per instruction against the actual libcrc byte-update/table code, two distinct output poisons, preserved inputs, in-place arrays, and arbitrary starting-CRC composition, plus 1044 full-buffer cases at offsets 0..3 and lengths 0..257, 4095, 4096, 16384 and null-input/text checks, all passing; (3) security/encoding audit measured identical Callgrind Ir for 1000 calls per model on eight operand patterns (331000 for xcrc32.d, 266000 for xcrc64.dh, 267000 for xcrc64.dl in every pattern) and exhaustively checked all 98304 register-field encodings for distinct decoding. Both reference arrays are exactly two allocated uint32_t words in sanitizer vector tests. These are local designer checks, not a claim that the independent Spike differential Gate 2 or performance/security gates have already run.
+register_files: []
+state_note: 'No additional architectural state. The running CRC lives in normal GPRs and is saved/restored by the base ABI. No custom CSR or context-save protocol is needed. Temporary PCPI computation storage is not persistent architectural state: it is initialized entirely from current operands, cannot be read by later instructions, and reset abandons it. The in-order core is stalled throughout each bounded operation; IRQs are disabled on this target. Future trap/IRQ support must retire or cancel an in-flight operation before a context switch; no partially written rd is visible. Every computation is total; custom-1 decoding has no memory or privilege side effects.'
+tests:
+- 'link1: coverage 99.98% >= 80%; 3/3 C models built and survived 100,000 vectors under ASan+UBSan'
+- 'gate2: 3/3 instructions: C model and patched Spike agree on 100,000 random + corner vectors'
+version: 1.0.0

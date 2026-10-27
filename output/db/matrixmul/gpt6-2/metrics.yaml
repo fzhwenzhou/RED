@@ -1,0 +1,39 @@
+blocking_findings: 0
+converged: true
+coverage: 0.9957060242855349
+critic_rounds: 1
+failed_turns: 0
+frozen_fingerprint: 7975e90fb726941f
+gates_passed: 5
+gates_total: 5
+instructions: 3
+model_label: 'codex: gpt-6.1-sol (effort=high) + 8 stage overrides (models.gpt6.toml)'
+predicted_speedup: 4.620801734532544
+redesign_rounds: 1
+rejected_drafts: 0
+repair_rounds: 0
+review_rounds: 1
+run_id: 20261026-125631-fe3ed0
+seconds_by_role:
+  core: 222.1
+  design: 843.6
+  iss: 84.6
+  mine: 46.3
+  review: 248.5
+  security: 47.6
+  workload: 69.6
+speedup_bar: 2.0
+started: '2026-10-26T13:19:59-04:00'
+structure_blocking: 0
+turn_seconds: 1562.2
+turns: 10
+turns_by_role:
+  core: 1
+  design: 1
+  iss: 1
+  mine: 1
+  review: 4
+  security: 1
+  workload: 1
+wallclock_seconds: 1407.5
+workload: matrixmul

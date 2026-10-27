@@ -1,0 +1,4 @@
+counterexample: null
+detail: predicted 5.46x over 91% of cycles (bar 2.00x, priced on the shipped spec)
+gate: gate3
+passed: true

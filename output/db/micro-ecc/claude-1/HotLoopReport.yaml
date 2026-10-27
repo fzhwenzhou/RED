@@ -1,0 +1,105 @@
+coverage: 0.971831375822251
+loops:
+- body: |
+    /* s1 */
+    tmp[0] = tmp[1] = tmp[2] = 0;
+    tmp[3] = product[11];
+    tmp[4] = product[12];
+    tmp[5] = product[13];
+    tmp[6] = product[14];
+    tmp[7] = product[15];
+    carry = uECC_vli_add(tmp, tmp, tmp, num_words_secp256r1);
+    carry += uECC_vli_add(result, result, tmp, num_words_secp256r1);
+    /* s2 ... s4: gather permuted product words into tmp, then uECC_vli_add(result, result, tmp) */
+    /* d1 ... d4: gather permuted product words into tmp, then carry -= uECC_vli_sub(result, result, tmp) */
+    if (carry < 0) {
+        do {
+            carry += uECC_vli_add(result, result, curve_secp256r1.p, num_words_secp256r1);
+        } while (carry < 0);
+    } else {
+        while (carry || uECC_vli_cmp_unsafe(curve_secp256r1.p, result, num_words_secp256r1) != 1) {
+            carry -= uECC_vli_sub(result, result, curve_secp256r1.p, num_words_secp256r1);
+        }
+    }
+  calls: 530950
+  cycle_share: 0.48487009375956297
+  dynamic_cycles: 4336710537
+  function: vli_mmod_fast_secp256r1
+  ir: ''
+  loop_id: vli_mmod_fast_secp256r1::nist_p256_reduction
+  operand_stats: |-
+    - 'NIST P-256 fast reduction of a 512-bit (16x32-bit word) product to 256 bits: result = t + 2*s1 + 2*s2 + s3 + s4 - d1 - d2 - d3 - d4 mod p'
+    - 'Straight-line: 4 word-permutation gathers + 5 vli_add and 4 vli_sub of 8 words each, plus final carry-correcting add/sub loop (typically 0-2 iterations)'
+    - Fixed word-index shuffles of product[8..15] into tmp[0..7]; no data-dependent indexing
+    - Loop-carried recurrence through result[] and signed carry across the add/sub chain
+    - Called ~531K times (callgrind call count 530950), self cost ~8.2K cycles per call
+  rank: 1
+  source_file: micro-ecc/curve-specific.inc
+  trip_count: 8
+- body: |
+    for (k = 0; k < num_words; ++k) {
+        for (i = 0; i <= k; ++i) {
+            muladd(left[i], right[k - i], &r0, &r1, &r2);
+        }
+        result[k] = r0;
+        r0 = r1;
+        r1 = r2;
+        r2 = 0;
+    }
+    for (k = num_words; k < num_words * 2 - 1; ++k) {
+        for (i = (k + 1) - num_words; i < num_words; ++i) {
+            muladd(left[i], right[k - i], &r0, &r1, &r2);
+        }
+        result[k] = r0;
+        r0 = r1;
+        r1 = r2;
+        r2 = 0;
+    }
+  calls: 3694592
+  cycle_share: 0.42464358053781365
+  dynamic_cycles: 3798040576
+  function: uECC_vli_mult
+  ir: ''
+  loop_id: uECC_vli_mult::product_scan_muladd
+  operand_stats: |-
+    - Product-scanning (column-wise) 8x8 limb multiply; 64 muladd per call (outer k trip 15, inner trip 1..8..1 triangular)
+    - Operands are 32-bit words; each muladd forms a 32x32->64 product and accumulates into a 96-bit (r0,r1,r2) carry chain
+    - Loop-carried recurrence through r0/r1/r2 accumulator; carry out via (r01 < p) compare
+    - 'Memory access: left[i] ascending, right[k-i] descending, unit stride, 256-bit inputs, 512-bit result'
+    - Called ~3.69M times in profile (callgrind call count 3694592); the dominant callee of the field-multiply/square path
+  rank: 2
+  source_file: micro-ecc/uECC.c
+  trip_count: 64
+- body: |
+    uECC_word_t l_borrow = uECC_vli_sub(result, left, right, num_words);
+    if (l_borrow) {
+        uECC_vli_add(result, result, mod, num_words);
+    }
+    /* inner multi-word loop in uECC_vli_sub: */
+    for (i = 0; i < num_words; ++i) {
+        uECC_word_t diff = left[i] - right[i] - borrow;
+        if (diff != left[i]) {
+            borrow = (diff > left[i]);
+        }
+        result[i] = diff;
+    }
+  calls: 3939328
+  cycle_share: 0.062317701524874335
+  dynamic_cycles: 557373689
+  function: uECC_vli_modSub
+  ir: ''
+  loop_id: uECC_vli_modSub::sub_with_borrow_fixup
+  operand_stats: |-
+    - 8-limb 32-bit subtract with borrow propagation; conditional add-back of the modulus on borrow (uECC_vli_add loop, same shape, 8 trips)
+    - Loop-carried recurrence through the borrow/carry bit; borrow update is data dependent (diff != left[i])
+    - 'Memory access: three unit-stride 256-bit vectors (left, right, result), result may alias left'
+    - Called ~3.94M times (callgrind call count 3939328), the most frequently called vli primitive, from XYcZ_add/XYcZ_addC and point arithmetic
+  rank: 3
+  source_file: micro-ecc/uECC.c
+  trip_count: 8
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/micro-ecc/20261026-162104-8cd807/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/micro-ecc/20261026-162104-8cd807/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 8944066860
+workload: micro-ecc secp256r1 ECDH (test/test_ecdh.c harness; 32-bit word build, num_words=8)

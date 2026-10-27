@@ -1,0 +1,49 @@
+coverage: 1.0
+loops:
+- body: |
+    for (int i = 1; i <= matrixC->rows; i++) {
+        for (int j = 1; j <= matrixC->columns; j++) {
+            for (int k = 1; k <= matrixA->columns; k++) {
+                setElement(i, j, getElement(i, j, matrixC) + getElement(i, k, matrixA) * getElement(k, j, matrixB), matrixC);
+            }
+        }
+    }
+  calls: 40000
+  cycle_share: 0.68310178147337
+  dynamic_cycles: 279480001
+  function: multiply
+  ir: ''
+  loop_id: multiply::ijk_matmul
+  operand_stats: |-
+    - Triple-nested loop; trip count = C.rows * C.columns * A.columns, set by runtime matrix dims (up to 100 elements per matrix, MAX_ELEMENTS=100); the shipped test.c uses 2x2 but the profile harness calls multiply 40000 times.
+    - 'Inner body is a multiply-accumulate on 32-bit IEEE float: C[i][j] += A[i][k] * B[k][j] (one fmul + one fadd, no fma).'
+    - Loop indices i,j,k are int starting at 1; row/column fields are unsigned char (8-bit) and are zero-extended before the index arithmetic.
+    - 'Address pattern: getElement/setElement compute elements[(row-1)*columns + (col-1)] with columns loaded from the struct each time; this is a multiply plus adds per access, 4 bytes per element, 3 element loads and 1 store per iteration.'
+    - A is read along a row (stride 1 element), B along a column (stride = B.columns elements), C[i][j] is loop-invariant across k but is reloaded and stored every iteration (store-to-load recurrence through memory on the accumulator, dependency distance 1).
+    - The accessor calls are static-inline-able and are folded into the loop in the callgrind profile; there is no separate getElement/setElement entry, so their cost is part of multiply.
+  rank: 1
+  source_file: matrixmul/matrixmul.h
+  trip_count: 0
+- body: |
+    for (int i = 0; i < MAX_ELEMENTS; i++) {
+        matrix->elements[i] = 0;
+    }
+  calls: 40000
+  cycle_share: 0.68310178147337
+  dynamic_cycles: 279480001
+  function: multiply
+  ir: ''
+  loop_id: multiply::clearMatrix_zero_fill
+  operand_stats: |-
+    - Fixed trip count 100 (MAX_ELEMENTS), executed once per multiply call regardless of actual matrix size.
+    - Unit-stride store of a constant 0.0f (32-bit float zero) to elements[i]; no loads, no loop-carried data dependence beyond the induction variable.
+    - Called from multiply (clearMatrix is inlined into multiply in the profile, so its cycles are included in multiply's total).
+  rank: 2
+  source_file: matrixmul/matrixmul.h
+  trip_count: 100
+passes_gate1: true
+profile_command: valgrind --tool=callgrind --callgrind-out-file=/home/naonao/RED/output/work/matrixmul/20261026-115900-fcf93a/profile/run1/callgrind.out --quiet /home/naonao/RED/output/work/matrixmul/20261026-115900-fcf93a/profile/run1/harness >/dev/null 2>&1
+profile_method: callgrind
+profile_runs:
+- 409133761
+workload: matrixmul

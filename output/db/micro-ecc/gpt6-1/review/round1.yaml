@@ -1,0 +1,24 @@
+findings:
+- evidence: state_note says xword(0,k) 'both returns and erases each saved word', but the model and instruction semantics explicitly return in[0]. For example, with A[0]=0x12345678, xword(0,0) returns zero and clears A[0]; restoring the saved zero changes a suspended multiplication's result. The same failure affects C selectors 8..23. This contradicts the advertised save/clear/restore protocol, although the uninterrupted multiplication and reduction wrappers remain usable.
+  finding: The specified context-save protocol cannot preserve A and C because xword returns the inserted value rather than the displaced state word.
+  fix: Return the selected entry-state word before replacing it, define the return for selectors 24..31, and update the model and prose consistently; alternatively provide a separate state-read operation and rewrite the context-save protocol.
+  instruction: p256.xword
+  reviewer: benefit+callability+implementability+legality
+  severity: major
+- evidence: 'lda moves 6 words each way: 12 beats and 24 bus cycles, with a supplied total of 75 cycles; stp moves 16 words each way, including ignored reads: 32 beats and 64 bus cycles, total 143. Both perform no arithmetic, so operand traffic dominates their useful work. Register operations have zero accelerator bus beats: mac2 costs 64 cycles, fold 489, xword 63, push 40 and pop 42. Multiplication therefore costs 75+2*63+4*64+143=600 extension cycles, plus ten scalar loads at 7 cycles each: 670 before wrapper control. Reduction costs 16*(40+489+42)=9136 extension cycles, approximately 9384 including the stated loads, stores and 96-cycle packing allowance. mac2 correctly declares 16 multiplies but also executes 15 carry-tail updates; fold has zero multiplies but executes 64 halfword carry updates and'
+  finding: The rationale's wrapper latency estimates are stale relative to the supplied gate prices.
+  fix: Replace the 510-cycle and approximately 8250-cycle planning totals with reconciled wrapper costs, retain the measured performance verdict, and report incremental area only after synthesis of the shared buffers, datapath and added control.
+  instruction: ''
+  reviewer: implementability
+  severity: minor
+- evidence: 'The profile gives multiplication 3798040576/3694592*8.5=8738 cycles/call and reduction 4336800805/530951*8.5=69427.89 cycles/call. All marshal_words are zero. The literal issue/traffic/MAC formula gives per-call contributions lda=52, mac2=4*44=176, stp=92, xword=2*28=56, fold=16*28=448, push=16*28=448, pop=16*28=448; these omit the sequential logic already measured by the gate. Using the supplied measured prices instead gives lda=75 (116.51x versus its entire kernel), mac2=256 (34.13x), stp=143 (61.10x), xword=126 (69.35x), fold=7824 (8.87x), push=640 (108.48x), and pop=672 (103.32x). Those helper ratios cannot receive independent application shares: their costs must be summed. The invocation counts match the stated data volumes and sequences; host instruction-count ratios do not invalidat'
+  finding: The rationale's performance estimates need reconciliation with the supplied gate prices and the complete software wrappers.
+  fix: Replace the stale planning totals with one table of measured instruction contributions and complete wrapper costs, including setup/control when available. Label 5.46x as the gate prediction and approximately 5.30x as the wrapper-adjusted estimate under the stated packing assumption; retain the explicit eligibility and profile-attribution qualifications.
+  instruction: ''
+  reviewer: benefit
+  severity: minor
+reviewers:
+- implementability
+- callability
+- benefit
+- legality

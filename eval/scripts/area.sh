@@ -60,12 +60,18 @@ printf '%-34s %10s %10s %10s\n' "generic cells (tech-indep.)" "$b_gen" "$e_gen" 
 printf '\n%-34s %10s %10s\n' "red_accel standalone" "$a_lut" "$a_gen"
 printf '%s\n' "  (LUT4 / generic cells)"
 
-cat > "$OUT/area.json" <<JSON
-{
-  "tool": "yosys $(yosys -V | awk '{print $2}')",
-  "baseline": {"ice40_lut4": $b_lut, "ice40_ff": $b_dff, "generic_cells": $b_gen},
-  "extended": {"ice40_lut4": $e_lut, "ice40_ff": $e_dff, "generic_cells": $e_gen},
-  "accel_only": {"ice40_lut4": $a_lut, "generic_cells": $a_gen}
-}
-JSON
-echo; echo "wrote $OUT/area.json"
+cat > "$OUT/area.yaml" <<YAML
+tool: yosys $(yosys -V | awk '{print $2}')
+baseline:
+  ice40_lut4: $b_lut
+  ice40_ff: $b_dff
+  generic_cells: $b_gen
+extended:
+  ice40_lut4: $e_lut
+  ice40_ff: $e_dff
+  generic_cells: $e_gen
+accel_only:
+  ice40_lut4: $a_lut
+  generic_cells: $a_gen
+YAML
+echo; echo "wrote $OUT/area.yaml"

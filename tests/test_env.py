@@ -2,10 +2,10 @@
 
 Confirms the repository is set up corresponding to the design's requirements:
 imports resolve, the toolchain matches each node's expectations, typed artifacts
-round-trip through JSON (nested dataclasses included), the mechanical edges
+round-trip through YAML (nested dataclasses included), the mechanical edges
 (Gate 1, link 1, Gate 2, link 2) run — and reject what they are supposed to
 reject — the durable store works, and the sealed MCP tools accept/validate the
-agents' JSON.
+agents' replies.
 
 Run directly (``python tests/test_env.py``) or under pytest
 (``pytest -q tests/test_env.py``). Each check degrades to a report rather than
@@ -17,6 +17,7 @@ crashing the run, so a partial toolchain still yields a readable summary.
 from __future__ import annotations
 
 import json
+import dataclasses
 import os
 import shutil
 import sys
@@ -32,7 +33,8 @@ sys.path.insert(0, _REPO_ROOT)
 _TMP_DB = tempfile.mkdtemp(prefix="red-test-db-")
 os.environ["RED_DB_ROOT"] = _TMP_DB
 
-from red import constants, db_node, iss, nodes, state_def       # noqa: E402
+from red import (constants, cost, db_node, iss, nodes, rsi,  # noqa: E402
+                 state_def, structure)
 from red.constants import (                                     # noqa: E402
     COVERAGE_TARGET,
     EXAMPLE_CFLAGS,
@@ -50,9 +52,9 @@ def _designer_tool(name: str, **over):
     """A DesignerTool with every sealed path defaulted into the temp DB."""
     paths = dict(
         source_roots=[EXAMPLE_PROJECT, EXAMPLE_CORE],
-        profile_path=os.path.join(_TMP_DB, "profile.json"),
-        report_path=os.path.join(_TMP_DB, "HotLoopReport.json"),
-        spec_path=os.path.join(_TMP_DB, "ISASpec.json"),
+        profile_path=os.path.join(_TMP_DB, "profile.yaml"),
+        report_path=os.path.join(_TMP_DB, "HotLoopReport.yaml"),
+        spec_path=os.path.join(_TMP_DB, "ISASpec.yaml"),
         status_path=os.path.join(_TMP_DB, "status.md"),
         knowledge_path=os.path.join(_TMP_DB, "knowledge.md"),
         sentinel_path=os.path.join(_TMP_DB, "finished"),
@@ -67,6 +69,33 @@ def _check(name: str, fn) -> None:
         _results.append((name, True, "ok"))
     except Exception as exc:  # noqa: BLE001 — report and continue
         _results.append((name, False, f"{type(exc).__name__}: {exc}"))
+
+
+def _raises(exc, fn) -> bool:
+    """True if *fn* raises *exc*. Used where the specific exception is the
+    point — a guard that refused for the wrong reason has not been tested."""
+    try:
+        fn()
+    except exc:
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+    return False
+
+
+def _rejects(fn) -> bool:
+    """True if *fn* raises the validator's rejection, rather than accepting.
+
+    ``validate_*`` signals every schema violation as TypeError/ValueError, and
+    the tool boundary turns that into ``Rejected: ...`` for the agent. A test
+    that only checked "no exception" would pass on a validator that had
+    stopped checking anything.
+    """
+    try:
+        fn()
+    except (TypeError, ValueError):
+        return True
+    return False
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -254,18 +283,18 @@ def test_state_roundtrip() -> None:
     state_def.validate_hot_loop_report(rep)
     state_def.validate_isa_spec(spec)
 
-    rep2 = state_def.from_json(state_def.to_json(rep), state_def.HotLoopReport)
+    rep2 = state_def.from_yaml(state_def.to_yaml(rep), state_def.HotLoopReport)
     _require(isinstance(rep2.loops[0], state_def.HotLoop),
              "HotLoopReport.loops must rebuild to HotLoop objects")
     state_def.validate_hot_loop_report(rep2)
     _require(abs(rep2.coverage - 0.9) < 1e-9, "coverage survives round-trip")
 
-    spec2 = state_def.from_json(state_def.to_json(spec), state_def.ISASpec)
+    spec2 = state_def.from_yaml(state_def.to_yaml(spec), state_def.ISASpec)
     _require(isinstance(spec2.instructions[0], state_def.InstructionSpec),
              "ISASpec.instructions must rebuild to InstructionSpec objects")
     state_def.validate_isa_spec(spec2)
 
-    g = state_def.from_json(state_def.to_json(
+    g = state_def.from_yaml(state_def.to_yaml(
         state_def.GateResult(gate="gate1", passed=True, detail="ok")),
         state_def.GateResult)
     _require(g.passed and g.gate == "gate1", "GateResult round-trip")
@@ -281,7 +310,7 @@ def test_gate1() -> None:
 
 def test_link1_accepts_sound_models() -> None:
     """Link 1 builds every C model and stress-runs it under ASan+UBSan."""
-    l1 = nodes.link1(state_def.to_json(_report()), state_def.to_json(_spec()),
+    l1 = nodes.link1(state_def.to_yaml(_report()), state_def.to_yaml(_spec()),
                      work_dir=os.path.join(_TMP_DB, "link1-ok"))
     _require(l1.passed, f"link1 must pass on sound models: {l1.detail} "
                         f"{l1.counterexample or ''}")
@@ -299,14 +328,14 @@ def test_link1_rejects_broken_model() -> None:
         pseudocode="rd[i] = rs1[i mod 4] for i in 0..4",
         mac_ops=0, replaces="uECC_vli_mult::inner", invocations=1,
         c_model=_OOB_MODEL)]
-    l1 = nodes.link1(state_def.to_json(_report()), state_def.to_json(spec),
+    l1 = nodes.link1(state_def.to_yaml(_report()), state_def.to_yaml(spec),
                      work_dir=os.path.join(_TMP_DB, "link1-oob"))
     _require(not l1.passed, "link1 must reject an out-of-bounds C model")
     _require(l1.counterexample, "a link1 failure must carry a counterexample")
 
     thin = _report()
     thin.coverage = 0.30
-    l1b = nodes.link1(state_def.to_json(thin), state_def.to_json(_spec()),
+    l1b = nodes.link1(state_def.to_yaml(thin), state_def.to_yaml(_spec()),
                       work_dir=os.path.join(_TMP_DB, "link1-thin"))
     _require(not l1b.passed,
              f"link1 must fail below {COVERAGE_TARGET:.0%} coverage")
@@ -354,10 +383,10 @@ def test_gate2_rejects_before_running() -> None:
         _require(not ok and "spike_model" in detail,
                  f"a missing spike_model must fail Gate 2, got: {detail}")
 
-    g2 = nodes.gate2(state_def.to_json(_spec()), os.path.join(_TMP_DB, "g2-node"))
+    g2 = nodes.gate2(state_def.to_yaml(_spec()), os.path.join(_TMP_DB, "g2-node"))
     _require(isinstance(g2, state_def.GateResult), "gate2 returns a GateResult")
     _require(not g2.passed, "gate2 must never pass a spec with no ISS models")
-    l2 = nodes.link2(state_def.to_json(g2))
+    l2 = nodes.link2(state_def.to_yaml(g2))
     _require(l2.passed == g2.passed, "link2 mirrors gate2")
     _results.append(("gate2 toolchain", True,
                      iss.toolchain_status()[1] if not ready else "spike ready"))
@@ -450,19 +479,19 @@ def test_spec_tool_normalizes_nested_encoding() -> None:
     draft that is right in substance but differently shaped."""
     spec = _spec()
     ins = spec.instructions[0]
-    payload = json.loads(state_def.to_json(spec))
+    payload = state_def.loads(state_def.to_yaml(spec))
     payload["instructions"][0]["encoding"] = {
         "opcode": "custom-0", "funct3": "110", "funct7": "0000011"}
     payload["instructions"][0]["opcode"] = ""
     payload["instructions"][0]["funct3"] = ""
     payload["instructions"][0]["funct7"] = ""
 
-    path = os.path.join(_TMP_DB, "ISASpec-nested.json")
+    path = os.path.join(_TMP_DB, "ISASpec-nested.yaml")
     tool = _designer_tool("red_spec_nested", spec_path=path)
     try:
-        out = tool.write_spec(json.dumps(payload))
+        out = tool.write_spec(state_def.to_yaml(payload))
         _require("Accepted" in out, f"nested encoding must be accepted: {out}")
-        back = state_def.from_json(tool.read_spec(), state_def.ISASpec)
+        back = state_def.from_yaml(tool.read_spec(), state_def.ISASpec)
         got = back.instructions[0]
         _require(got.opcode == "custom-0" and got.funct3 == "110"
                  and got.funct7 == "0000011" and isinstance(got.encoding, str),
@@ -503,16 +532,16 @@ def test_a1_profile_workload() -> None:
 def test_db_store() -> None:
     n, path = db_node.claim_run(EXAMPLE_WORKLOAD)
     _require(os.path.isdir(path), "claim_run creates a sweep dir")
-    db_node.put(path, "profile.json", '{"a": 1}', workload=EXAMPLE_WORKLOAD)
+    db_node.put(path, "profile.yaml", "a: 1\n", workload=EXAMPLE_WORKLOAD)
     db_node.write_text(path, "summary.md", "# hi", workload=EXAMPLE_WORKLOAD)
-    _require(os.path.isfile(os.path.join(path, "profile.json")), "put writes the file")
+    _require(os.path.isfile(os.path.join(path, "profile.yaml")), "put writes the file")
     _require(os.path.isfile(os.path.join(path, "summary.md")), "write_text writes the file")
 
 
 def test_sealed_tools() -> None:
-    report_path = os.path.join(_TMP_DB, "HotLoopReport.json")
-    spec_path = os.path.join(_TMP_DB, "ISASpec.json")
-    profile_path = os.path.join(_TMP_DB, "profile.json")
+    report_path = os.path.join(_TMP_DB, "HotLoopReport.yaml")
+    spec_path = os.path.join(_TMP_DB, "ISASpec.yaml")
+    profile_path = os.path.join(_TMP_DB, "profile.yaml")
     tag = "test"
     # One server carries the designer's whole surface (red/tools.py).
     dsn = _designer_tool(f"red_dsn_{tag}", profile_path=profile_path,
@@ -521,16 +550,18 @@ def test_sealed_tools() -> None:
         _require("uECC.c" in dsn.list_sources(),
                  "list_sources finds the project sources")
 
-        accepted = dsn.write_report(state_def.to_json(_report()))
-        _require("Accepted" in accepted, f"write_report accepts valid JSON: {accepted!r}")
-        rep2 = state_def.from_json(dsn.read_report(), state_def.HotLoopReport)
+        accepted = dsn.write_report(state_def.to_yaml(_report()))
+        _require("Accepted" in accepted,
+                 f"write_report accepts a valid report: {accepted!r}")
+        rep2 = state_def.from_yaml(dsn.read_report(), state_def.HotLoopReport)
         _require(isinstance(rep2.loops[0], state_def.HotLoop),
                  "read_report rebuilds nested loops")
         rejected = dsn.write_report('{"workload": "x"}')  # missing loops -> invalid
-        _require("Rejected" in rejected, "write_report rejects malformed JSON")
+        _require("Rejected" in rejected, "write_report rejects a malformed report")
 
-        accepted = dsn.write_spec(state_def.to_json(_spec()))
-        _require("Accepted" in accepted, f"write_spec accepts valid JSON: {accepted!r}")
+        accepted = dsn.write_spec(state_def.to_yaml(_spec()))
+        _require("Accepted" in accepted,
+                 f"write_spec accepts a valid spec: {accepted!r}")
         # The point is one server for the whole designer surface, not a
         # particular number of methods on it.
         for m in dsn.METHODS:
@@ -877,8 +908,8 @@ def test_review_adjudicates_instead_of_redrawing() -> None:
     _require("first review" in review._prior_digest(None, "benefit"),
              "the first round must say so plainly")
 
-    charter = review._charter("benefit", state_def.to_json(_spec()),
-                              state_def.to_json(_report()), EXAMPLE_CORE,
+    charter = review._charter("benefit", state_def.to_yaml(_spec()),
+                              state_def.to_yaml(_report()), EXAMPLE_CORE,
                               None, prior)
     _require("claims the wrong loop" in charter and "${" not in charter,
              "the prior round must reach the charter fully substituted")
@@ -911,7 +942,7 @@ def test_review_parses_agent_replies() -> None:
                                 instruction="mac96", finding="net slowdown")])
     _require(rep.blocking() == 1 and len(rep.actionable()) == 1, "severity accounting")
     _require("BLOCKING" in review.render(rep), "render surfaces blocking findings")
-    back = state_def.from_json(state_def.to_json(rep), state_def.ReviewReport)
+    back = state_def.from_yaml(state_def.to_yaml(rep), state_def.ReviewReport)
     _require(isinstance(back.findings[0], state_def.ReviewFinding),
              "ReviewReport round-trips like every other artifact")
 
@@ -920,12 +951,12 @@ def test_review_charters_are_complete() -> None:
     """Every reviewer needs a charter, and the shared frame must have no
     unsubstituted placeholders left once the loop fills it in."""
     from red import review
-    spec_json = state_def.to_json(_spec())
-    report_json = state_def.to_json(_report())
+    spec_yaml = state_def.to_yaml(_spec())
+    report_yaml = state_def.to_yaml(_report())
     for reviewer in review.REVIEWERS:
-        text = review._charter(reviewer, spec_json, report_json, EXAMPLE_CORE)
+        text = review._charter(reviewer, spec_yaml, report_yaml, EXAMPLE_CORE)
         _require("${" not in text, f"{reviewer} charter has an unsubstituted placeholder")
-        _require(spec_json[:40] in text, f"{reviewer} charter must carry the spec")
+        _require(spec_yaml[:40] in text, f"{reviewer} charter must carry the spec")
         _require("uECC_vli_mult" in text or "loop" in text,
                  f"{reviewer} charter must carry the hot loops")
     _results.append(("review sub-agents", True,
@@ -1048,16 +1079,16 @@ def test_report_is_frozen_after_gate1() -> None:
                                  body="b", ir="i", dynamic_cycles=100,
                                  calls=10, cycle_share=0.9)])
     with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "HotLoopReport.json")
+        path = os.path.join(d, "HotLoopReport.yaml")
 
         class _Bare(tools._ReportMixin):
             report_path = path
 
         t = _Bare()
-        _require("Accepted" in t.write_report(state_def.to_json(rep)),
+        _require("Accepted" in t.write_report(state_def.to_yaml(rep)),
                  "A1 must be able to write the report before Gate 1")
         open(path + ".frozen", "w").close()
-        verdict = t.write_report(state_def.to_json(rep))
+        verdict = t.write_report(state_def.to_yaml(rep))
         _require(verdict.startswith("Rejected"),
                  f"once frozen the report must be read-only (got {verdict!r})")
         _require("frozen after Gate 1" in verdict,
@@ -1398,7 +1429,7 @@ def test_source_extensions_cover_the_projects_real_arithmetic() -> None:
 def test_knowledge_graph_accumulates_across_runs() -> None:
     """The graph exists so run N+1 can see what run N tried.
 
-    Everything else RED writes is per-run JSON under output/, which the operator
+    Everything else RED writes is per-run YAML under output/, which the operator
     deletes between batches; nothing connected the instruction being designed to
     earlier attempts at the same kernel. This exercises the whole path against a
     real Neo4j: two runs, the same kernel named differently by each, and the
@@ -1827,16 +1858,16 @@ def test_security_tool_cannot_edit_what_it_reviews() -> None:
 
     work = tempfile.mkdtemp(prefix="red-test-sec-tool-")
     try:
-        spec_path = os.path.join(work, "ISASpec.json")
+        spec_path = os.path.join(work, "ISASpec.yaml")
         with open(spec_path, "w") as f:
-            f.write(state_def.to_json(state_def.ISASpec(
+            f.write(state_def.to_yaml(state_def.ISASpec(
                 name="s", instructions=[_sec_ins("clean", _SEC_CLEAN)])))
-        findings = os.path.join(work, "agent.json")
+        findings = os.path.join(work, "agent.yaml")
         # Built without starting the actor: this is about the method surface,
         # and a Ray actor per assertion is minutes of test time.
         tool = object.__new__(SecurityTool)
         tool.spec_path = spec_path
-        tool.core_path = os.path.join(work, "CoreProfile.json")
+        tool.core_path = os.path.join(work, "CoreProfile.yaml")
         tool.security_path = os.path.join(work, "report.md")
         tool.findings_path = findings
         tool.probe_dir = work
@@ -1863,7 +1894,7 @@ def test_security_tool_cannot_edit_what_it_reviews() -> None:
                                    '"evidence": "e", "fix": "z"}]')
         _require("Recorded 1" in out, out)
         with open(findings) as f:
-            saved_f = json.load(f)
+            saved_f = state_def.loads(f.read())
         _require(saved_f[0]["severity"] == "major" and
                  saved_f[0]["confidence"] == "agent",
                  f"the tool must record it as advisory: {saved_f[0]}")
@@ -1901,6 +1932,1286 @@ def test_every_tool_a_charter_offers_actually_has_a_name() -> None:
     _results.append(("tool names", True,
                      "every method of every sealed tool resolves to a name the "
                      "charters can interpolate"))
+
+
+def test_yaml_11_cannot_silently_retype_an_encoding_field() -> None:
+    """Every encoding field looks like an octal literal, so quoting is not
+    cosmetic.
+
+    In YAML 1.1 a bare ``0000011`` is the integer 9 and ``000`` is 0, and the
+    same resolver turns ``yes``/``no``/``on``/``off`` into booleans. An
+    InstructionSpec's funct3, funct7 and opcode bits are exactly those shapes.
+    If the emitter ever stopped quoting them, a spec would round-trip through
+    disk into a different instruction with no error anywhere, which is the
+    worst failure this repository could have. Assert the quoting, and assert
+    that a file which *does* leave them bare is rejected rather than accepted
+    with the wrong type.
+    """
+    import yaml
+
+    hazards = ["000", "0000011", "0001011", "0101011", "1011011", "1111011",
+               "yes", "no", "on", "off", "true", "false", "null", "~",
+               "0b101", "1_000", "12:30", "1.0", "0x1f", ".inf", "-"]
+    for raw in hazards:
+        dumped = state_def.to_yaml({"v": raw})
+        back = state_def.loads(dumped)["v"]
+        _require(back == raw and isinstance(back, str),
+                 f"{raw!r} round-tripped as {back!r} ({type(back).__name__}); "
+                 f"emitted as {dumped.strip()!r}")
+
+    # A whole spec, through disk, with the encoding fields intact.
+    spec = _spec()
+    spec.instructions[0].funct3 = "000"
+    spec.instructions[0].funct7 = "0000011"
+    back = state_def.from_yaml(state_def.to_yaml(spec), state_def.ISASpec)
+    got = back.instructions[0]
+    _require(got.funct3 == "000" and got.funct7 == "0000011",
+             f"encoding fields changed on the round trip: "
+             f"funct3={got.funct3!r} funct7={got.funct7!r}")
+
+    # And the hand-written form that YAML 1.1 retypes must not slip through.
+    bare = yaml.safe_load("funct7: 0000011\n")["funct7"]
+    _require(bare == 9,
+             f"sanity: YAML 1.1 reads a bare 0000011 as octal 9, got {bare!r}")
+    hand = state_def.to_yaml(spec).replace("funct7: '0000011'",
+                                           "funct7: 0000011")
+    try:
+        state_def.validate_isa_spec(
+            state_def.from_yaml(hand, state_def.ISASpec))
+        raise AssertionError(
+            "a spec whose funct7 lost its quotes was accepted; the validator "
+            "must catch the retyped field")
+    except ValueError as exc:
+        _require("funct7" in str(exc) and "string" in str(exc),
+                 f"and say which field and why: {exc}")
+
+    _results.append(("YAML 1.1 types", True,
+                     f"{len(hazards)} hazardous scalars stay strings; "
+                     "an unquoted encoding field is rejected, not retyped"))
+
+
+def test_block_scalars_survive_the_round_trip() -> None:
+    """Source fields are emitted as readable blocks and come back byte-exact.
+
+    The whole point of the format is that a ``c_model`` reads as C. That is
+    worth nothing if the block style loses a character, and the cases where it
+    would (a line ending in whitespace, an embedded tab or CR) are exactly the
+    ones a hand-edited model is likely to contain.
+    """
+    cases = {
+        "plain C":       "void f(const uint32_t in[2], uint32_t out[2]) {\n  out[0] = in[0];\n}\n",
+        "no final nl":   "line one\nline two",
+        "trailing ws":   "line one   \nline two\n",
+        "embedded tab":  "a\n\tb\n",
+        "blank lines":   "a\n\n\nb\n",
+        "leading space": "  indented\nflush\n",
+        "crlf":          "a\r\nb\n",
+        "unicode":       "/* \u00b5-op \u2014 caf\u00e9 */\nint x;\n",
+    }
+    dumped = state_def.to_yaml(cases)
+    back = state_def.loads(dumped)
+    for label, text in cases.items():
+        _require(back[label] == text,
+                 f"{label} did not survive: {back[label]!r} != {text!r}")
+
+    # The common case must actually use block style, or the format buys nothing.
+    _require("|" in dumped.split("plain C:")[1].split("\n")[0],
+             f"a multi-line C model should emit as a block scalar:\n{dumped[:300]}")
+
+    spec = _spec()
+    _require("c_model: |" in state_def.to_yaml(spec).replace("  ", ""),
+             "a real spec's c_model should be a block scalar")
+    _results.append(("block scalars", True,
+                     f"{len(cases)} multi-line shapes round-trip byte-exact; "
+                     "C models emit as readable blocks"))
+
+
+def test_the_isaspec_format_document_matches_the_validator() -> None:
+    """Every YAML block in ISASPEC_FORMAT.md must parse, and the worked
+    example must be exactly what the emitter produces.
+
+    A format document whose example the real validator rejects is worse than
+    no document: it is read as authoritative and is wrong. The example is
+    small enough to check, so check it rather than trusting that it was right
+    when it was written.
+    """
+    import re
+
+    path = os.path.join(_REPO_ROOT, "ISASPEC_FORMAT.md")
+    _require(os.path.isfile(path), "ISASPEC_FORMAT.md is present")
+    md = open(path).read()
+
+    blocks = re.findall(r"```yaml\n(.*?)```", md, re.S)
+    _require(blocks, "the document shows at least one YAML block")
+    specs = 0
+    for i, block in enumerate(blocks):
+        try:
+            obj = state_def.loads(block)
+        except ValueError as exc:
+            raise AssertionError(
+                f"YAML block {i} in ISASPEC_FORMAT.md does not parse: {exc}")
+        if isinstance(obj, dict) and "instructions" in obj:
+            state_def.validate_isa_spec(
+                state_def.from_yaml(block, state_def.ISASpec))
+            specs += 1
+    _require(specs >= 1,
+             "the document carries a complete, valid worked example")
+    # The example must be what RED would actually emit, not a hand-typed
+    # approximation of it, or the two drift the first time the emitter changes.
+    for block in blocks:
+        obj = state_def.loads(block)
+        if isinstance(obj, dict) and "instructions" in obj:
+            spec = state_def.from_yaml(block, state_def.ISASpec)
+            _require(state_def.to_yaml(spec).strip() == block.strip(),
+                     "the worked example is not byte-identical to what "
+                     "to_yaml produces for it; regenerate it")
+
+    # The opcode table in the document is copied from the code; if the code
+    # grows a fifth custom opcode the table silently goes stale.
+    for name, bits in state_def.CUSTOM_OPCODE_BITS.items():
+        _require(f"`{name}` | `{bits}`" in md,
+                 f"the opcode table is missing {name} -> {bits}")
+
+    _results.append(("ISASpec format doc", True,
+                     f"{len(blocks)} YAML block(s) parse, {specs} validate "
+                     "and match the emitter, opcode table matches the code"))
+
+
+def test_a_register_to_register_instruction_is_expressible() -> None:
+    """The format must be able to describe a RISC primitive, not only a
+    memory-block accelerator.
+
+    Every instruction RED had ever designed took two memory addresses and
+    returned a block, because that was the only ABI the validator, the Spike
+    wrapper, the firmware and the cost model knew. A spec that cannot express
+    ``sha256sig0 rd, rs1`` cannot describe most of the ratified RISC-V
+    extensions, and an agent held to it will keep producing one opcode that
+    swallows a kernel — which is exactly what it did.
+
+    What makes this cheap is that the C model signature does not change: only
+    the binding of ``in[]``/``out[]`` to machine state does. So this asserts
+    the three places that binding shows up, and that link 1's view is
+    untouched.
+    """
+    ins = state_def.InstructionSpec(
+        name="crc32.step", mnemonic="crc32.w",
+        encoding="0000000 rs2 rs1 000 rd 0001011",
+        opcode="custom-0", funct3="000", funct7="0000000",
+        form="reg", src_regs=2, words=2, operands=["rd", "rs1", "rs2"],
+        semantics="x[rd] = crc32 step of x[rs1] with x[rs2]",
+        pseudocode="X(rd) <- step(X(rs1), X(rs2))",
+        mac_ops=0, replaces="crc32::inner", invocations=1,
+        c_model=("void crc32_w_model(const uint32_t in[2], uint32_t out[2])"
+                 "{ out[0] = in[0] ^ in[1]; }"),
+        spike_model=("void crc32_w_iss(const uint32_t in[2], uint32_t out[2])"
+                     "{ out[0] = in[0] ^ in[1]; }"))
+    spec = state_def.ISASpec(name="RED-crc", instructions=[ins])
+    state_def.validate_isa_spec(spec)
+
+    # 1. The Spike side reads registers and writes rd, and touches no memory.
+    ext = iss.render_extension(spec)
+    body = ext[ext.index("red_exec_crc32_w"):]
+    body = body[:body.index("return pc + 4;")]
+    _require("MMU.load" not in body and "MMU.store" not in body,
+             "a register-form instruction must not touch memory in the ISS; "
+             f"got:\n{body}")
+    _require("in[0] = (uint32_t)RS1" in body and "in[1] = (uint32_t)(RS2)" in body,
+             f"operands must come from the register file; got:\n{body}")
+    _require("WRITE_RD(sext32(out[0]))" in body,
+             f"the result must go to rd; got:\n{body}")
+
+    # 2. The firmware issues it with register operands, not addresses.
+    fw = iss.render_rv32(ins, nvec=8, emit="", sig_words=4)
+    _require("red_in" in fw and '"r"(a), "r"(b)' in fw,
+             "the rv32 harness must pass the operands in registers")
+    _require("red_out[0] = rd_val;" in fw,
+             "the rv32 harness must take the result from rd")
+
+    # 3. It pays no operand traffic, which is the whole point.
+    _require(cost.operand_beats(ins) == 0,
+             f"a register form moves no words; got {cost.operand_beats(ins)}")
+    blk = state_def.InstructionSpec(
+        name="b", mnemonic="b", encoding="e", semantics="s", pseudocode="p",
+        form="block", words=16, replaces="r", c_model="void b_model(){}")
+    _require(cost.operand_beats(blk) == 32,
+             "a block instruction still pays 2 x words beats")
+    plat = cost.Platform()
+    _require(plat.instruction_cycles(2, 0, 0)
+             < plat.instruction_cycles(16, 0, 32),
+             "a register form must cost less than a 16-word block")
+
+    # 4. link 1 does not know the difference: same signature, same harness.
+    _require(f"{state_def.c_identifier(ins.mnemonic)}_model" in ins.c_model,
+             "the C model signature is unchanged by the form")
+
+    # 5. An immediate form is an I-type: no funct7 to decode on.
+    imm = dataclasses.replace(ins, name="i", mnemonic="crc32.i", form="reg_imm",
+                              imm_bits=2, src_regs=1, funct3="001",
+                              operands=["rd", "rs1"],
+                              c_model=("void crc32_i_model(const uint32_t in[2],"
+                                       " uint32_t out[2]){ out[0] = in[0]; }"))
+    state_def.validate_isa_spec(state_def.ISASpec(name="x", instructions=[imm]))
+    _, mask = iss.match_mask(imm)
+    _require(mask == 0x0000707F,
+             f"an I-type must not decode on funct7; mask was 0x{mask:08x}")
+    _require(iss.match_mask(ins)[1] == 0xFE00707F,
+             "an R-type still decodes on funct7")
+
+    _results.append(("register-form instructions", True,
+                     "reg/reg_imm validate, generate register-operand ISS and "
+                     "firmware, cost zero beats, and share the C model ABI"))
+
+
+def test_the_structural_check_rejects_an_accelerator_behind_an_opcode() -> None:
+    """A spec can pass every gate and still not be an ISA extension.
+
+    matrixmul converged with all five gates green — Gate 2 agreement on 10^5
+    vectors, 6.06x predicted over 99% coverage, no blocking review finding —
+    and shipped one instruction, ``fmmac.s``, that reads a 200-word block,
+    performs a complete 5x10x10 binary32 matrix multiply-accumulate and writes
+    a 200-word block back. 6,400 bits of operand state, no declared
+    architectural state, nothing left for the caller to compose. One reviewer
+    filed it as ``major``; nothing blocked.
+
+    So the judgement is made mechanically, from the spec's own fields, and it
+    is calibrated against what RED has actually shipped: the designs that are
+    shaped like extensions must stay clean, or the check is just noise.
+    """
+    # `load-store` throughout, so this isolates the *sizing* rules: a
+    # compute instruction in block form is blocked by the load/store rule
+    # whatever its width, and that is a different objection with a different
+    # fix (see test_arithmetic_may_not_address_memory).
+    def spec_of(words, n=1, **kw):
+        return state_def.ISASpec(
+            name="x", instructions=[
+                state_def.InstructionSpec(
+                    name=f"i{k}", mnemonic=f"m{k}", encoding="e",
+                    semantics="s", pseudocode="p", form="block",
+                    group="load-store", words=words,
+                    replaces="r", funct7=f"000000{k}",
+                    operands=["rd", "rs1", "rs2"],
+                    c_model=f"void m{k}_model(){{}}")
+                for k in range(n)], **kw)
+
+    def sizing(s_, **kw):
+        return [structure.rule_of(f) for f in structure.check(s_, **kw)
+                if f.severity == "blocking"]
+
+    sev = lambda s_, **kw: [f.severity for f in structure.check(s_, **kw)]
+
+    _require(structure.RULE_BLOCK_TOO_WIDE in sizing(spec_of(200)),
+             f"a 200-word operand block must be blocking; got {sizing(spec_of(200))}")
+    _require(structure.RULE_BLOCK_TOO_WIDE in sizing(spec_of(65)),
+             "65 words (2,080 bits) is past the hard bound")
+    _require(not sizing(spec_of(64)),
+             f"64 words is exactly the hard bound and must not block; "
+             f"got {sizing(spec_of(64))}")
+
+    # The two designs that are shaped like extensions stay clean.
+    for words, n in ((16, 2), (17, 3)):
+        got = [f for f in structure.check(spec_of(words, n, rationale="why"))]
+        _require(not got,
+                 f"a {n}-instruction, {words}-word extension must be clean; "
+                 f"got {[(f.severity, f.finding[:60]) for f in got]}")
+
+    # Declared state has to be reachable, or it is area nothing can use.
+    rf = state_def.RegisterFile(name="mt", count=8, width_bits=256)
+    held = spec_of(8, 2, register_files=[rf], rationale="why")
+    _require("major" in sev(held),
+             "a register file no instruction names must be a finding")
+    held.instructions[0].reads_state = ["mt"]
+    held.instructions[0].writes_state = ["mt"]
+    _require(not structure.check(held),
+             "once an instruction reaches the file, the finding must clear")
+
+    # Threading state through the operand block is the recommended pattern,
+    # not a defect: the state is visible in memory and the model stays pure.
+    threaded = spec_of(17, 2, rationale="why")
+    threaded.instructions[0].state_words = 1
+    _require(not structure.check(threaded),
+             "state threaded through in[]/out[] must not be flagged")
+
+    # False positives on real designs are the way a check like this dies: one
+    # spurious blocking finding on a good spec and the next person turns it
+    # off. The specs under eval/spec/ are the ones that were actually built as
+    # RTL and measured, so they are the strongest evidence available that the
+    # thresholds do not fire on work worth shipping. They are pinned files,
+    # not a live run directory -- an earlier version of this test read
+    # output/db/matrixmul/run_1 and started failing the moment that directory
+    # was regenerated with a design that was, correctly, clean.
+    pinned = os.path.join(_REPO_ROOT, "eval", "spec")
+    checked = 0
+    ls = 0
+    for name in sorted(os.listdir(pinned)) if os.path.isdir(pinned) else []:
+        if not name.endswith(".yaml"):
+            continue
+        try:
+            real = state_def.from_yaml(
+                open(os.path.join(pinned, name)).read(), state_def.ISASpec)
+        except (TypeError, ValueError):
+            continue            # not a spec (core profiles live here too)
+        if not real.instructions:
+            continue
+        # These were built as RTL and measured, so a *sizing* complaint about
+        # one is a false positive and the check would deserve to be turned
+        # off. A load/store complaint is not: they really are memory-operand
+        # ALU instructions, which is the defect that rule was added to name,
+        # and they predate it. Separate the two by rule id rather than by
+        # severity, or this guard quietly stops guarding anything.
+        sizing = [f for f in structure.check(real)
+                  if f.severity == "blocking"
+                  and structure.rule_of(f) != structure.RULE_LOAD_STORE]
+        _require(not sizing,
+                 f"eval/spec/{name} was built as RTL and measured, so a "
+                 f"blocking sizing finding on it is a false positive: "
+                 f"{[(structure.rule_of(f), f.finding[:60]) for f in sizing]}")
+        ls += sum(1 for f in structure.check(real)
+                  if structure.rule_of(f) == structure.RULE_LOAD_STORE)
+        checked += 1
+    detail = (f"200/65 words blocking, 64 clean; {checked} pinned spec(s) trip "
+              f"no sizing rule ({ls} load/store finding(s), expected)")
+
+    _results.append(("structural review", True, detail))
+
+
+def test_architectural_state_cannot_be_held_without_being_declared() -> None:
+    """State an extension holds has to be nameable, addressable and reachable.
+
+    The format gained register files and CSRs because a spec that keeps 3,200
+    bits of accumulator live inside one instruction and declares nothing has
+    hidden the dominant cost of the design from everyone who reviews it. The
+    declarations are only worth having if they are checked, so: a CSR must sit
+    in RISC-V's custom space rather than aliasing an architectural one, two
+    CSRs may not share an address, and an instruction may not name state the
+    spec never declared.
+    """
+    def with_state(**kw):
+        s_ = _spec()
+        for k, v in kw.items():
+            setattr(s_, k, v)
+        return s_
+
+    ok = with_state(csrs=[state_def.CSRSpec(name="xcfg", address="0x800")])
+    state_def.validate_isa_spec(ok)
+
+    for addr, why in (("0x300", "mstatus — an architectural CSR"),
+                      ("0xC00", "cycle — an architectural CSR"),
+                      ("not-a-number", "unparseable")):
+        bad = with_state(csrs=[state_def.CSRSpec(name="xcfg", address=addr)])
+        _require(_rejects(lambda: state_def.validate_isa_spec(bad)),
+                 f"a CSR at {addr} ({why}) must be rejected")
+
+    dup = with_state(csrs=[state_def.CSRSpec(name="a", address="0x800"),
+                           state_def.CSRSpec(name="b", address="0x800")])
+    _require(_rejects(lambda: state_def.validate_isa_spec(dup)),
+             "two CSRs at one address must be rejected")
+
+    undeclared = _spec()
+    undeclared.instructions[0].reads_state = ["mt"]
+    _require(_rejects(lambda: state_def.validate_isa_spec(undeclared)),
+             "an instruction may not read state the spec never declared")
+
+    for bad_rf in (state_def.RegisterFile(name="", count=1, width_bits=32),
+                   state_def.RegisterFile(name="mt", count=0, width_bits=32),
+                   state_def.RegisterFile(name="mt", count=4, width_bits=0)):
+        s_ = with_state(register_files=[bad_rf])
+        _require(_rejects(lambda: state_def.validate_isa_spec(s_)),
+                 f"a malformed register file {bad_rf} must be rejected")
+
+    sized = with_state(
+        register_files=[state_def.RegisterFile(name="mt", count=8,
+                                               width_bits=256)],
+        csrs=[state_def.CSRSpec(name="xcfg", address="0x800", width_bits=32)])
+    _require(sized.state_bits() == 8 * 256 + 32,
+             f"state_bits must total the declaration; got {sized.state_bits()}")
+
+    # A register form has no operand block, so it cannot thread state
+    # through one -- but it may name an architectural register file, which is
+    # exactly the load/store compute shape.
+    threaded = state_def.InstructionSpec(
+        name="p", mnemonic="p", encoding="e", semantics="s", pseudocode="p",
+        form="reg", words=2, operands=["rd", "rs1", "rs2"], replaces="r",
+        state_words=1, c_model="void p_model(){}")
+    _require(_rejects(lambda: state_def.validate_isa_spec(
+                 state_def.ISASpec(name="x", instructions=[threaded]))),
+             "a register form carrying state_words must be rejected")
+
+    named = state_def.InstructionSpec(
+        name="v", mnemonic="vmul", encoding="e", semantics="s", pseudocode="p",
+        opcode="custom-0", funct3="000", funct7="0000001",
+        form="reg", group="compute", words=2, operands=["rd", "rs1", "rs2"],
+        replaces="r", reads_state=["vt"], writes_state=["vt"],
+        c_model="void vmul_model(){}")
+    state_def.validate_isa_spec(state_def.ISASpec(
+        name="x", instructions=[named],
+        register_files=[state_def.RegisterFile(name="vt", count=4,
+                                               width_bits=256)]))
+
+    _results.append(("architectural state", True,
+                     "custom-space CSR addresses, no collisions, no "
+                     "undeclared references, register forms stay pure"))
+
+
+def test_several_instructions_on_one_kernel_are_charged_for_all_of_them() -> None:
+    """A decomposed extension is a pipeline, not a menu of alternatives.
+
+    Gate 3 used to keep the *best* claim when several instructions named the
+    same kernel. That was defensible while RED only ever produced one
+    instruction per kernel, and it broke the moment the structural check
+    started pushing designs toward small composable instructions: matrixmul
+    shipped xqpack2.s -> xqdot4 -> xqto.s, three register-form instructions
+    that each named multiply::matrix_product_ijk and each claimed to replace
+    essentially all of it. The gate took the best of 20.90x, 8.33x and 19.89x
+    and reported 19.22x for a kernel that has to run all three; the honest
+    figure was 4.51x.
+
+    So every instruction the spec ships for a kernel is charged, and the
+    software they displace is credited once and capped at the kernel.
+    """
+    loop = state_def.HotLoop(
+        loop_id="k::inner", source_file="k.c", function="k", body="x",
+        ir="", trip_count=1, calls=1, dynamic_cycles=1_000_000,
+        cycle_share=1.0, rank=1)
+    report = state_def.HotLoopReport(
+        workload="w", profile_method="test", loops=[loop], coverage=1.0,
+        profile_runs=[1_000_000])
+
+    def ins(mn, f7):
+        return state_def.InstructionSpec(
+            name=mn, mnemonic=mn, encoding="e", opcode="custom-0",
+            funct3="000", funct7=f7, form="reg", words=2,
+            operands=["rd", "rs1", "rs2"], semantics="s", pseudocode="p",
+            mac_ops=0, replaces="k::inner", invocations=1000,
+            c_model=f"void {mn}_model(const uint32_t in[2], uint32_t out[2])"
+                    "{ out[0] = in[0]; }")
+
+    one = cost.estimate(state_def.ISASpec(name="x", instructions=[ins("a", "0000001")]),
+                        report)
+    three = cost.estimate(
+        state_def.ISASpec(name="x", instructions=[ins("a", "0000001"),
+                                                  ins("b", "0000010"),
+                                                  ins("c", "0000011")]),
+        report)
+
+    _require(three.app_speedup < one.app_speedup,
+             "three instructions doing the same work as one cannot be faster "
+             f"than one: one={one.app_speedup:.2f}x three={three.app_speedup:.2f}x")
+
+    # Each runs the same number of times at the same cost, so three of them
+    # cost three times as much hardware time on that kernel. With the kernel
+    # fully replaced, the speedup should fall by about a factor of three.
+    ratio = one.app_speedup / max(three.app_speedup, 1e-9)
+    _require(2.5 < ratio < 3.5,
+             f"three identical instructions should cost about 3x one; "
+             f"got {ratio:.2f}x ({one.app_speedup:.2f} -> {three.app_speedup:.2f})")
+
+    # And the single-instruction case — the only one with RTL to calibrate
+    # against — must be untouched by all of this.
+    _require(abs(one.app_speedup - cost.estimate(
+                 state_def.ISASpec(name="x", instructions=[ins("a", "0000001")]),
+                 report).app_speedup) < 1e-9,
+             "pricing a one-instruction design must be deterministic")
+
+    _results.append(("pipeline pricing", True,
+                     f"3 instructions on one kernel cost {ratio:.1f}x one, "
+                     "not the best of the three"))
+
+
+def test_a_register_file_extension_is_expressible_and_testable() -> None:
+    """A matrix-extension shape has to be describable *and* executable.
+
+    Declaring `register_files` is architecture; the question is whether the
+    verification can run it. It can, without any harness change, because a
+    model that holds its file in file-scope state keeps it between calls while
+    the signature stays `f(in[], out[])`. Gate 2 then drives both models from
+    reset with the same vector sequence and compares outputs, so a divergent
+    state transition shows up as a divergent output.
+
+    This pins the two conditions that make that work, because a spec that
+    misses either gets a green Gate 2 that tested nothing.
+    """
+    rf = state_def.RegisterFile(name="mt", count=1, width_bits=128,
+                                purpose="accumulator tile", reset="zero")
+
+    # A register-to-register compute that accumulates into the file. It must
+    # be `reg` form: an instruction that took a memory address and did this
+    # arithmetic would be a memory-operand ALU operation, which the load/store
+    # rule rejects — the state lives in the file, not at an address.
+    def spec_with(model):
+        ins = state_def.InstructionSpec(
+            name="macc", mnemonic="macc", encoding="e", opcode="custom-0",
+            funct3="000", funct7="0000000", form="reg", group="compute",
+            words=2, operands=["rd", "rs1", "rs2"], semantics="s",
+            pseudocode="p", replaces="r", c_model=model,
+            reads_state=["mt"], writes_state=["mt"])
+        return state_def.ISASpec(name="RED-mt", rationale="why",
+                                 register_files=[rf], instructions=[ins])
+
+    stateful = """
+static uint32_t mt[4];
+void macc_model(const uint32_t in[2], uint32_t out[2])
+{
+    mt[0] += in[0];
+    mt[1] += in[1];
+    mt[2] ^= mt[0];
+    mt[3] ^= mt[1];
+    out[0] = mt[2] + mt[3];
+}
+"""
+    spec = spec_with(stateful)
+    state_def.validate_isa_spec(spec)
+    _require(not structure.check(spec),
+             f"a declared, reachable register file must be clean; got "
+             f"{[(f.severity, f.finding[:70]) for f in structure.check(spec)]}")
+    _require(spec.state_words() == 4,
+             f"128 bits is 4 words; got {spec.state_words()}")
+
+    # A file no instruction reaches is area the design cannot use.
+    unreachable = spec_with(stateful)
+    unreachable.instructions[0].reads_state = []
+    unreachable.instructions[0].writes_state = []
+    _require(any(f.severity == "major" for f in structure.check(unreachable)),
+             "a register file no instruction names must be reported")
+
+    # And the state has to actually survive between invocations, or the whole
+    # pattern is an operand block with extra words. Build the real harness and
+    # check that losing the state changes the signature Gate 2 compares.
+    import subprocess, tempfile
+    ins = spec.instructions[0]
+    src = iss.render_native(ins, nvec=8, emit=iss._emit_blocks("native"))
+    _require("static uint32_t mt[4];" in src,
+             "the model's own state must reach the generated harness verbatim")
+    with tempfile.TemporaryDirectory() as d:
+        sigs = {}
+        for tag, text in (("stateful", src),
+                          ("stateless", src.replace(
+                              "    mt[0] += in[0];",
+                              "    mt[0] = 0; mt[1] = 0; mt[2] = 0; mt[3] = 0;\n"
+                              "    mt[0] += in[0];"))):
+            c = os.path.join(d, f"{tag}.c")
+            exe = os.path.join(d, tag)
+            open(c, "w").write(text)
+            build = subprocess.run(["cc", "-std=c99", "-O1", "-o", exe, c],
+                                   capture_output=True, text=True)
+            _require(build.returncode == 0,
+                     f"the {tag} harness must compile; cc said:\n{build.stderr[-500:]}")
+            run = subprocess.run([exe], capture_output=True, text=True)
+            _require(run.returncode == 0, f"the {tag} harness must run")
+            sigs[tag] = run.stdout.strip()
+        _require(sigs["stateful"] and sigs["stateful"] != sigs["stateless"],
+                 "a model that loses its state between invocations must produce "
+                 f"a different signature, or Gate 2 cannot see the difference; "
+                 f"both gave {sigs['stateful']!r}")
+
+    _results.append(("register-file extensions", True,
+                     "declared, reachable and executable; persistent state "
+                     f"changes the Gate-2 signature ({sigs['stateful']} vs "
+                     f"{sigs['stateless']})"))
+
+
+def test_the_core_analyst_can_see_the_rtl_that_builds_the_target() -> None:
+    """A0 has to be able to read the machine it is describing.
+
+    The core source root is the vendor's submodule: a parameterised module
+    whose defaults are RV32I with no multiplier, no divider and no coprocessor
+    port. The machine RED actually designs for is the wrapper that
+    instantiates it with ENABLE_FAST_MUL=1, ENABLE_DIV=1 and a bus-master port
+    for the accelerator. That wrapper lives outside the submodule, and for two
+    runs it was not in the agents' source roots at all — so A0 reported the
+    defaults, said `coprocessor_memory_access: False`, and the designer
+    correctly concluded it could not write a memory-operand instruction. The
+    extension that came out was shaped by a file nobody could open.
+    """
+    from red import tools
+
+    roots = constants.core_source_roots(constants.EXAMPLE_CORE)
+    _require(constants.EXAMPLE_CORE in roots,
+             "the core's own sources must stay in scope")
+
+    probe = tools.DesignerTool.__new__(tools.DesignerTool)
+    probe.source_roots = roots
+    index = probe._source_index()
+
+    if not os.path.isdir(constants.TARGET_RTL):
+        _results.append(("core RTL visibility", True,
+                         "skipped: no eval/rtl in this checkout"))
+        return
+
+    rtl = [os.path.basename(p) for p in index
+           if os.path.abspath(index[p]).startswith(
+               os.path.abspath(constants.TARGET_RTL))]
+    _require(rtl, f"no file from {constants.TARGET_RTL} is reachable; A0 "
+                  "cannot see the configuration it is meant to report")
+
+    # The specific fact that was wrong: the wrapper enables the multiplier and
+    # gives the accelerator a memory port. Read it the way the agent would.
+    hit = next((p for p in index if p.endswith("red_core.v")), None)
+    _require(hit, f"red_core.v is not listed; listed RTL is {sorted(rtl)}")
+    body = probe.read_source(hit)
+    for fact in ("ENABLE_FAST_MUL", "ENABLE_DIV", "picorv32 #("):
+        _require(fact in body,
+                 f"read_source({hit!r}) returned something that is not the "
+                 f"wrapper: {fact!r} missing")
+    _require("mem_valid" in body,
+             "the wrapper should show the memory interface the accelerator uses")
+
+    _results.append(("core RTL visibility", True,
+                     f"{len(rtl)} target RTL file(s) reachable, including "
+                     f"{hit} with its parameter overrides"))
+
+
+def test_arithmetic_may_not_address_memory() -> None:
+    """RISC-V is a load/store architecture and the spec format has to hold
+    designs to it.
+
+    `block` form exists so an instruction can take an operand too wide for a
+    register. Nothing stopped it being used for arithmetic, so designs kept
+    arriving as memory-to-memory ALU operations — micro-ecc shipped a 16-word
+    multiply, a reduction and a subtract that each read two memory blocks and
+    wrote one. Those are VAX instructions wearing a RISC-V encoding, and no
+    amount of being correctly sized makes them not that.
+
+    The real constraint underneath is that a 256-bit field element does not
+    fit in two 32-bit registers. The architectural answer is an extension
+    register file with loads and stores, which is what the vector and matrix
+    extensions do — so the rule has to push designs there, not merely forbid
+    the shape.
+    """
+    def ins(mn, form, group, words, f7, **kw):
+        return state_def.InstructionSpec(
+            name=mn, mnemonic=mn, encoding="e", opcode="custom-0",
+            funct3="000", funct7=f7, form=form, group=group, words=words,
+            operands=["rd", "rs1", "rs2"], semantics="s", pseudocode="p",
+            replaces="r", c_model=f"void {mn}_model(){{}}", **kw)
+
+    def rules(*instructions, **kw):
+        spec = state_def.ISASpec(name="x", rationale="why",
+                                 instructions=list(instructions), **kw)
+        return {structure.rule_of(f): f.severity
+                for f in structure.check(spec)}
+
+    # Arithmetic on memory operands is blocking, at any width.
+    for words in (2, 8, 16, 31):
+        got = rules(ins("m", "block", "compute", words, "0000001"))
+        _require(got.get(structure.RULE_LOAD_STORE) == "blocking",
+                 f"a {words}-word memory-operand compute must be blocking; "
+                 f"got {got}")
+    _require(rules(ins("r", "block", "reduction", 8, "0000001")
+                   ).get(structure.RULE_LOAD_STORE) == "blocking",
+             "a reduction is arithmetic too")
+
+    # Loads, stores and moves are exactly what may touch memory.
+    for group in structure.MEMORY_GROUPS:
+        got = rules(ins("l", "block", group, 16, "0000001"),
+                    ins("c", "reg", "compute", 2, "0000010"))
+        _require(structure.RULE_LOAD_STORE not in got,
+                 f"a {group} instruction is allowed to address memory; got {got}")
+
+    # `group` is the designer's own label, so the exemption it buys must be
+    # checked against something the designer does not control. A load that
+    # declares multiplies is a compute instruction wearing a load's label.
+    for group in structure.MEMORY_GROUPS:
+        got = rules(ins("l", "block", group, 16, "0000001", mac_ops=64))
+        _require(got.get(structure.RULE_LOAD_STORE) == "blocking",
+                 f"a {group} instruction declaring 64 multiplies is "
+                 f"arithmetic, not data movement; got {got}")
+
+    # Register-to-register arithmetic is never a load/store complaint.
+    _require(structure.RULE_LOAD_STORE not in
+             rules(ins("c", "reg", "compute", 2, "0000001")),
+             "register-to-register arithmetic touches no memory")
+
+    # The shape the rule is steering toward: load into a declared file,
+    # compute on it, store back out. That must come out clean.
+    rf = state_def.RegisterFile(name="vt", count=4, width_bits=256,
+                                purpose="field elements", reset="zero")
+    family = rules(
+        ins("vld", "block", "load-store", 8, "0000001", writes_state=["vt"]),
+        ins("vmul", "reg", "compute", 2, "0000010",
+            reads_state=["vt"], writes_state=["vt"]),
+        ins("vst", "block", "load-store", 8, "0000011", reads_state=["vt"]),
+        register_files=[rf])
+    _require(not family,
+             f"a load/compute/store family over a declared register file is "
+             f"the target shape and must be clean; got {family}")
+
+    _results.append(("load/store discipline", True,
+                     "memory-operand arithmetic is blocking at any width; "
+                     "load/store/move may address memory; a load-compute-"
+                     "store family over a declared file is clean"))
+
+
+def test_an_agent_can_search_sources_without_a_shell() -> None:
+    """A sealed agent needs a way to find things, or it tries to escape.
+
+    `read_source` returns a whole file and the interesting ones are large —
+    micro-ecc's uECC.c is thousands of lines. Two micro-ecc runs were lost
+    because the designer reached for `Bash` to grep it, the seal denied the
+    call, and the agent spent its entire turn budget re-trying until the CLI
+    gave up with `error_max_turns`, producing no spec at all. The seal was
+    doing its job; what was missing was any sanctioned way to do the thing
+    the agent wanted.
+
+    So the search tool has to exist, it has to be on the tools that carry
+    sources, and the prompts have to say the shell is not there.
+    """
+    from red import tools
+    from red.constants import core_source_roots, EXAMPLE_CORE
+
+    for cls in (tools.DesignerTool, tools.WorkloadTool):
+        _require("grep_source" in cls.METHODS,
+                 f"{cls.__name__} carries sources, so it needs grep_source; "
+                 f"has {cls.METHODS}")
+
+    probe = tools.DesignerTool.__new__(tools.DesignerTool)
+    probe.source_roots = [os.path.join(_REPO_ROOT, "target_project", "micro-ecc"),
+                          *core_source_roots(EXAMPLE_CORE)]
+    if not os.path.isdir(probe.source_roots[0]):
+        _results.append(("sealed source search", True, "skipped: no micro-ecc"))
+        return
+
+    hit = probe.grep_source(r"uECC_vli_mult\b")
+    _require("uECC_vli_mult" in hit and ":" in hit,
+             f"a search for a function that exists must find it; got {hit[:200]}")
+    _require(probe.grep_source("ThisDoesNotExistAnywhere") .startswith("no match"),
+             "a search that finds nothing must say so, not error")
+    bad = probe.grep_source("unterminated[")
+    _require(bad.startswith("Rejected:"),
+             f"a malformed pattern must be rejected, not raised; got {bad[:120]}")
+
+    # Restricting to one file must not silently search everything.
+    one = probe.grep_source(r"uECC_vli_mult\b", path="uECC.c")
+    _require("asm_arm.inc" not in one,
+             "passing `path` must narrow the search")
+
+    # And the charters have to tell the agent the shell is not an option.
+    for name in ("system.md", "core.md", "workload.md"):
+        body = open(os.path.join(_REPO_ROOT, "red", "prompts", name)).read()
+        _require("grep_source" in body,
+                 f"{name} must point the agent at grep_source")
+        _require("no shell" in body.lower() or "There is no shell" in body,
+                 f"{name} must say the shell does not exist")
+
+    _results.append(("sealed source search", True,
+                     "grep_source on both source-carrying tools; matches, "
+                     "misses and bad patterns handled; charters say no shell"))
+
+
+def test_the_improver_is_told_why_a_run_failed() -> None:
+    """Metrics locate a bottleneck; findings explain it.
+
+    An improvement brief that carries only totals lets an agent say "review
+    took 71% of the time" and nothing more. One improver declined to propose
+    anything for exactly that reason — "that identifies the bottleneck, but
+    not its cause ... without those, a prompt change would guess at the
+    failure mechanism" — and it was right: the brief omitted the blocking
+    review findings, which are the one artifact that names the cause.
+
+    It also must not blow up on the artifacts it reads. gates/chain.yaml
+    holds a *list* of gate results where every other gate file holds one, and
+    assuming the singular shape raised an AttributeError straight past the
+    parse guard.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as run:
+        os.makedirs(os.path.join(run, "review"))
+        os.makedirs(os.path.join(run, "gates"))
+        rep = state_def.ReviewReport(
+            reviewers=["benefit"],
+            findings=[
+                state_def.ReviewFinding(
+                    reviewer="benefit", severity="blocking", instruction="foo",
+                    finding="slower than the software it replaces",
+                    fix="price it at the gate's number"),
+                state_def.ReviewFinding(
+                    reviewer="benefit", severity="minor", instruction="foo",
+                    finding="a nit nobody needs in the brief"),
+            ])
+        open(os.path.join(run, "review", "round1.yaml"), "w").write(
+            state_def.to_yaml(rep))
+        open(os.path.join(run, "gates", "gate3.yaml"), "w").write(
+            state_def.to_yaml(state_def.GateResult(
+                gate="gate3", passed=False, detail="predicted 0.4x")))
+        # the list-shaped one that used to crash it
+        open(os.path.join(run, "gates", "chain.yaml"), "w").write(
+            state_def.to_yaml([
+                state_def.GateResult(gate="link1", passed=True, detail="ok"),
+                state_def.GateResult(gate="link2", passed=True, detail="ok")]))
+
+        out = rsi.render_findings(run)
+        _require("slower than the software" in out,
+                 f"a blocking finding must reach the brief; got {out[:300]}")
+        _require("price it at the gate's number" in out,
+                 "the reviewer's proposed fix is the actionable half")
+        _require("a nit nobody needs" not in out,
+                 "minor findings would bury the blocking ones")
+        for gate in ("gate3", "link1", "link2"):
+            _require(gate in out, f"{gate}'s verdict must reach the brief; "
+                                  f"got {out[:400]}")
+        _require("FAIL" in out and "predicted 0.4x" in out,
+                 "a failing gate must say so, with its detail")
+
+    _require("(no run directory" in rsi.render_findings(""),
+             "a missing run directory must degrade, not raise")
+    _require(rsi.render_findings(tempfile.gettempdir()),
+             "a directory with no artifacts must still return something")
+
+    body = open(os.path.join(_REPO_ROOT, "red", "prompts", "improve.md")).read()
+    _require("${FINDINGS}" in body,
+             "improve.md must have somewhere to put them")
+
+    _results.append(("improver evidence", True,
+                     "blocking findings and their fixes reach the brief, "
+                     "minor ones do not, list- and scalar-shaped gate files "
+                     "both parse"))
+
+
+def test_the_self_improver_cannot_edit_what_judges_it() -> None:
+    """The one property that makes self-improvement safe to switch on.
+
+    Everything that scores a RED run is code in this same repository. An
+    improver able to edit ``red/cost.py`` would find that the cheapest way to
+    raise the predicted speedup is to change how speedup is predicted, and
+    every number downstream would agree with it. The standing objection to
+    self-improving systems is exactly this, so the answer has to be structural
+    rather than a line in a prompt — the improver's own brief is one of the
+    files it is allowed to rewrite.
+
+    So: the gates, the cost model, the security and structural checks, the
+    schema validators, the thresholds, the tests and the guard itself are
+    frozen; a proposal naming one is refused; and applying anything at all is
+    abandoned if the fingerprint over those files moves.
+    """
+    root = _REPO_ROOT
+
+    for judge in ("red/cost.py", "red/nodes.py", "red/security.py",
+                  "red/structure.py", "red/state_def.py", "red/iss.py",
+                  "red/review.py", "red/constants.py", "red/rsi.py",
+                  "tests/test_env.py"):
+        _require(rsi.classify(judge) == rsi.FROZEN_CLASS,
+                 f"{judge} decides whether a run was good and must be frozen; "
+                 f"classified as {rsi.classify(judge)!r}")
+    _require(rsi.classify("red/prompts/redesign.md") == rsi.MUTABLE_CLASS,
+             "the prompts are what the improver is for")
+    _require(rsi.classify("red/loop.py") == rsi.PROPOSAL_CLASS,
+             "the loop needs a human in the way, not a veto")
+
+    for bad, why in (("red/cost.py", "frozen"),
+                     ("red/loop.py", "proposal-only"),
+                     ("../outside.md", "outside the repo"),
+                     ("/etc/passwd", "absolute")):
+        p = rsi.Proposal(target=bad, new_text="anything")
+        _require(_raises(rsi.ProposalRejected,
+                         lambda: rsi.validate_proposal(p, root)),
+                 f"a proposal against {bad} ({why}) must be refused")
+
+    # The fingerprint has to actually notice a frozen file changing, or none
+    # of the above is enforced after the fact.
+    before = rsi.frozen_fingerprint(root)
+    victim = os.path.join(root, "red", "cost.py")
+    original = open(victim, encoding="utf-8").read()
+    try:
+        with open(victim, "a", encoding="utf-8") as f:
+            f.write("\n# tampering\n")
+        _require(rsi.frozen_fingerprint(root) != before,
+                 "the fingerprint did not notice a frozen file changing")
+    finally:
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write(original)
+    _require(rsi.frozen_fingerprint(root) == before,
+             "the fingerprint did not come back after the file was restored")
+
+    # A proposal that is legal but whose application moves the fingerprint is
+    # abandoned even if the tests pass -- a suite that still passes is what a
+    # successful goalpost-move looks like.
+    target = os.path.join(root, "red", "prompts", "debug.md")
+    kept = open(target, encoding="utf-8").read()
+    p = rsi.Proposal(target="red/prompts/debug.md", old_text=kept,
+                     new_text=kept + "\n<!-- rsi self-test -->\n")
+    tamper = ["python3", "-c",
+              f"open({victim!r}, 'a').write('\\n# moved\\n')"]
+    try:
+        ok, detail = rsi.apply_proposal(p, root, test_cmd=tamper, timeout=120)
+        _require(not ok and "fingerprint" in detail.lower(),
+                 f"a proposal that moves the fingerprint must be refused; "
+                 f"got ok={ok} detail={detail!r}")
+    finally:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(kept)
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write(original)
+    _require(open(target, encoding="utf-8").read() == kept,
+             "the prompt was not restored after the proposal was refused")
+    _require(rsi.frozen_fingerprint(root) == before,
+             "the tree was left tampered with")
+
+    _results.append(("self-improvement guard", True,
+                     f"{sum(len(rsi._files_under(root, f)) for f in rsi.FROZEN)} "
+                     "frozen files; frozen and proposal-only targets refused; "
+                     "fingerprint movement aborts an apply"))
+
+
+def test_a_proposal_is_kept_only_if_the_suite_still_passes() -> None:
+    """Applying a change is a bet, and the test suite settles it.
+
+    The improver writes a whole replacement file. If that file breaks
+    anything, the repository must come back exactly as it was rather than
+    half-changed, because the next run would otherwise be scored against a
+    tree nobody chose.
+    """
+    root = _REPO_ROOT
+    rel = "red/prompts/debug.md"
+    target = os.path.join(root, rel)
+    kept = open(target, encoding="utf-8").read()
+
+    # A proposal argued against a file that has since changed is stale, and
+    # applying it would silently discard whatever changed it.
+    stale = rsi.Proposal(target=rel, old_text=kept + "drift",
+                         new_text=kept + "\nx\n")
+    _require(_raises(rsi.ProposalRejected,
+                     lambda: rsi.validate_proposal(stale, root)),
+             "a proposal argued against a stale version must be refused")
+    _require(_raises(rsi.ProposalRejected, lambda: rsi.validate_proposal(
+                 rsi.Proposal(target=rel, old_text=kept, new_text=kept), root)),
+             "a proposal that changes nothing must be refused")
+
+    try:
+        failing = rsi.Proposal(target=rel, old_text=kept,
+                               new_text=kept + "\n<!-- rsi self-test -->\n")
+        ok, detail = rsi.apply_proposal(
+            failing, root, test_cmd=["python3", "-c", "raise SystemExit(1)"],
+            timeout=120)
+        _require(not ok, "a proposal must not survive a failing suite")
+        _require(failing.status == "rejected", f"status was {failing.status!r}")
+        _require(open(target, encoding="utf-8").read() == kept,
+                 "the file was not restored after the suite failed")
+
+        passing = rsi.Proposal(target=rel, old_text=kept,
+                               new_text=kept + "\n<!-- rsi self-test -->\n")
+        ok, detail = rsi.apply_proposal(
+            passing, root, test_cmd=["python3", "-c", "pass"], timeout=120)
+        _require(ok, f"a proposal must survive a passing suite; got {detail!r}")
+        _require(open(target, encoding="utf-8").read() == passing.new_text,
+                 "an applied proposal did not reach the file")
+        back, _ = rsi.revert_proposal(passing, root)
+        _require(back and open(target, encoding="utf-8").read() == kept,
+                 "revert did not restore the file")
+    finally:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(kept)
+
+    _results.append(("proposal application", True,
+                     "stale and empty proposals refused; a failing suite "
+                     "restores the file; revert restores it"))
+
+
+def test_an_improvement_has_to_be_an_improvement() -> None:
+    """Efficiency alone is trivially gained by giving up sooner.
+
+    A run that abandons synthesis after one turn is fast, cheap and worthless,
+    and every effort metric prefers it. So quality is compared first and a
+    regression in it rejects the change whatever happened to the clock — and
+    two runs judged by different frozen code are not compared at all, because
+    the thing that scored them is not the same thing.
+    """
+    base = rsi.RunMetrics(
+        workload="w", run_id="1", frozen_fingerprint="aaaa", converged=True,
+        gates_passed=5, gates_total=5, coverage=0.99, predicted_speedup=4.5,
+        turns=20, turn_seconds=3000.0, review_rounds=2)
+
+    quicker = dataclasses.replace(base, turns=14, turn_seconds=2000.0)
+    ok, why = rsi.compare(base, quicker)
+    _require(ok, f"same result for less effort is an improvement; got {why}")
+
+    gave_up = dataclasses.replace(base, converged=False, gates_passed=2,
+                                  turns=3, turn_seconds=200.0)
+    ok, why = rsi.compare(base, gave_up)
+    _require(not ok and "regress" in why,
+             f"a faster run that stopped converging is not an improvement; "
+             f"got ok={ok} {why!r}")
+
+    worse_spec = dataclasses.replace(base, predicted_speedup=2.1,
+                                     turn_seconds=100.0)
+    ok, _ = rsi.compare(base, worse_spec)
+    _require(not ok, "a worse extension produced faster is not an improvement")
+
+    louder = dataclasses.replace(base, blocking_findings=3, turn_seconds=10.0)
+    ok, _ = rsi.compare(base, louder)
+    _require(not ok, "more blocking findings is not an improvement")
+
+    moved = dataclasses.replace(quicker, frozen_fingerprint="bbbb")
+    ok, why = rsi.compare(base, moved)
+    _require(not ok and "void" in why,
+             f"runs judged by different code must not be compared; got {why!r}")
+
+    same = rsi.compare(base, dataclasses.replace(base))
+    _require(not same[0], "an identical run is not an improvement")
+
+    _results.append(("improvement comparison", True,
+                     "quality is lexicographically first; a changed frozen "
+                     "fingerprint voids the comparison"))
+
+
+def test_the_tunable_loop_knobs_stay_inside_their_bounds() -> None:
+    """The improver may retune effort, never the bar.
+
+    Each tunable caps how many rounds a stage may spend. Turning one down
+    makes a run cheaper and may make it worse, which the metrics catch. What
+    must not be reachable this way is anything that decides whether a run
+    passed: a tunables file naming the coverage target or a gate tolerance is
+    rejected rather than clamped, because a proposal that tried it is not a
+    proposal anyone wants silently half-applied.
+    """
+    root = _REPO_ROOT
+    for name in rsi.TUNABLES:
+        _require(hasattr(constants, name),
+                 f"{name} is declared tunable but red.constants has no such value")
+
+    forbidden = ("COVERAGE_TARGET", "SPEEDUP_TARGET", "GATE1_TOLERANCE",
+                 "SECURITY_VECTORS", "SPEEDUP_FLOOR", "INVOCATION_REJECT")
+    for name in forbidden:
+        _require(name not in rsi.TUNABLES,
+                 f"{name} defines the bar a run is judged against and must "
+                 "not be tunable")
+        _require(hasattr(constants, name), f"sanity: {name} should exist")
+
+    bad = ['[loop]\nCOVERAGE_TARGET = 1\n',
+           '[loop]\nREVIEW_MAX_ROUNDS = 99\n',
+           '[loop]\nREVIEW_MAX_ROUNDS = 0\n',
+           '[loop]\nREVIEW_MAX_ROUNDS = "four"\n',
+           '[gates]\nanything = 1\n',
+           'not toml at all ===\n']
+    for text in bad:
+        _require(_raises(rsi.ProposalRejected,
+                         lambda t=text: rsi._validate_tunable_text(t)),
+                 f"a tunables file of {text!r} must be refused")
+    rsi._validate_tunable_text("[loop]\nREVIEW_MAX_ROUNDS = 6\n")
+
+    # And a file that slipped past anyway is clamped on read rather than
+    # taking the loop with it, because this is parsed at import time.
+    tmp = os.path.join(_TMP_DB, "clamp")
+    os.makedirs(os.path.join(tmp, "rsi"), exist_ok=True)
+    with open(os.path.join(tmp, rsi.TUNABLES_FILE), "w") as f:
+        f.write("[loop]\nREVIEW_MAX_ROUNDS = 99\nCOVERAGE_TARGET = 0.1\n"
+                "CRITIC_MAX_ROUNDS = 5\n")
+    got = rsi.load_tunables(tmp)
+    _require(got == {"CRITIC_MAX_ROUNDS": 5},
+             f"out-of-range and unknown keys must be dropped on read; got {got}")
+    with open(os.path.join(tmp, rsi.TUNABLES_FILE), "w") as f:
+        f.write("this is not toml {{{\n")
+    _require(rsi.load_tunables(tmp) == {},
+             "a damaged tunables file must leave RED importable")
+
+    _results.append(("tunable bounds", True,
+                     f"{len(rsi.TUNABLES)} effort caps tunable; the bar is "
+                     "not reachable; out-of-range values dropped on read"))
+
+
+def test_a_run_records_what_it_cost() -> None:
+    """Self-improvement needs a measurement, and the loop is the only thing
+    that can take it.
+
+    Without per-turn telemetry the improver can only guess where a run spent
+    itself, and "the prompts feel verbose" is not evidence. Every agent turn
+    in the loop goes through one dispatch function, so that is where the
+    measurement is taken.
+    """
+    src = open(os.path.join(_REPO_ROOT, "red", "loop.py")).read()
+    _require("rsi.record_turn(" in src,
+             "red.loop must record every agent turn through red.rsi")
+    _require("rsi.reset_turns()" in src,
+             "a batch runs several projects in one process, so the turn log "
+             "must be cleared per run")
+    _require('_mirror("metrics.yaml"' in src,
+             "every run must leave a metrics.yaml for the improver to read")
+
+    rsi.reset_turns()
+    rsi.record_turn("A2 round 0", "design", "opus", 12.5, True, 400)
+    rsi.record_turn("A2 round 1", "design", "opus", 7.5, False, 0)
+    rsi.record_turn("review legality", "review", "sonnet", 4.0, True, 900)
+    m = rsi.collect_turn_metrics(rsi.RunMetrics(workload="w", run_id="1"))
+    _require(m.turns == 3 and m.failed_turns == 1,
+             f"turns={m.turns} failed={m.failed_turns}")
+    _require(abs(m.turn_seconds - 24.0) < 1e-6, f"{m.turn_seconds}")
+    _require(m.seconds_by_role == {"design": 20.0, "review": 4.0},
+             f"per-stage time is what localises a slow run; got "
+             f"{m.seconds_by_role}")
+    rsi.reset_turns()
+    _require(rsi.collect_turn_metrics(rsi.RunMetrics()).turns == 0,
+             "reset_turns did not clear the log")
+
+    # The metrics artifact has to survive the same round trip every other
+    # artifact does, or the improver cannot read yesterday's run.
+    back = state_def.from_yaml(state_def.to_yaml(m), rsi.RunMetrics)
+    _require(back.seconds_by_role == m.seconds_by_role and back.turns == m.turns,
+             "RunMetrics did not survive the YAML round trip")
+
+    _results.append(("run telemetry", True,
+                     "turns, failures and per-stage seconds recorded at the "
+                     "dispatch chokepoint and round-tripped as YAML"))
+
+
+def test_both_backends_seal_the_tool_surface_the_same_way() -> None:
+    """Whichever CLI runs a stage, the turn must be confined to its own tools.
+
+    This is the property Gate 2's independence rests on, and the two backends
+    spell it completely differently: Claude Code takes ``--strict-mcp-config``
+    plus an ``--allowedTools`` list, Codex takes ``--ignore-user-config`` plus
+    a per-server ``enabled_tools`` array. Both halves have to be present in
+    both, because dropping either one is invisible in a passing run and shows
+    up only as an agent that could read something it should not.
+
+    Measured on the real CLI during development: with Codex's allow-list in
+    place a withheld tool is unreachable, and without it the same prompt reads
+    it straight out.
+    """
+    from red.backend import ClaudeCodeLLM, CodexLLM
+    from red import modelcfg
+
+    class _FakeTool:
+        name = "red_iss"
+        METHODS = ("read_spec", "write_spec")
+        url = "http://127.0.0.1:9/red_iss/mcp"
+
+    tool = _FakeTool()
+
+    claude_argv, claude_stdin = ClaudeCodeLLM()._argv(
+        "msg", [tool], modelcfg.Routing(backend="claude"), _TMP_DB)
+    _require("--strict-mcp-config" in claude_argv,
+             "claude must drop the operator's own MCP servers")
+    allow = claude_argv[claude_argv.index("--allowedTools") + 1]
+    _require(allow == "mcp__red_iss__red_iss_read_spec,"
+                      "mcp__red_iss__red_iss_write_spec",
+             f"claude allow-list should name every method: {allow}")
+    _require(claude_stdin is None, "claude takes the prompt in argv")
+
+    codex_argv, codex_stdin = CodexLLM()._argv(
+        "msg", [tool], modelcfg.Routing(backend="codex"), _TMP_DB)
+    _require("--ignore-user-config" in codex_argv,
+             "codex must drop the operator's own MCP servers")
+    _require('mcp_servers.red_iss.enabled_tools='
+             '["red_iss_read_spec", "red_iss_write_spec"]' in codex_argv,
+             f"codex allow-list missing or malformed: {codex_argv}")
+    _require(f'mcp_servers.red_iss.url="{tool.url}"' in codex_argv,
+             "codex must be told where the server is")
+    _require(codex_argv[-1] == "-" and codex_stdin == "msg",
+             "codex takes the prompt on stdin")
+
+    # Neither backend may hand an agent a shell by way of the allow-list.
+    _require("Bash" not in allow and "Write" not in allow,
+             f"claude allow-list must contain MCP methods only: {allow}")
+
+    _results.append(("backend seal", True,
+                     "claude: strict-mcp-config + allowedTools; "
+                     "codex: ignore-user-config + enabled_tools"))
+
+
+def test_a_backend_that_is_not_installed_is_a_setup_error() -> None:
+    """A missing CLI must read as a broken environment, not a bad design.
+
+    Every stage above treats ``success=False`` as something the design did
+    wrong and spends a repair round on it. A backend that is simply absent
+    would burn the whole budget saying nothing useful, so it has to arrive
+    with a message that names the binary.
+    """
+    from red import backend as backend_mod
+
+    saved = backend_mod.CODEX_BIN
+    try:
+        backend_mod.CODEX_BIN = os.path.join(_TMP_DB, "no-such-codex")
+        res = backend_mod.CodexLLM().prompt("anything")
+    finally:
+        backend_mod.CODEX_BIN = saved
+    _require(res is not None and not res.success, "a missing CLI fails the turn")
+    _require("could not start" in res.stderr and "no-such-codex" in res.stderr,
+             f"and says which binary: {res.stderr!r}")
+    _results.append(("missing backend", True,
+                     "an uninstalled CLI names itself instead of raising"))
+
+
+def test_every_agent_stage_is_routable_to_its_own_model() -> None:
+    """A stage can only be given its own model if it names a role, and the
+    role it names has to be one the routing file can address.
+
+    These are two lists in two files and nothing but this check keeps them
+    equal. A role the loop passes but ``red.modelcfg`` does not know routes
+    silently to the default, so an operator who writes ``[roles.mining]`` for
+    ``mine`` gets no error and no effect, which is the worst of both. The
+    config loader reports unknown names for the same reason.
+    """
+    import ast
+    from red import modelcfg
+
+    # Every module that starts an agent turn, not just the loop: red.rsi
+    # dispatches the improvement turn after a run has finished, and a role
+    # used only there is still a role an operator can route.
+    DISPATCHERS = ("loop.py", "rsi.py", "review.py", "security.py")
+    passed = set()
+    for mod in DISPATCHERS:
+        path = os.path.join(_REPO_ROOT, "red", mod)
+        if not os.path.isfile(path):
+            continue
+        for node in ast.walk(ast.parse(open(path).read())):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg == "role" and isinstance(kw.value, ast.Constant) \
+                        and isinstance(kw.value.value, str) and kw.value.value:
+                    passed.add(kw.value.value)
+
+    where = ", ".join(f"red/{m}" for m in DISPATCHERS)
+    unknown = sorted(passed - set(modelcfg.ROLES))
+    _require(not unknown,
+             f"{where} dispatch role(s) {unknown} that modelcfg.ROLES "
+             "does not define, so they cannot be routed")
+    unused = sorted(set(modelcfg.ROLES) - passed)
+    _require(not unused,
+             f"modelcfg.ROLES defines {unused} but no dispatch in {where} "
+             "passes them — a routing entry that does nothing")
+
+    # And no model id may be written into the code: the whole point is that
+    # the mapping lives in a file the operator owns.
+    for mod in ("loop.py", "backend.py", "modelcfg.py", "constants.py"):
+        body = open(os.path.join(_REPO_ROOT, "red", mod)).read()
+        for needle in ("claude-opus", "claude-sonnet", "claude-haiku",
+                       "gpt-", "gemini-"):
+            _require(needle not in body,
+                     f"red/{mod} hard-codes the model id {needle!r}; "
+                     "routing belongs in models.toml")
+
+    cfg = modelcfg.load(os.path.join(_REPO_ROOT, "models.toml"))
+    _require(cfg.source, "models.toml should be present and loadable")
+    overrides = {r for r, v in cfg.routed.items() if v != cfg.fallback}
+    _require(overrides,
+             "models.toml routes every stage identically, which makes the "
+             "per-stage mechanism untested in practice")
+    _require(not cfg.unknown,
+             f"models.toml names unknown role(s) {list(cfg.unknown)}")
+    _results.append(("model routing", True,
+                     f"{len(passed)} stages routable; models.toml overrides "
+                     f"{len(overrides)} of them; no model id in code"))
+
+
+def test_a_disabled_routing_file_runs_everything_on_one_model() -> None:
+    """``--models-config ''`` must fall all the way back to --model/--effort.
+
+    This is the escape hatch a sweep uses: pin one model everywhere and
+    compare against a routed run. If the file leaked in anyway the two arms of
+    that comparison would be the same thing.
+    """
+    from red import modelcfg
+
+    off = modelcfg.load("/nonexistent/models.toml",
+                        model="some-model", effort="high")
+    _require(not off.source, "a missing file leaves no source")
+    for role in modelcfg.ROLES:
+        r = off.for_role(role)
+        _require(r.model == "some-model" and r.effort == "high",
+                 f"{role} should fall back to the caller, got {r}")
+    _require("some-model" in off.render() and "every stage" in off.render(),
+             f"the log line should say so plainly: {off.render()!r}")
+    _results.append(("routing fallback", True,
+                     "no file means one model everywhere, as --model asked"))
 
 
 def test_no_configuration_is_imported_and_then_ignored() -> None:
@@ -1991,11 +3302,21 @@ def test_gate0_tells_a_workload_from_a_unit_test() -> None:
             # count is drawn from the clock, so the two runs cannot agree. The
             # spread is deliberately large — a fixture that straddles the 2%
             # limit would pass or fail on the draw.
+            #
+            # The seed is nanoseconds, not time(NULL). time(NULL) advances once
+            # a second, so Gate 0's two back-to-back runs frequently drew the
+            # *same* seed, executed the same trip count, and agreed — and Gate
+            # 0 was then right to pass a harness that had behaved
+            # deterministically, while this test failed for asserting it would
+            # not. A fixture meant to be nondeterministic has to differ on
+            # every run, not on most of them.
             "nondeterministic": ('#include <stdio.h>\n#include <stdlib.h>\n'
                                  '#include <time.h>\n#include "lib.h"\n'
                                  'int main(void){ static uint8_t b[4096];\n'
                                  '  for (unsigned i=0;i<sizeof b;i++) b[i]=(uint8_t)(i*7+1);\n'
-                                 '  srand((unsigned)time(NULL));\n'
+                                 '  struct timespec ts;\n'
+                                 '  clock_gettime(CLOCK_MONOTONIC, &ts);\n'
+                                 '  srand((unsigned)ts.tv_nsec);\n'
                                  '  uint32_t a=0; int n=30000+(rand()%%30000);\n'
                                  '  for (int k=0;k<n;k++) a^=mix(b,sizeof b);\n'
                                  '  printf("%%u\\n",a); return 0; }\n').replace("%%", "%"),
@@ -2100,7 +3421,7 @@ def test_the_fixed_abi_is_enforced_where_it_is_cheap() -> None:
             (["rd", "rs1"], "rs2 missing"),
             ([], "no operands at all"),
             (["rs1", "rs2"], "rd missing")):
-        broken = state_def.from_json(state_def.to_json(spec), state_def.ISASpec)
+        broken = state_def.from_yaml(state_def.to_yaml(spec), state_def.ISASpec)
         broken.instructions[0].operands = bad
         try:
             state_def.validate_isa_spec(broken)
@@ -2113,14 +3434,14 @@ def test_the_fixed_abi_is_enforced_where_it_is_cheap() -> None:
     # encoding: `write_spec` itself synthesizes an encoding string when the
     # agent sends the fields nested, so a rule on that text would reject drafts
     # RED's own normalizer produces.
-    broken = state_def.from_json(state_def.to_json(spec), state_def.ISASpec)
+    broken = state_def.from_yaml(state_def.to_yaml(spec), state_def.ISASpec)
     broken.instructions[0].operands = ["rd", "rs1"]
     tool = _designer_tool("red_abi_test")
     try:
-        out = tool.write_spec(state_def.to_json(broken))
+        out = tool.write_spec(state_def.to_yaml(broken))
         _require("Rejected" in out and "rs2" in out,
                  f"write_spec must refuse it: {out[:200]}")
-        ok = tool.write_spec(state_def.to_json(spec))
+        ok = tool.write_spec(state_def.to_yaml(spec))
         _require("Accepted" in ok, f"and accept the well-formed one: {ok[:160]}")
     finally:
         tool.stop()
@@ -2379,13 +3700,13 @@ def test_a_wildly_wrong_invocations_is_refused() -> None:
     tool = _designer_tool("red_inv_test")
     try:
         with open(tool.report_path, "w") as f:
-            f.write(state_def.to_json(report))
+            f.write(state_def.to_yaml(report))
         spec = _spec()
         for ins in spec.instructions:
             ins.replaces = hot.loop_id
             ins.words = 8
             ins.invocations = 2               # ~1,250 would be consistent
-        out = tool.write_spec(state_def.to_json(spec))
+        out = tool.write_spec(state_def.to_yaml(spec))
         _require("Rejected" in out and "invocations" in out,
                  f"an order-of-magnitude error must be refused: {out[:200]}")
         _require("bytes" in out.lower(),
@@ -2393,7 +3714,7 @@ def test_a_wildly_wrong_invocations_is_refused() -> None:
 
         for ins in spec.instructions:
             ins.invocations = 1000            # within the estimator's bias
-        ok = tool.write_spec(state_def.to_json(spec))
+        ok = tool.write_spec(state_def.to_yaml(spec))
         _require("Accepted" in ok,
                  f"a plausible declaration must pass: {ok[:200]}")
     finally:
@@ -2415,7 +3736,7 @@ def test_a_secure_design_is_part_of_converging() -> None:
     _require("secure = bool(gate4 and gate4.passed)" in src and
              "and secure and" in src,
              "the convergence test must require Gate 4")
-    _require(src.index("_scan(state_def.to_json(spec)") > src.index("review_spec"),
+    _require(src.index("_scan(state_def.to_yaml(spec)") > src.index("review_spec"),
              "the shipped spec must be re-checked AFTER the review may have "
              "revised it")
 

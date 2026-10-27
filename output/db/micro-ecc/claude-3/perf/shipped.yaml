@@ -1,0 +1,93 @@
+app_speedup: 8.257070202252551
+covered_share: 0.9718466943994009
+detail: |-
+  covers 97.2% of profiled cycles; predicted whole-application speedup 8.26x
+    p256.lda: 99 cyc (16 beats, 0 MAC, 0.00 MAC/word, x2 per call) vs 602 cyc of software = 6.05x — its C model executes 162 instructions, of which 162 are not accounted for by mac_ops=0; charged as 22 sequential logic steps; invocations UNVERIFIED (~1 implied)
+    p256.ldr: 92 cyc (16 beats, 0 MAC, 0.00 MAC/word) vs 1204 cyc of software = 13.09x — its C model executes 108 instructions, of which 108 are not accounted for by mac_ops=0; charged as 15 sequential logic steps
+    p256.str: 84 cyc (16 beats, 0 MAC, 0.00 MAC/word, x2 per call) vs 602 cyc of software = 7.15x — its C model executes 52 instructions, of which 52 are not accounted for by mac_ops=0; charged as 7 sequential logic steps
+    p256.mac2: 70 cyc (0 beats, 16 MAC, 4.00 MAC/word, x4 per call) vs 2187 cyc of software = 31.36x — its C model executes 414 instructions, of which 178 are not accounted for by mac_ops=16; charged as 25 sequential logic steps
+    p256.red: 264 cyc (0 beats, 0 MAC, 0.00 MAC/word, x28 per call) vs 2483 cyc of software = 9.41x — its C model executes 1,694 instructions, of which 1,694 are not accounted for by mac_ops=0; charged as 235 sequential logic steps; invocations UNVERIFIED (~5 implied)
+    p256.subm: 80 cyc (0 beats, 0 MAC, 0.00 MAC/word) vs 1204 cyc of software = 15.13x — its C model executes 365 instructions, of which 365 are not accounted for by mac_ops=0; charged as 51 sequential logic steps; invocations UNVERIFIED (~0 implied)
+
+  **This prediction rests on an unverified declaration.** Gate 3 measures everything else it uses — the software cost from the profile, the instruction's work from its own C model — but not this:
+    - invocations=2 is the designer's declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model's 162, which is consistent with roughly 1 invocations, not 2. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?
+    - invocations=28 is the designer's declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model's 1,694, which is consistent with roughly 5 invocations, not 28. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?
+    - invocations=1 is the designer's declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model's 365, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?
+measurement_error: ''
+per_instruction:
+- beats: 16
+  cycles: 99.45370871683812
+  invocations: 2
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: p256.lda
+  note: its C model executes 162 instructions, of which 162 are not accounted for by mac_ops=0; charged as 22 sequential logic steps; invocations UNVERIFIED (~1 implied)
+  replaced_cycles: 601.9629767513646
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  speedup: 6.052695113314046
+  unverified: 'invocations=2 is the designer''s declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model''s 162, which is consistent with roughly 1 invocations, not 2. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'
+  words: 8
+- beats: 16
+  cycles: 91.96913914455874
+  invocations: 1
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: p256.ldr
+  note: its C model executes 108 instructions, of which 108 are not accounted for by mac_ops=0; charged as 15 sequential logic steps
+  replaced_cycles: 1203.9259535027293
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  speedup: 13.090542813610302
+  unverified: ''
+  words: 8
+- beats: 16
+  cycles: 84.20736329182458
+  invocations: 2
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: p256.str
+  note: its C model executes 52 instructions, of which 52 are not accounted for by mac_ops=0; charged as 7 sequential logic steps
+  replaced_cycles: 601.9629767513646
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  speedup: 7.148578856046515
+  unverified: ''
+  words: 8
+- beats: 0
+  cycles: 69.74066053059015
+  invocations: 4
+  mac_ops: 16
+  marshal_cycles: 0.0
+  mnemonic: p256.mac2
+  note: its C model executes 414 instructions, of which 178 are not accounted for by mac_ops=16; charged as 25 sequential logic steps
+  replaced_cycles: 2187.07
+  replaces: uECC_vli_mult::product_scanning
+  speedup: 31.360041378453705
+  unverified: ''
+  words: 2
+- beats: 0
+  cycles: 263.79371954520843
+  invocations: 28
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: p256.red
+  note: its C model executes 1,694 instructions, of which 1,694 are not accounted for by mac_ops=0; charged as 235 sequential logic steps; invocations UNVERIFIED (~5 implied)
+  replaced_cycles: 2482.5686784749705
+  replaces: vli_mmod_fast_secp256r1::reduction
+  speedup: 9.411022683766028
+  unverified: 'invocations=28 is the designer''s declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model''s 1,694, which is consistent with roughly 5 invocations, not 28. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'
+  words: 2
+- beats: 0
+  cycles: 79.59014618299946
+  invocations: 1
+  mac_ops: 0
+  marshal_cycles: 0.0
+  mnemonic: p256.subm
+  note: its C model executes 365 instructions, of which 365 are not accounted for by mac_ops=0; charged as 51 sequential logic steps; invocations UNVERIFIED (~0 implied)
+  replaced_cycles: 1203.9259535027293
+  replaces: uECC_vli_modSub::sub_borrow_fixup
+  speedup: 15.126570451756365
+  unverified: 'invocations=1 is the designer''s declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model''s 365, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'
+  words: 2
+unverified:
+- 'invocations=2 is the designer''s declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model''s 162, which is consistent with roughly 1 invocations, not 2. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'
+- 'invocations=28 is the designer''s declaration and RED cannot verify it: one call of vli_mmod_fast_secp256r1 executes 8,168 host instructions against this model''s 1,694, which is consistent with roughly 5 invocations, not 28. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'
+- 'invocations=1 is the designer''s declaration and RED cannot verify it: one call of uECC_vli_modSub executes 141 host instructions against this model''s 365, which is consistent with roughly 0 invocations, not 1. That ratio is itself only indicative — the two sides are different implementations — but the gap is too large to ignore. Check it against the data volume: how many bytes does one call process, and how many does one invocation?'

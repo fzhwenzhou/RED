@@ -113,7 +113,7 @@ prediction beside the measurement above:
 | matrixmul | **14.57x** | 92.10x (6.3x over) | 1.02x (0.07x) |
 
 Provenance, because it matters for what can be reproduced. The micro-ecc row is
-live: `eval/spec/micro-ecc.report.json` and `.core.json` are pinned beside the
+live: `eval/spec/micro-ecc.report.yaml` and `.core.yaml` are pinned beside the
 spec, so `reprice.py` regenerates **1.81x** on demand, and a later run that
 re-derived the same design (16 words, 64 MACs, one invocation per call — the
 same machine, spelled `secp256r1_mult`) reported the same 1.81x from its own

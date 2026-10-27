@@ -26,9 +26,49 @@ import os
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _load_tunables() -> dict:
+    """Loop knobs the self-improver has retuned, from ``rsi/tunables.toml``.
+
+    Imported lazily and defensively: red.rsi imports red.state_def, which must
+    not depend on this module at import time, and a tunables file damaged by a
+    bad proposal must leave RED runnable rather than unimportable."""
+    try:
+        from red.rsi import load_tunables
+        return load_tunables(REPO_ROOT)
+    except Exception:                                        # noqa: BLE001
+        return {}
+
 # Candidate application projects and cores live here. RED takes one of each.
 TARGET_PROJECTS = os.path.join(REPO_ROOT, "target_project")
 TARGET_CPUS = os.path.join(REPO_ROOT, "target_cpu")
+
+# The RTL that actually *instantiates* the core, as opposed to the upstream
+# core submodule under TARGET_CPUS. This is the distinction that decides what
+# machine an extension is designed for, and leaving it out of the agents'
+# source roots was worth two runs.
+#
+# target_cpu/picorv32 is the vendor's repository: a parameterised module whose
+# defaults are RV32I with no multiplier, no divider and no coprocessor port,
+# plus a dozen testbenches for configurations nobody here builds. The machine
+# RED is actually designing for is eval/rtl/red_core.v, which instantiates
+# that module with ENABLE_FAST_MUL=1 and ENABLE_DIV=1 and adds a bus-master
+# port so the accelerator can reach memory. An A0 that cannot see this file
+# reports the defaults, and then reports `coprocessor_memory_access: False` --
+# which is not a small error, because it rules out every memory-operand
+# instruction the designer might otherwise have proposed.
+TARGET_RTL = os.path.join(REPO_ROOT, "eval", "rtl")
+
+
+def core_source_roots(core_dir: str) -> list:
+    """The directories an agent may read to understand the target machine.
+
+    The core's own sources, plus the RTL that instantiates it when that
+    directory exists. Absent, this degrades to exactly the old behaviour."""
+    roots = [core_dir]
+    if os.path.isdir(TARGET_RTL):
+        roots.append(TARGET_RTL)
+    return roots
 
 # The bundled worked example (defaults only — every value below is an INPUT the
 # CLI overrides). The harness + cflags together *define* the workload: micro-ecc
@@ -95,14 +135,36 @@ GATE2_BLOCK = 1_024              # vectors per checksum in Gate 2's phase 1
 # run, Spike run), so they overlap well on threads. Capped so a large spec
 # cannot oversubscribe the machine.
 GATE2_MAX_PARALLEL = int(os.environ.get("RED_GATE2_PARALLEL", "4"))
-CRITIC_MAX_ROUNDS = 3            # S2c self-critique cap (the review
-                                 # sub-agents in red.review do the rest)
-REPAIR_MAX_ROUNDS = 3            # link-1 failure -> agentic repair, then escalation
+# --- loop effort caps, retunable by the self-improver ---------------------
+# These four are the only values red.rsi may change on its own, and it may
+# only move them inside the bounds declared in red/rsi.py. They cap *effort*,
+# so turning one down trades compute for quality -- and quality is measured
+# per run, so a knob turned too far shows up as a regression and the proposal
+# that moved it is reverted. Nothing that defines the bar a run is judged
+# against is tunable: the coverage target, the speedup target, the gate
+# tolerances and the vector counts below are all frozen.
+#
+# Precedence: environment variable, then rsi/tunables.toml, then the default.
+_TUNED = _load_tunables()
+
+
+def _tunable(name: str, env: str, default: int) -> int:
+    raw = os.environ.get(env)
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _TUNED.get(name, default)
+
+
+CRITIC_MAX_ROUNDS = _tunable("CRITIC_MAX_ROUNDS", "RED_CRITIC_ROUNDS", 3)
+REPAIR_MAX_ROUNDS = _tunable("REPAIR_MAX_ROUNDS", "RED_REPAIR_ROUNDS", 3)
 # review -> designer revision -> re-review, capped. Raise it (RED_REVIEW_ROUNDS)
 # when the reviewers are still finding blocking issues at the cap and you want
 # the designer to keep going; each extra round costs one review fan-out plus one
 # designer turn.
-REVIEW_MAX_ROUNDS = int(os.environ.get("RED_REVIEW_ROUNDS", "4"))
+REVIEW_MAX_ROUNDS = _tunable("REVIEW_MAX_ROUNDS", "RED_REVIEW_ROUNDS", 4)
 REVIEW_MAX_FINDINGS = 12         # per reviewer; keeps a runaway reply bounded
 
 # ---------------------------------------------------------------------------
@@ -132,7 +194,7 @@ CYCLES_PER_IR = float(os.environ.get("RED_CYCLES_PER_IR", "8.51"))
 # Gate 3 rejects an extension predicted to deliver less than this. The point of
 # designing custom instructions is not to break even.
 SPEEDUP_TARGET = float(os.environ.get("RED_SPEEDUP_TARGET", "2.0"))
-PERF_MAX_ROUNDS = int(os.environ.get("RED_PERF_ROUNDS", "4"))
+PERF_MAX_ROUNDS = _tunable("PERF_MAX_ROUNDS", "RED_PERF_ROUNDS", 4)
 
 # --- how the bar moves -----------------------------------------------------
 #
@@ -294,9 +356,22 @@ RISCV_GCC = os.environ.get("RED_RISCV_GCC", "riscv64-unknown-elf-gcc")
 LLM_RATE_LIMIT_RETRIES = int(os.environ.get("RED_LLM_RATE_LIMIT_RETRIES", "3"))
 LLM_RATE_LIMIT_BACKOFF = float(os.environ.get("RED_LLM_RATE_LIMIT_BACKOFF", "45"))
 CLAUDE_BIN = os.environ.get("RED_CLAUDE_BIN", "claude")
+# The other agent CLI RED can drive (red/backend.py CodexLLM). Only looked for
+# when models.toml actually routes a stage to it.
+CODEX_BIN = os.environ.get("RED_CODEX_BIN", "codex")
 # Empty means "whatever the CLI is configured to use", which is the right
 # default: the operator's own Claude Code settings decide.
 AGENT_MODEL = os.environ.get("RED_AGENT_MODEL", "")
+# How hard the model is asked to think per turn (low|medium|high|xhigh|max).
+# RED's turns are design and review work rather than lookups, so the effort
+# level changes the output materially and belongs in the run's record next to
+# the model name. Empty means "whatever the CLI is configured for".
+AGENT_EFFORT = os.environ.get("RED_AGENT_EFFORT", "")
+# Per-stage model routing (red/modelcfg.py). A file, not a table in code, so
+# that running the designer on one model and the reviewers on another never
+# means editing Python. Missing file means every stage uses AGENT_MODEL above.
+MODELS_CONFIG = os.environ.get("RED_MODELS_CONFIG",
+                               os.path.join(REPO_ROOT, "models.toml"))
 # Per turn. A design turn reads several sources and writes a spec, so it needs
 # room; a reviewer answers in one JSON array.
 AGENT_MAX_TURNS = int(os.environ.get("RED_AGENT_MAX_TURNS", "40"))

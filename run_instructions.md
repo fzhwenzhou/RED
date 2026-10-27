@@ -1,7 +1,7 @@
 # Running RED
 
 RED mines an application's hot loops (A1) and designs a custom RISC-V
-instruction extension for them (A2). The output is `ISASpec.json`.
+instruction extension for them (A2). The output is `ISASpec.yaml`.
 
 Everything runs on **one machine**. There is nothing to provision, nothing to
 tear down, and nothing that bills while RED is idle. Two ways to run it:
@@ -100,7 +100,9 @@ Options (all optional — the defaults are the bundled micro-ecc example):
                    Pass "" and AW writes one (§3.6).
 --cflags "..."     compile flags that pin the workload
 --exclude "a,b"    path fragments whose .c files belong to a DIFFERENT program
---model ID         model for the agent turns
+--model ID         model for stages models.toml does not name
+--effort LEVEL     low|medium|high|xhigh|max, same scope as --model
+--models-config P  per-stage routing file ('' disables it)
 --mechanical       no agent turns at all (§1)
 ```
 
@@ -127,6 +129,23 @@ server that would show it the reference C models.
 Knobs: `RED_AGENT_PARALLEL` (4) concurrent turns, `RED_AGENT_MAX_TURNS` (40)
 tool-use turns inside one stage, `RED_AGENT_TIMEOUT` (1800 s) before a wedged
 turn is cut off and reported as a failed turn.
+
+### Which model runs which stage
+
+Each turn names the *role* it is playing and `models.toml` maps roles to
+models and effort levels (see README, "One model per stage"). The loop prints
+the resolved table before the first turn:
+
+```
+[red] models: models.toml
+[red]   (default)        <strong-model> (effort=high)
+[red]   workload         <cheaper-model> (effort=medium)
+[red]   design           <strong-model> (effort=xhigh)
+```
+
+`RED_MODELS_CONFIG` or `--models-config` points elsewhere; `--models-config ''`
+runs every stage on `--model`/`--effort`, which is the right setting when
+comparing two models against each other.
 
 A turn that fails is a *result*, never an exception: the loop's repair edges
 are written to act on it, and a backend that is down should not look like a
@@ -188,7 +207,7 @@ fell short and which project functions it actually reached — the most useful
 line on the page when the agent thinks it is stressing something it is not.
 `RED_WORKLOAD_ROUNDS` (4) rounds, then the run stops rather than mining libc.
 
-Artifacts: `output/db/<workload>/run_<N>/workload/round<N>.{json,md}`.
+Artifacts: `output/db/<workload>/run_<N>/workload/round<N>.{yaml,md}`.
 
 ## 4. Reading the results
 
@@ -199,12 +218,12 @@ outside the repo to keep a batch's record when you clear `output/`.
 
 | File | What it is |
 |------|-----------|
-| `profile.json` | A1's mechanical profile: per-function instruction counts, method, harness used |
-| `HotLoopReport.json` | A1's deliverable: ranked hot loops, cycle share, coverage, Gate-1 status |
-| `ISASpec.draft.json` | A2's spec as the agent wrote it, before verification |
-| `ISASpec.json` | **RED's deliverable**: the verified spec (encodings, semantics, pseudocode, both executable models, link-1 + Gate-2 verdicts) |
+| `profile.yaml` | A1's mechanical profile: per-function instruction counts, method, harness used |
+| `HotLoopReport.yaml` | A1's deliverable: ranked hot loops, cycle share, coverage, Gate-1 status |
+| `ISASpec.draft.yaml` | A2's spec as the agent wrote it, before verification |
+| `ISASpec.yaml` | **RED's deliverable**: the verified spec (encodings, semantics, pseudocode, both executable models, link-1 + Gate-2 verdicts) |
 | `gate2/` | Everything Gate 2 built: the generated Spike extension, the rv32 test program, the signature dumps |
-| `gates/gate2.json`, `gates/chain.json` | The verification edges' verdicts |
+| `gates/gate2.yaml`, `gates/chain.yaml` | The verification edges' verdicts |
 | `summary.md` | Human-readable run summary |
 
 `output/work/<workload>/<run-id>/` holds the driver-side scratch: the agent
@@ -320,7 +339,7 @@ pays for its own state machine and bus hand-over — so `fixed = 1 + 27` and
 `beat = 1 + 1` reproduce the 28/2 the RTL actually showed. Taking A0's numbers
 raw would make the gate optimistic by an order of magnitude.
 
-Written to `output/db/<workload>/run_<N>/CoreProfile.json`.
+Written to `output/db/<workload>/run_<N>/CoreProfile.yaml`.
 
 ## 4e. Gate 3 — the performance gate
 
@@ -368,8 +387,8 @@ is a *biased* estimator (the two sides are different implementations), so the
 gate reports the inconsistency instead of substituting it, and `write_spec`
 refuses a declaration more than 10× out.
 
-Verdicts land in `output/db/<workload>/run_<N>/perf/round<N>.{json,md}`, and the
-shipped re-price in `perf/shipped.{json,md}`.
+Verdicts land in `output/db/<workload>/run_<N>/perf/round<N>.{yaml,md}`, and the
+shipped re-price in `perf/shipped.{yaml,md}`.
 
 To score the gate against cycle-accurate RTL:
 `./.venv/bin/python eval/scripts/reprice.py`.
@@ -446,7 +465,7 @@ Gate 1, link 1, Gate 4 and Gate 2 all pass. That is deliberate: the gates verify
 instruction means what it says, and `eval/` showed that is not the same as it
 being worth building.
 
-Findings land in `output/db/<workload>/run_<N>/review/round<N>.{json,md}`.
+Findings land in `output/db/<workload>/run_<N>/review/round<N>.{yaml,md}`.
 
 ### What the reviewers actually catch
 
@@ -544,7 +563,7 @@ three by 6.3×–7.0×. See [eval/README.md](eval/README.md) for the harness and
 | Symptom | Cause / fix |
 |---------|-------------|
 | `test_a1_profile_workload` fails with `profile_method='static-asm'` | `valgrind`/`callgrind_annotate` missing → `sudo apt-get install valgrind` |
-| Gate 1 fails with "no dynamic cycle counts" | The harness did not build; check `build_log` in `profile.json` and your `--cflags` |
+| Gate 1 fails with "no dynamic cycle counts" | The harness did not build; check `build_log` in `profile.yaml` and your `--cflags` |
 | Every agent turn fails instantly | `claude` is not on PATH or not authenticated. Check with `bash scripts/red_env.sh check`; the transcripts in `output/work/.../llm_logs/` carry the CLI's own stderr |
 | `A2: no ISASpec produced` | Expected with `--mechanical`. Otherwise read `output/work/.../llm_logs/transcript.log` — the turn either failed or wrote a spec the schema rejected, and both are recorded there |
 | A turn is cut off after 30 min | `RED_AGENT_TIMEOUT`. The run continues: a wedged turn is reported as a failed turn, not a hang |
@@ -552,7 +571,7 @@ three by 6.3×–7.0×. See [eval/README.md](eval/README.md) for the harness and
 | Tool servers fail to bind | A previous run left a driver process alive holding its ports: `pkill -f 'python -m red.loop'`. Ports are asked of the kernel, not scanned, so a clean machine never collides |
 | The run says the knowledge graph is unavailable | Harmless — RED runs without memory of earlier runs. `bash scripts/setup_neo4j.sh start` |
 | Gate 4 reports `NOT CHECKED — timing.secret_branch` | memcheck cannot start without glibc debuginfo: `sudo apt-get install -y libc6-dbg`. The gate is behaving correctly — a check it could not run is never reported as passed — but that run has no taint evidence |
-| link 1 fails with a sanitizer report | Working as intended — the agent's C model has a real bug; the counterexample is in `gates/chain.json` |
+| link 1 fails with a sanitizer report | Working as intended — the agent's C model has a real bug; the counterexample is in `gates/chain.yaml` |
 | Gate 2 says "needs a patched-Spike toolchain" | `bash scripts/setup_spike.sh`; check with its `check` subcommand |
 | Gate 2 fails with "spike extension does not compile" | The ISS agent's C++ is bad; the compiler diagnostic is in the counterexample, and the repair edge feeds it back automatically |
 | Gate 2 reports an encoding collision | Two instructions claim the same (opcode, funct3, funct7); the counterexample names them |

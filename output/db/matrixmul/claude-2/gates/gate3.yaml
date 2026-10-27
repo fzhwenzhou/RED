@@ -1,0 +1,4 @@
+counterexample: null
+detail: predicted 1.98x over 68% of cycles (bar 1.32x; relaxed for redesign round 2, priced on the shipped spec)
+gate: gate3
+passed: true

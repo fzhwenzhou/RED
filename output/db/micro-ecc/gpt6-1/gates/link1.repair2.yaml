@@ -1,0 +1,4 @@
+counterexample: 'p256.xword: c_model failed at runtime (exit 1): FAIL vector 2: model is not a pure function of its input'
+detail: coverage 90.95% >= 80%; 6/7 C models built and survived 100,000 vectors under ASan+UBSan
+gate: link1
+passed: false
